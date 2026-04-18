@@ -142,7 +142,7 @@ namespace SqlTestDataGenerator.DataGeneration
             BranchScenario scenario, ParsedQuery query,
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId)
         {
-            var sharedIds = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
             // Determine how many rows we need for HAVING conditions
@@ -174,15 +174,14 @@ namespace SqlTestDataGenerator.DataGeneration
                         if (col.IsComputed) continue;
 
                         var value = GenerateColumnValue(col, alias, query, schemas,
-                            sharedIds, rowId, satisfy: true, rowIdx);
+                            tableRowIds, rowId, satisfy: true, rowIdx);
                         row.SetValue(col.ColumnName, value);
                     }
 
                     scenario.AddRow(tableName, row);
                 }
 
-                // Store the ID for FK references
-                sharedIds[tableName] = currentId;
+                RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
                 currentId += rowCount + 1;
             }
 
@@ -195,7 +194,7 @@ namespace SqlTestDataGenerator.DataGeneration
             BranchScenario scenario, ParsedQuery query,
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId)
         {
-            var sharedIds = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
             // Find the condition being tested
@@ -228,14 +227,14 @@ namespace SqlTestDataGenerator.DataGeneration
                              alias.Equals(testedCondition.TableAlias, StringComparison.OrdinalIgnoreCase));
 
                         var value = GenerateColumnValue(col, alias, query, schemas,
-                            sharedIds, rowId, satisfy: !isTestedColumn, rowIdx);
+                            tableRowIds, rowId, satisfy: !isTestedColumn, rowIdx);
                         row.SetValue(col.ColumnName, value);
                     }
 
                     scenario.AddRow(tableName, row);
                 }
 
-                sharedIds[tableName] = currentId;
+                RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
                 currentId += rowCount + 1;
             }
         }
@@ -245,7 +244,7 @@ namespace SqlTestDataGenerator.DataGeneration
             BranchScenario scenario, ParsedQuery query,
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId)
         {
-            var sharedIds = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
             var testedCondition = query.HavingConditions
@@ -289,7 +288,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         else
                         {
                             value = GenerateColumnValue(col, alias, query, schemas,
-                                sharedIds, rowId, satisfy: true, rowIdx);
+                                tableRowIds, rowId, satisfy: true, rowIdx);
                         }
 
                         row.SetValue(col.ColumnName, value);
@@ -298,7 +297,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     scenario.AddRow(tableName, row);
                 }
 
-                sharedIds[tableName] = currentId;
+                RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
                 currentId += rowCount + 1;
             }
         }
@@ -308,7 +307,7 @@ namespace SqlTestDataGenerator.DataGeneration
             BranchScenario scenario, ParsedQuery query,
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId)
         {
-            var sharedIds = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
             // Find which join is being tested
@@ -354,7 +353,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         else
                         {
                             value = GenerateColumnValue(col, alias, query, schemas,
-                                sharedIds, rowId, satisfy: true, rowIdx);
+                                tableRowIds, rowId, satisfy: true, rowIdx);
                         }
 
                         row.SetValue(col.ColumnName, value);
@@ -363,7 +362,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     scenario.AddRow(tableName, row);
                 }
 
-                sharedIds[tableName] = currentId;
+                RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
                 currentId += rowCount + 1;
             }
         }
@@ -375,7 +374,7 @@ namespace SqlTestDataGenerator.DataGeneration
         {
             // Similar to positive but the subquery-referenced column has a value
             // that does NOT appear in the subquery result
-            var sharedIds = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
             foreach (var tableName in insertOrder)
@@ -398,14 +397,14 @@ namespace SqlTestDataGenerator.DataGeneration
                         if (col.IsComputed) continue;
 
                         var value = GenerateColumnValue(col, alias, query, schemas,
-                            sharedIds, rowId, satisfy: true, rowIdx);
+                            tableRowIds, rowId, satisfy: true, rowIdx);
                         row.SetValue(col.ColumnName, value);
                     }
 
                     scenario.AddRow(tableName, row);
                 }
 
-                sharedIds[tableName] = currentId;
+                RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
                 currentId += rowCount + 1;
             }
 
@@ -418,7 +417,7 @@ namespace SqlTestDataGenerator.DataGeneration
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId)
         {
             // Similar to positive, but range conditions use exact boundary values
-            var sharedIds = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
             var testedCondition = query.WhereConditions
@@ -462,7 +461,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         else
                         {
                             value = GenerateColumnValue(col, alias, query, schemas,
-                                sharedIds, rowId, satisfy: true, rowIdx);
+                                tableRowIds, rowId, satisfy: true, rowIdx);
                         }
 
                         row.SetValue(col.ColumnName, value);
@@ -471,7 +470,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     scenario.AddRow(tableName, row);
                 }
 
-                sharedIds[tableName] = currentId;
+                RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
                 currentId += rowCount + 1;
             }
 
@@ -485,7 +484,7 @@ namespace SqlTestDataGenerator.DataGeneration
         private object? GenerateColumnValue(
             ColumnSchema col, string tableAlias, ParsedQuery query,
             Dictionary<string, TableSchema> schemas,
-            Dictionary<string, int> sharedIds, int rowId,
+            Dictionary<string, List<int>> tableRowIds, int rowId,
             bool satisfy, int rowIndex)
         {
             var generator = _valueFactory.GetGenerator(col.TypeCategory);
@@ -513,7 +512,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 var fk = currentTableSchema.ForeignKeys
                     .FirstOrDefault(f => f.ColumnName.Equals(col.ColumnName, StringComparison.OrdinalIgnoreCase));
 
-                if (fk != null && sharedIds.TryGetValue(fk.ReferencedTable, out var fkId))
+                if (fk != null && TryResolveRelatedRowId(tableRowIds, fk.ReferencedTable, rowIndex, out var fkId))
                 {
                     return fkId;
                 }
@@ -604,7 +603,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     : joinCondition.LeftTableAlias;
 
                 var otherTable = query.ResolveAlias(otherAlias);
-                if (sharedIds.TryGetValue(otherTable, out var joinId))
+                if (TryResolveRelatedRowId(tableRowIds, otherTable, rowIndex, out var joinId))
                 {
                     return joinId;
                 }
@@ -806,6 +805,32 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             return multiplier;
+        }
+
+        private static void RegisterGeneratedIds(
+            Dictionary<string, List<int>> tableRowIds,
+            string tableName,
+            int startId,
+            int rowCount)
+        {
+            tableRowIds[tableName] = Enumerable
+                .Range(startId, Math.Max(0, rowCount))
+                .ToList();
+        }
+
+        private static bool TryResolveRelatedRowId(
+            Dictionary<string, List<int>> tableRowIds,
+            string tableName,
+            int rowIndex,
+            out int resolvedId)
+        {
+            resolvedId = default;
+            if (!tableRowIds.TryGetValue(tableName, out var ids) || ids.Count == 0)
+                return false;
+
+            var safeIndex = Math.Abs(rowIndex) % ids.Count;
+            resolvedId = ids[safeIndex];
+            return true;
         }
 
         private bool IsAggregateSourceTable(string tableName, string alias, ParsedQuery query)
