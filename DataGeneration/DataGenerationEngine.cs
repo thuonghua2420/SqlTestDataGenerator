@@ -39,10 +39,10 @@ namespace SqlTestDataGenerator.DataGeneration
                 OriginalSql = query.OriginalSql
             };
 
-            // Resolve INSERT order
-            var tableNames = query.Tables
-                .Select(t => t.TableName)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
+            // Build one unified generation scope up front:
+            // main query tables + subquery tables + all FK ancestors.
+            var generationScope = CollectGenerationScope(query, schemas);
+            var tableNames = generationScope
                 .Where(t => schemas.TryGetValue(t, out var s) && s.Columns.Any())
                 .ToList();
             List<string> insertOrder;
@@ -56,17 +56,11 @@ namespace SqlTestDataGenerator.DataGeneration
                 insertOrder = _orderResolver.ResolveFromJoins(query);
             }
 
-            // Also include tables from subqueries
-            foreach (var sub in query.Subqueries)
+            foreach (var tableName in tableNames)
             {
-                foreach (var subTable in sub.Tables)
+                if (!insertOrder.Contains(tableName, StringComparer.OrdinalIgnoreCase))
                 {
-                    if (!tableNames.Contains(subTable.TableName, StringComparer.OrdinalIgnoreCase) &&
-                        schemas.TryGetValue(subTable.TableName, out var subSchema) &&
-                        subSchema.Columns.Any())
-                    {
-                        tableNames.Add(subTable.TableName);
-                    }
+                    insertOrder.Add(tableName);
                 }
             }
 
@@ -175,8 +169,8 @@ namespace SqlTestDataGenerator.DataGeneration
                     {
                         if (col.IsComputed) continue;
 
-                        var value = GenerateColumnValue(col, alias, query, schemas,
-                            tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx);
+                        var value = GenerateColumnValue(scenario, col, alias, query, schemas,
+                            tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx, includeSubqueryConditions: true);
                         row.SetValue(col.ColumnName, value);
                     }
 
@@ -229,8 +223,8 @@ namespace SqlTestDataGenerator.DataGeneration
                             (string.IsNullOrEmpty(testedCondition.TableAlias) ||
                              alias.Equals(testedCondition.TableAlias, StringComparison.OrdinalIgnoreCase));
 
-                        var value = GenerateColumnValue(col, alias, query, schemas,
-                            tableRowIds, referencedTableIdPools, rowId, satisfy: !isTestedColumn, rowIdx);
+                        var value = GenerateColumnValue(scenario, col, alias, query, schemas,
+                            tableRowIds, referencedTableIdPools, rowId, satisfy: !isTestedColumn, rowIdx, includeSubqueryConditions: true);
                         row.SetValue(col.ColumnName, value);
                     }
 
@@ -291,8 +285,8 @@ namespace SqlTestDataGenerator.DataGeneration
                         }
                         else
                         {
-                            value = GenerateColumnValue(col, alias, query, schemas,
-                                tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx);
+                            value = GenerateColumnValue(scenario, col, alias, query, schemas,
+                                tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx, includeSubqueryConditions: true);
                         }
 
                         row.SetValue(col.ColumnName, value);
@@ -357,8 +351,8 @@ namespace SqlTestDataGenerator.DataGeneration
                         }
                         else
                         {
-                            value = GenerateColumnValue(col, alias, query, schemas,
-                                tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx);
+                            value = GenerateColumnValue(scenario, col, alias, query, schemas,
+                                tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx, includeSubqueryConditions: true);
                         }
 
                         row.SetValue(col.ColumnName, value);
@@ -402,8 +396,8 @@ namespace SqlTestDataGenerator.DataGeneration
                     {
                         if (col.IsComputed) continue;
 
-                        var value = GenerateColumnValue(col, alias, query, schemas,
-                            tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx);
+                        var value = GenerateColumnValue(scenario, col, alias, query, schemas,
+                            tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx, includeSubqueryConditions: false);
                         row.SetValue(col.ColumnName, value);
                     }
 
@@ -467,8 +461,8 @@ namespace SqlTestDataGenerator.DataGeneration
                         }
                         else
                         {
-                            value = GenerateColumnValue(col, alias, query, schemas,
-                                tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx);
+                            value = GenerateColumnValue(scenario, col, alias, query, schemas,
+                                tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx, includeSubqueryConditions: true);
                         }
 
                         row.SetValue(col.ColumnName, value);
@@ -489,14 +483,17 @@ namespace SqlTestDataGenerator.DataGeneration
         // ═════════════════════════════════════════════════════════════════
 
         private object? GenerateColumnValue(
+            BranchScenario scenario,
             ColumnSchema col, string tableAlias, ParsedQuery query,
             Dictionary<string, TableSchema> schemas,
             Dictionary<string, List<int>> tableRowIds,
             Dictionary<string, List<int>> referencedTableIdPools,
             int rowId,
-            bool satisfy, int rowIndex)
+            bool satisfy, int rowIndex,
+            bool includeSubqueryConditions)
         {
             var generator = _valueFactory.GetGenerator(col.TypeCategory);
+            var currentTableName = col.TableName;
 
             // Always generate explicit values for IDENTITY columns so scripts can include full rows.
             if (col.IsIdentity)
@@ -547,69 +544,59 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             // 3. Check if this column has a WHERE condition
-            var condition = query.WhereConditions
-                .FirstOrDefault(c =>
-                    c.ColumnName.Equals(col.ColumnName, StringComparison.OrdinalIgnoreCase) &&
-                    (string.IsNullOrEmpty(c.TableAlias) ||
-                     c.TableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase)) &&
-                    !c.HasSubquery);
+            var condition = FindApplicableCondition(
+                query.WhereConditions,
+                query,
+                currentTableName,
+                tableAlias,
+                col.ColumnName,
+                excludeHasSubquery: true);
 
             if (condition != null)
             {
-                var opStr = ConditionOpToString(condition.Operator);
+                return GenerateConditionValue(
+                    scenario,
+                    query,
+                    col,
+                    generator,
+                    condition,
+                    tableRowIds,
+                    satisfy);
+            }
 
-                if (condition.Operator == ComparisonOp.Between)
+            // 3.25. Check table-local conditions that live inside EXISTS/IN subqueries
+            if (includeSubqueryConditions)
+            {
+                var subqueryCondition = FindApplicableSubqueryCondition(
+                    query.Subqueries,
+                    query,
+                    currentTableName,
+                    tableAlias,
+                    col.ColumnName);
+
+                if (subqueryCondition != null)
                 {
-                    // For BETWEEN, generate a value within the range
-                    if (satisfy)
-                    {
-                        return GenerateBetweenValue(col, condition.Value, condition.SecondValue, inside: true);
-                    }
-                    else
-                    {
-                        return GenerateBetweenValue(col, condition.Value, condition.SecondValue, inside: false);
-                    }
+                    return GenerateConditionValue(
+                        scenario,
+                        query,
+                        col,
+                        generator,
+                        subqueryCondition,
+                        tableRowIds,
+                        satisfy: true);
                 }
-
-                if (condition.Operator == ComparisonOp.In && condition.InValues.Any())
-                {
-                    if (satisfy)
-                        return generator.GenerateFromLiteral(condition.InValues[0], col);
-                    else
-                        return generator.GenerateViolating(col, "=", condition.InValues[0]);
-                }
-
-                if (condition.Operator == ComparisonOp.IsNull)
-                {
-                    return satisfy ? null : generator.GenerateDefault(col);
-                }
-
-                if (condition.Operator == ComparisonOp.IsNotNull)
-                {
-                    return satisfy ? generator.GenerateDefault(col) : null;
-                }
-
-                if (condition.Operator == ComparisonOp.Like)
-                {
-                    return satisfy
-                        ? generator.GenerateSatisfying(col, "LIKE", condition.LikePattern)
-                        : generator.GenerateViolating(col, "LIKE", condition.LikePattern);
-                }
-
-                return satisfy
-                    ? generator.GenerateSatisfying(col, opStr, condition.Value)
-                    : generator.GenerateViolating(col, opStr, condition.Value);
             }
 
             // 3.5 Check HAVING aggregate conditions for positive-path generation
             if (satisfy)
             {
-                var aggregateCondition = query.HavingConditions
-                    .FirstOrDefault(c =>
-                        c.AggregateFunc.HasValue &&
-                        c.ColumnName.Equals(col.ColumnName, StringComparison.OrdinalIgnoreCase) &&
-                        (string.IsNullOrEmpty(c.TableAlias) ||
-                         c.TableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase)));
+                var aggregateCondition = FindApplicableCondition(
+                    query.HavingConditions.Where(c => c.AggregateFunc.HasValue),
+                    query,
+                    currentTableName,
+                    tableAlias,
+                    col.ColumnName,
+                    excludeHasSubquery: false);
 
                 if (aggregateCondition != null)
                 {
@@ -652,6 +639,124 @@ namespace SqlTestDataGenerator.DataGeneration
 
             // 5. Default value generation
             return generator.GenerateDefault(col);
+        }
+
+        private object? GenerateConditionValue(
+            BranchScenario scenario,
+            ParsedQuery query,
+            ColumnSchema col,
+            IValueGenerator generator,
+            ConditionInfo condition,
+            Dictionary<string, List<int>> tableRowIds,
+            bool satisfy)
+        {
+            if (condition.IsColumnComparison &&
+                satisfy &&
+                TryResolveSubqueryComparisonValue(
+                    scenario,
+                    query,
+                    condition,
+                    tableRowIds,
+                    query.AliasToTableMap,
+                    out var comparisonValue))
+            {
+                return comparisonValue;
+            }
+
+            var opStr = ConditionOpToString(condition.Operator);
+
+            if (condition.Operator == ComparisonOp.Between)
+            {
+                return GenerateBetweenValue(col, condition.Value, condition.SecondValue, inside: satisfy);
+            }
+
+            if (condition.Operator == ComparisonOp.In && condition.InValues.Any())
+            {
+                return satisfy
+                    ? generator.GenerateFromLiteral(condition.InValues[0], col)
+                    : generator.GenerateViolating(col, "=", condition.InValues[0]);
+            }
+
+            if (condition.Operator == ComparisonOp.IsNull)
+            {
+                return satisfy ? null : generator.GenerateDefault(col);
+            }
+
+            if (condition.Operator == ComparisonOp.IsNotNull)
+            {
+                return satisfy ? generator.GenerateDefault(col) : null;
+            }
+
+            if (condition.Operator == ComparisonOp.Like)
+            {
+                return satisfy
+                    ? generator.GenerateSatisfying(col, "LIKE", condition.LikePattern)
+                    : generator.GenerateViolating(col, "LIKE", condition.LikePattern);
+            }
+
+            return satisfy
+                ? generator.GenerateSatisfying(col, opStr, condition.Value)
+                : generator.GenerateViolating(col, opStr, condition.Value);
+        }
+
+        private static ConditionInfo? FindApplicableCondition(
+            IEnumerable<ConditionInfo> conditions,
+            ParsedQuery query,
+            string tableName,
+            string tableAlias,
+            string columnName,
+            bool excludeHasSubquery)
+        {
+            return conditions.FirstOrDefault(c =>
+                c.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase) &&
+                (!excludeHasSubquery || !c.HasSubquery) &&
+                MatchesConditionTarget(query, c.TableAlias, tableName, tableAlias));
+        }
+
+        private static ConditionInfo? FindApplicableSubqueryCondition(
+            IEnumerable<SubqueryInfo> subqueries,
+            ParsedQuery query,
+            string tableName,
+            string tableAlias,
+            string columnName)
+        {
+            foreach (var subquery in subqueries)
+            {
+                var condition = subquery.Conditions.FirstOrDefault(c =>
+                    c.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase) &&
+                    MatchesConditionTarget(query, c.TableAlias, tableName, tableAlias));
+
+                if (condition != null)
+                    return condition;
+
+                var nested = FindApplicableSubqueryCondition(
+                    subquery.NestedSubqueries,
+                    query,
+                    tableName,
+                    tableAlias,
+                    columnName);
+
+                if (nested != null)
+                    return nested;
+            }
+
+            return null;
+        }
+
+        private static bool MatchesConditionTarget(
+            ParsedQuery query,
+            string? conditionTableAlias,
+            string tableName,
+            string tableAlias)
+        {
+            if (string.IsNullOrWhiteSpace(conditionTableAlias))
+                return true;
+
+            if (conditionTableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            var resolved = query.ResolveAlias(conditionTableAlias);
+            return resolved.Equals(tableName, StringComparison.OrdinalIgnoreCase);
         }
 
         private object? GenerateBoundaryValue(ColumnSchema col, ConditionInfo condition)
@@ -767,6 +872,12 @@ namespace SqlTestDataGenerator.DataGeneration
             {
                 if (!schemas.TryGetValue(tableName, out var schema))
                     continue;
+
+                if (scenario.TableRows.TryGetValue(tableName, out var existingRows) &&
+                    existingRows.Count > 0)
+                {
+                    continue;
+                }
 
                 var subTable = subquery.Tables
                     .FirstOrDefault(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase));
@@ -935,6 +1046,61 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             return map;
+        }
+
+        private static HashSet<string> CollectGenerationScope(
+            ParsedQuery query,
+            Dictionary<string, TableSchema> schemas)
+        {
+            var scope = new HashSet<string>(
+                query.Tables
+                    .Select(t => t.TableName)
+                    .Where(t => !string.IsNullOrWhiteSpace(t)),
+                StringComparer.OrdinalIgnoreCase);
+
+            foreach (var subquery in query.Subqueries)
+            {
+                CollectSubqueryTables(subquery, scope);
+            }
+
+            var queue = new Queue<string>(scope);
+            while (queue.Count > 0)
+            {
+                var tableName = queue.Dequeue();
+                if (!schemas.TryGetValue(tableName, out var schema))
+                    continue;
+
+                foreach (var fk in schema.ForeignKeys)
+                {
+                    if (string.IsNullOrWhiteSpace(fk.ReferencedTable))
+                        continue;
+
+                    if (scope.Add(fk.ReferencedTable))
+                    {
+                        queue.Enqueue(fk.ReferencedTable);
+                    }
+                }
+            }
+
+            return scope;
+        }
+
+        private static void CollectSubqueryTables(
+            SubqueryInfo subquery,
+            HashSet<string> scope)
+        {
+            foreach (var table in subquery.Tables)
+            {
+                if (!string.IsNullOrWhiteSpace(table.TableName))
+                {
+                    scope.Add(table.TableName);
+                }
+            }
+
+            foreach (var nested in subquery.NestedSubqueries)
+            {
+                CollectSubqueryTables(nested, scope);
+            }
         }
 
         private static bool TryResolveSubqueryComparisonValue(
