@@ -17,6 +17,7 @@ namespace SqlTestDataGenerator.DataGeneration
         /// </summary>
         public List<BranchScenario> AnalyzeBranches(ParsedQuery query)
         {
+            _nextId = 1;
             var scenarios = new List<BranchScenario>();
 
             // 1. POSITIVE: All conditions satisfied → query returns rows

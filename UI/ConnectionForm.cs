@@ -26,13 +26,8 @@ namespace SqlTestDataGenerator.UI
         private Label _statusLabel = null!;
 
         // Colors
-        private readonly Color _bgDark = Color.FromArgb(32, 33, 44);
-        private readonly Color _bgInput = Color.FromArgb(40, 42, 56);
-        private readonly Color _accentBlue = Color.FromArgb(88, 130, 247);
-        private readonly Color _accentGreen = Color.FromArgb(72, 209, 156);
-        private readonly Color _textPrimary = Color.FromArgb(230, 233, 240);
-        private readonly Color _textSecondary = Color.FromArgb(160, 166, 180);
-        private readonly Color _borderColor = Color.FromArgb(55, 58, 75);
+        private readonly Color _accentGreen = Color.Green;
+        private readonly Color _textSecondary = SystemColors.GrayText;
 
         public ConnectionForm()
         {
@@ -47,8 +42,8 @@ namespace SqlTestDataGenerator.UI
             this.MaximizeBox = false;
             this.MinimizeBox = false;
             this.StartPosition = FormStartPosition.CenterParent;
-            this.BackColor = _bgDark;
-            this.ForeColor = _textPrimary;
+            this.BackColor = SystemColors.Control;
+            this.ForeColor = SystemColors.ControlText;
             this.Font = new Font("Segoe UI", 10F);
 
             int y = 20;
@@ -74,7 +69,7 @@ namespace SqlTestDataGenerator.UI
                 Location = new Point(20, y),
                 AutoSize = true,
                 Checked = true,
-                ForeColor = _textPrimary,
+                ForeColor = SystemColors.ControlText,
                 Font = new Font("Segoe UI", 9.5F)
             };
             _winAuthRadio.CheckedChanged += AuthRadio_CheckedChanged;
@@ -86,7 +81,7 @@ namespace SqlTestDataGenerator.UI
                 Text = "SQL Server Authentication",
                 Location = new Point(20, y),
                 AutoSize = true,
-                ForeColor = _textPrimary,
+                ForeColor = SystemColors.ControlText,
                 Font = new Font("Segoe UI", 9.5F)
             };
             this.Controls.Add(_sqlAuthRadio);
@@ -118,7 +113,7 @@ namespace SqlTestDataGenerator.UI
             y += 30;
 
             // Buttons
-            _testBtn = CreateStyledButton("Test", _accentBlue, 80);
+            _testBtn = CreateStyledButton("Test", Color.Blue, 80);
             _testBtn.Location = new Point(140, y);
             _testBtn.Click += TestBtn_Click;
 
@@ -154,7 +149,7 @@ namespace SqlTestDataGenerator.UI
                 _winAuthRadio.Checked);
 
             _statusLabel.Text = success ? "✓ Connection successful!" : $"✗ {message}";
-            _statusLabel.ForeColor = success ? _accentGreen : Color.FromArgb(255, 99, 115);
+            _statusLabel.ForeColor = success ? _accentGreen : Color.Red;
         }
 
         private void ConnectBtn_Click(object? sender, EventArgs e)
@@ -162,7 +157,7 @@ namespace SqlTestDataGenerator.UI
             if (string.IsNullOrWhiteSpace(_serverInput.Text) || string.IsNullOrWhiteSpace(_databaseInput.Text))
             {
                 _statusLabel.Text = "Server and Database are required.";
-                _statusLabel.ForeColor = Color.FromArgb(255, 99, 115);
+                _statusLabel.ForeColor = Color.Red;
                 return;
             }
 
@@ -183,7 +178,7 @@ namespace SqlTestDataGenerator.UI
                 Text = text,
                 Location = new Point(x, y + 4),
                 AutoSize = true,
-                ForeColor = _textSecondary,
+                ForeColor = SystemColors.ControlText,
                 Font = new Font("Segoe UI", 9.5F)
             };
             this.Controls.Add(label);
@@ -196,8 +191,8 @@ namespace SqlTestDataGenerator.UI
             {
                 Location = new Point(x, y),
                 Size = new Size(width, 28),
-                BackColor = _bgInput,
-                ForeColor = _textPrimary,
+                BackColor = SystemColors.Window,
+                ForeColor = SystemColors.WindowText,
                 BorderStyle = BorderStyle.FixedSingle,
                 Font = new Font("Segoe UI", 10F)
             };
@@ -211,14 +206,13 @@ namespace SqlTestDataGenerator.UI
             {
                 Text = text,
                 Size = new Size(width, 32),
-                FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
-                ForeColor = Color.White,
-                BackColor = Color.FromArgb(accentColor.R / 3, accentColor.G / 3, accentColor.B / 3),
-                Cursor = Cursors.Hand
+                FlatStyle = FlatStyle.Standard,
+                Font = new Font("Segoe UI", 9.5F),
+                ForeColor = SystemColors.ControlText,
+                BackColor = SystemColors.Control,
+                Cursor = Cursors.Hand,
+                UseVisualStyleBackColor = true
             };
-            btn.FlatAppearance.BorderColor = accentColor;
-            btn.FlatAppearance.BorderSize = 1;
             return btn;
         }
     }

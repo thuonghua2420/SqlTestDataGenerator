@@ -52,6 +52,7 @@ namespace SqlTestDataGenerator.Schema
 
             // Detect IDENTITY columns
             DetectIdentityColumns(conn, tableName, schemaName, schema);
+            DetectComputedColumns(conn, tableName, schemaName, schema);
 
             _cache[key] = schema;
             return schema;
@@ -104,12 +105,20 @@ namespace SqlTestDataGenerator.Schema
             using var reader = cmd.ExecuteReader();
             while (reader.Read())
             {
+                int? maxLength = null;
+                if (!reader.IsDBNull(3))
+                {
+                    var rawLen = reader.GetInt32(3);
+                    // SQL Server reports (max) types as -1. Treat that as unbounded.
+                    maxLength = rawLen > 0 ? rawLen : null;
+                }
+
                 columns.Add(new ColumnSchema
                 {
                     ColumnName = reader.GetString(0),
                     DataType = reader.GetString(1),
                     IsNullable = reader.GetString(2) == "YES",
-                    MaxLength = reader.IsDBNull(3) ? null : (int?)reader.GetInt32(3),
+                    MaxLength = maxLength,
                     NumericPrecision = reader.IsDBNull(4) ? null : (int?)Convert.ToInt32(reader.GetValue(4)),
                     NumericScale = reader.IsDBNull(5) ? null : (int?)Convert.ToInt32(reader.GetValue(5)),
                     DefaultValue = reader.IsDBNull(6) ? null : reader.GetString(6),
@@ -245,6 +254,30 @@ namespace SqlTestDataGenerator.Schema
                 var colName = reader.GetString(0);
                 var col = schema.GetColumn(colName);
                 if (col != null) col.IsIdentity = true;
+            }
+        }
+
+        private void DetectComputedColumns(SqlConnection conn, string tableName, string schemaName, TableSchema schema)
+        {
+            var sql = @"
+                SELECT c.name
+                FROM sys.columns c
+                JOIN sys.tables t ON c.object_id = t.object_id
+                JOIN sys.schemas s ON t.schema_id = s.schema_id
+                WHERE t.name = @TableName
+                  AND s.name = @SchemaName
+                  AND c.is_computed = 1";
+
+            using var cmd = new SqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@TableName", tableName);
+            cmd.Parameters.AddWithValue("@SchemaName", schemaName);
+
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                var colName = reader.GetString(0);
+                var col = schema.GetColumn(colName);
+                if (col != null) col.IsComputed = true;
             }
         }
     }

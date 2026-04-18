@@ -23,14 +23,15 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
 
         public bool CanHandle(DataTypeCategory category) => category == DataTypeCategory.Integer;
 
-        public object GenerateDefault(ColumnSchema column) => _counter++;
+        public object GenerateDefault(ColumnSchema column) =>
+            NormalizeIntegerForType(_counter++, column);
 
         public object GenerateSatisfying(ColumnSchema column, string op, string value)
         {
             if (!long.TryParse(value, out var numValue))
                 return _counter++;
 
-            return op switch
+            var candidate = op switch
             {
                 "=" => numValue,
                 "<>" or "!=" => numValue + 1,
@@ -40,6 +41,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
                 "<=" => numValue,
                 _ => numValue
             };
+            return NormalizeIntegerForType(candidate, column);
         }
 
         public object GenerateViolating(ColumnSchema column, string op, string value)
@@ -47,7 +49,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
             if (!long.TryParse(value, out var numValue))
                 return 0;
 
-            return op switch
+            var candidate = op switch
             {
                 "=" => numValue + 1,
                 "<>" or "!=" => numValue,
@@ -57,14 +59,27 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
                 "<=" => numValue + 1,
                 _ => 0
             };
+            return NormalizeIntegerForType(candidate, column);
         }
 
         public object GenerateFromLiteral(string literal, ColumnSchema column)
         {
-            return long.TryParse(literal, out var v) ? v : _counter++;
+            var value = long.TryParse(literal, out var v) ? v : _counter++;
+            return NormalizeIntegerForType(value, column);
         }
 
         public int GetNextId() => _counter++;
+
+        private static object NormalizeIntegerForType(long value, ColumnSchema column)
+        {
+            return column.DataType.ToLowerInvariant() switch
+            {
+                "tinyint" => (byte)(Math.Abs(value) % 256),
+                "smallint" => (short)((value % 65536 + 65536) % 65536 - 32768),
+                "int" => (int)value,
+                _ => value
+            };
+        }
     }
 
     /// <summary>
@@ -134,7 +149,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
 
         public object GenerateDefault(ColumnSchema column)
         {
-            var maxLen = column.MaxLength ?? 50;
+            var maxLen = NormalizeMaxLength(column.MaxLength);
             var val = $"TestData_{++_counter}";
             return val.Length > maxLen ? val[..maxLen] : val;
         }
@@ -176,8 +191,16 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
             var result = pattern
                 .Replace("%", "Test")
                 .Replace("_", "X");
-            var maxLen = column.MaxLength ?? 50;
+            var maxLen = NormalizeMaxLength(column.MaxLength);
             return result.Length > maxLen ? result[..maxLen] : result;
+        }
+
+        private static int NormalizeMaxLength(int? maxLength)
+        {
+            // SQL Server reports (max) as -1; null also means no explicit bound.
+            if (!maxLength.HasValue || maxLength.Value <= 0)
+                return 4000;
+            return maxLength.Value;
         }
     }
 
@@ -228,6 +251,55 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
         public object GenerateFromLiteral(string literal, ColumnSchema column)
         {
             return DateTime.TryParse(literal, out var v) ? v : DateTime.Now;
+        }
+    }
+
+    /// <summary>
+    /// Generates time values.
+    /// </summary>
+    public class TimeValueGenerator : IValueGenerator
+    {
+        private int _counter;
+
+        public bool CanHandle(DataTypeCategory category) => category == DataTypeCategory.Time;
+
+        public object GenerateDefault(ColumnSchema column)
+        {
+            _counter++;
+            return new TimeSpan((_counter % 24), (_counter * 7) % 60, (_counter * 13) % 60);
+        }
+
+        public object GenerateSatisfying(ColumnSchema column, string op, string value)
+        {
+            if (TimeSpan.TryParse(value, out var parsed))
+                return parsed;
+
+            if (DateTime.TryParse(value, out var dt))
+                return dt.TimeOfDay;
+
+            return GenerateDefault(column);
+        }
+
+        public object GenerateViolating(ColumnSchema column, string op, string value)
+        {
+            if (TimeSpan.TryParse(value, out var parsed))
+                return parsed.Add(TimeSpan.FromMinutes(5));
+
+            if (DateTime.TryParse(value, out var dt))
+                return dt.TimeOfDay.Add(TimeSpan.FromMinutes(5));
+
+            return new TimeSpan(23, 59, 59);
+        }
+
+        public object GenerateFromLiteral(string literal, ColumnSchema column)
+        {
+            if (TimeSpan.TryParse(literal, out var parsed))
+                return parsed;
+
+            if (DateTime.TryParse(literal, out var dt))
+                return dt.TimeOfDay;
+
+            return GenerateDefault(column);
         }
     }
 
@@ -293,6 +365,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
             new DecimalValueGenerator(),
             new StringValueGenerator(),
             new DateTimeValueGenerator(),
+            new TimeValueGenerator(),
             new BooleanValueGenerator(),
             new GuidValueGenerator()
         };

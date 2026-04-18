@@ -59,6 +59,7 @@ namespace SqlTestDataGenerator.Output
         public string GenerateScenarioScript(BranchScenario scenario)
         {
             var sb = new StringBuilder();
+            var identityTablesInScenario = GetIdentityTablesWithGeneratedValues(scenario);
 
             // Scenario header
             if (IncludeComments)
@@ -80,13 +81,14 @@ namespace SqlTestDataGenerator.Output
                 sb.AppendLine();
             }
 
-            // Track which tables need IDENTITY_INSERT
-            var identityTables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
             // Generate INSERTs in dependency order
             foreach (var tableName in scenario.InsertOrder)
             {
                 if (!scenario.TableRows.TryGetValue(tableName, out var rows) || !rows.Any())
+                    continue;
+
+                var validRows = rows.Where(r => r.ColumnValues.Any()).ToList();
+                if (!validRows.Any())
                     continue;
 
                 // Check for identity columns
@@ -94,17 +96,16 @@ namespace SqlTestDataGenerator.Output
                 if (HandleIdentityInsert && Schemas != null &&
                     Schemas.TryGetValue(tableName, out var schema))
                 {
-                    hasIdentity = schema.HasIdentityColumn;
+                    hasIdentity = HasIdentityValues(schema, validRows);
                     if (hasIdentity)
                     {
                         sb.AppendLine($"SET IDENTITY_INSERT [{SchemaName}].[{tableName}] ON;");
-                        identityTables.Add(tableName);
                     }
                 }
 
-                foreach (var row in rows)
+                foreach (var insertStmt in GenerateInsertStatements(tableName, validRows))
                 {
-                    sb.AppendLine(GenerateInsertStatement(tableName, row));
+                    sb.AppendLine(insertStmt);
                 }
 
                 if (hasIdentity)
@@ -121,9 +122,29 @@ namespace SqlTestDataGenerator.Output
                 if (scenario.InsertOrder.Contains(kvp.Key, StringComparer.OrdinalIgnoreCase))
                     continue;
 
-                foreach (var row in kvp.Value)
+                var validRows = kvp.Value.Where(r => r.ColumnValues.Any()).ToList();
+                if (!validRows.Any())
+                    continue;
+
+                bool hasIdentity = false;
+                if (HandleIdentityInsert && Schemas != null &&
+                    Schemas.TryGetValue(kvp.Key, out var schema))
                 {
-                    sb.AppendLine(GenerateInsertStatement(kvp.Key, row));
+                    hasIdentity = HasIdentityValues(schema, validRows);
+                    if (hasIdentity)
+                    {
+                        sb.AppendLine($"SET IDENTITY_INSERT [{SchemaName}].[{kvp.Key}] ON;");
+                    }
+                }
+
+                foreach (var insertStmt in GenerateInsertStatements(kvp.Key, validRows))
+                {
+                    sb.AppendLine(insertStmt);
+                }
+
+                if (hasIdentity)
+                {
+                    sb.AppendLine($"SET IDENTITY_INSERT [{SchemaName}].[{kvp.Key}] OFF;");
                 }
                 sb.AppendLine();
             }
@@ -134,6 +155,19 @@ namespace SqlTestDataGenerator.Output
                 sb.AppendLine("    PRINT 'Scenario " + scenario.Id + " data inserted successfully.';");
                 sb.AppendLine("END TRY");
                 sb.AppendLine("BEGIN CATCH");
+
+                if (HandleIdentityInsert && identityTablesInScenario.Any())
+                {
+                    foreach (var table in identityTablesInScenario)
+                    {
+                        sb.AppendLine("    BEGIN TRY");
+                        sb.AppendLine($"        SET IDENTITY_INSERT [{SchemaName}].[{table}] OFF;");
+                        sb.AppendLine("    END TRY");
+                        sb.AppendLine("    BEGIN CATCH");
+                        sb.AppendLine("    END CATCH");
+                    }
+                }
+
                 sb.AppendLine("    ROLLBACK TRANSACTION;");
                 sb.AppendLine("    PRINT 'Error in Scenario " + scenario.Id + ": ' + ERROR_MESSAGE();");
                 sb.AppendLine("END CATCH");
@@ -143,17 +177,65 @@ namespace SqlTestDataGenerator.Output
         }
 
         /// <summary>
-        /// Generate a single INSERT statement for a row.
+        /// Generate INSERT statements grouped by identical column sets.
         /// </summary>
-        private string GenerateInsertStatement(string tableName, GeneratedRow row)
+        private List<string> GenerateInsertStatements(string tableName, List<GeneratedRow> rows)
         {
-            var columns = row.ColumnValues.Keys.ToList();
-            var values = columns.Select(col => FormatValue(row.ColumnValues[col])).ToList();
+            var statements = new List<string>();
+            var groupedRows = rows.GroupBy(r =>
+                string.Join("|", r.ColumnValues.Keys.Select(c => c.ToLowerInvariant())));
 
-            var colList = string.Join(", ", columns.Select(c => $"[{c}]"));
-            var valList = string.Join(", ", values);
+            foreach (var group in groupedRows)
+            {
+                var first = group.First();
+                var columns = first.ColumnValues.Keys.ToList();
+                var colList = string.Join(", ", columns.Select(c => $"[{c}]"));
+                var valueLines = new List<string>();
 
-            return $"INSERT INTO [{SchemaName}].[{tableName}] ({colList}) VALUES ({valList});";
+                foreach (var row in group)
+                {
+                    var values = columns.Select(col => FormatValue(row.ColumnValues[col]));
+                    valueLines.Add($"({string.Join(", ", values)})");
+                }
+
+                var valuesSql = string.Join(",\r\n", valueLines);
+                statements.Add($"INSERT INTO [{SchemaName}].[{tableName}] ({colList}) VALUES\r\n{valuesSql};");
+            }
+
+            return statements;
+        }
+
+        private static bool HasIdentityValues(TableSchema schema, List<GeneratedRow> rows)
+        {
+            var identityColumns = schema.Columns
+                .Where(c => c.IsIdentity)
+                .Select(c => c.ColumnName)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            return rows.Any(r => r.ColumnValues.Keys.Any(identityColumns.Contains));
+        }
+
+        private List<string> GetIdentityTablesWithGeneratedValues(BranchScenario scenario)
+        {
+            var tables = new List<string>();
+            if (!HandleIdentityInsert || Schemas == null)
+                return tables;
+
+            foreach (var kvp in scenario.TableRows)
+            {
+                var validRows = kvp.Value.Where(r => r.ColumnValues.Any()).ToList();
+                if (!validRows.Any())
+                    continue;
+
+                if (Schemas.TryGetValue(kvp.Key, out var schema) && HasIdentityValues(schema, validRows))
+                {
+                    tables.Add(kvp.Key);
+                }
+            }
+
+            return tables
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
         }
 
         /// <summary>
@@ -174,6 +256,7 @@ namespace SqlTestDataGenerator.Output
                 float f => f.ToString(CultureInfo.InvariantCulture),
                 DateTime dt => $"'{dt:yyyy-MM-dd HH:mm:ss}'",
                 DateTimeOffset dto => $"'{dto:yyyy-MM-dd HH:mm:ss zzz}'",
+                TimeSpan ts => $"'{ts:hh\\:mm\\:ss}'",
                 Guid g => $"'{g}'",
                 string s => $"N'{EscapeSqlString(s)}'",
                 byte[] bytes => $"0x{BitConverter.ToString(bytes).Replace("-", "")}",

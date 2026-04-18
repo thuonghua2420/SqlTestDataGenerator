@@ -21,6 +21,11 @@ namespace SqlTestDataGenerator.DataGeneration
         public int StartId { get; set; } = 90000;
 
         /// <summary>
+        /// Target number of rows generated per table for each selected scenario.
+        /// </summary>
+        public int RowsPerTable { get; set; } = 1;
+
+        /// <summary>
         /// Generate test data for all scenarios.
         /// </summary>
         public GeneratedDataSet Generate(
@@ -35,7 +40,11 @@ namespace SqlTestDataGenerator.DataGeneration
             };
 
             // Resolve INSERT order
-            var tableNames = query.Tables.Select(t => t.TableName).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            var tableNames = query.Tables
+                .Select(t => t.TableName)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Where(t => schemas.TryGetValue(t, out var s) && s.Columns.Any())
+                .ToList();
             List<string> insertOrder;
 
             try
@@ -52,7 +61,9 @@ namespace SqlTestDataGenerator.DataGeneration
             {
                 foreach (var subTable in sub.Tables)
                 {
-                    if (!tableNames.Contains(subTable.TableName, StringComparer.OrdinalIgnoreCase))
+                    if (!tableNames.Contains(subTable.TableName, StringComparer.OrdinalIgnoreCase) &&
+                        schemas.TryGetValue(subTable.TableName, out var subSchema) &&
+                        subSchema.Columns.Any())
                     {
                         tableNames.Add(subTable.TableName);
                     }
@@ -92,7 +103,7 @@ namespace SqlTestDataGenerator.DataGeneration
         {
             // Generate a unique ID set for this scenario
             var scenarioBaseId = _idCounter;
-            _idCounter += 100;
+            _idCounter += GetScenarioIdStride();
 
             switch (scenario.Type)
             {
@@ -122,6 +133,10 @@ namespace SqlTestDataGenerator.DataGeneration
             }
         }
 
+        private int GetRequestedRowCount() => Math.Max(1, RowsPerTable);
+
+        private int GetScenarioIdStride() => Math.Max(1000, GetRequestedRowCount() * 500);
+
         // ─── Positive scenario: all conditions satisfied ────────────────
         private void GeneratePositiveData(
             BranchScenario scenario, ParsedQuery query,
@@ -145,7 +160,9 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 // For tables that contribute to aggregates, create multiple rows
                 bool isAggregateSource = IsAggregateSourceTable(tableName, alias, query);
-                int rowCount = isAggregateSource ? rowMultiplier : 1;
+                int rowCount = isAggregateSource
+                    ? Math.Max(rowMultiplier, GetRequestedRowCount())
+                    : GetRequestedRowCount();
 
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
@@ -154,7 +171,6 @@ namespace SqlTestDataGenerator.DataGeneration
 
                     foreach (var col in schema.Columns)
                     {
-                        if (col.IsIdentity) continue; // Skip identity columns
                         if (col.IsComputed) continue;
 
                         var value = GenerateColumnValue(col, alias, query, schemas,
@@ -167,7 +183,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 // Store the ID for FK references
                 sharedIds[tableName] = currentId;
-                currentId += rowMultiplier + 1;
+                currentId += rowCount + 1;
             }
 
             // Handle subquery support data
@@ -195,26 +211,32 @@ namespace SqlTestDataGenerator.DataGeneration
                     .FirstOrDefault(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase))
                     ?.Alias ?? tableName;
 
-                var row = new GeneratedRow { TableName = tableName };
-
-                foreach (var col in schema.Columns)
+                int rowCount = GetRequestedRowCount();
+                for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
-                    if (col.IsIdentity || col.IsComputed) continue;
+                    var row = new GeneratedRow { TableName = tableName };
+                    int rowId = currentId + rowIdx;
 
-                    // Check if this column is the one being tested
-                    bool isTestedColumn = testedCondition != null &&
-                        col.ColumnName.Equals(testedCondition.ColumnName, StringComparison.OrdinalIgnoreCase) &&
-                        (string.IsNullOrEmpty(testedCondition.TableAlias) ||
-                         alias.Equals(testedCondition.TableAlias, StringComparison.OrdinalIgnoreCase));
+                    foreach (var col in schema.Columns)
+                    {
+                        if (col.IsComputed) continue;
 
-                    var value = GenerateColumnValue(col, alias, query, schemas,
-                        sharedIds, currentId, satisfy: !isTestedColumn, 0);
-                    row.SetValue(col.ColumnName, value);
+                        // Check if this column is the one being tested
+                        bool isTestedColumn = testedCondition != null &&
+                            col.ColumnName.Equals(testedCondition.ColumnName, StringComparison.OrdinalIgnoreCase) &&
+                            (string.IsNullOrEmpty(testedCondition.TableAlias) ||
+                             alias.Equals(testedCondition.TableAlias, StringComparison.OrdinalIgnoreCase));
+
+                        var value = GenerateColumnValue(col, alias, query, schemas,
+                            sharedIds, rowId, satisfy: !isTestedColumn, rowIdx);
+                        row.SetValue(col.ColumnName, value);
+                    }
+
+                    scenario.AddRow(tableName, row);
                 }
 
-                scenario.AddRow(tableName, row);
                 sharedIds[tableName] = currentId;
-                currentId++;
+                currentId += rowCount + 1;
             }
         }
 
@@ -243,12 +265,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 // For COUNT fail: create only 1 row (instead of the required minimum)
                 // For SUM fail: create rows with very small values
-                int rowCount = 1;
-                if (isAggregateSource && testedCondition?.AggregateFunc == AggregateFunction.Count)
-                {
-                    // If HAVING COUNT >= 3, we create only 1 row
-                    rowCount = 1;
-                }
+                int rowCount = isAggregateSource ? 1 : GetRequestedRowCount();
 
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
@@ -257,7 +274,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                     foreach (var col in schema.Columns)
                     {
-                        if (col.IsIdentity || col.IsComputed) continue;
+                        if (col.IsComputed) continue;
 
                         // For SUM/AVG failures, use tiny values for the aggregate column
                         bool useSmallValue = isAggregateSource &&
@@ -314,34 +331,40 @@ namespace SqlTestDataGenerator.DataGeneration
                     .FirstOrDefault(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase))
                     ?.Alias ?? tableName;
 
-                var row = new GeneratedRow { TableName = tableName };
-
-                foreach (var col in schema.Columns)
+                int rowCount = GetRequestedRowCount();
+                for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
-                    if (col.IsIdentity || col.IsComputed) continue;
+                    var row = new GeneratedRow { TableName = tableName };
+                    int rowId = currentId + rowIdx;
 
-                    // For the FK column that references the missing table, use a non-existent ID
-                    bool isMissingFK = testedJoin != null &&
-                        col.ColumnName.Equals(testedJoin.LeftColumn, StringComparison.OrdinalIgnoreCase) &&
-                        alias.Equals(testedJoin.LeftTableAlias, StringComparison.OrdinalIgnoreCase);
-
-                    object? value;
-                    if (isMissingFK)
+                    foreach (var col in schema.Columns)
                     {
-                        value = 99999; // Non-existent foreign key
-                    }
-                    else
-                    {
-                        value = GenerateColumnValue(col, alias, query, schemas,
-                            sharedIds, currentId, satisfy: true, 0);
+                        if (col.IsComputed) continue;
+
+                        // For the FK column that references the missing table, use a non-existent ID
+                        bool isMissingFK = testedJoin != null &&
+                            col.ColumnName.Equals(testedJoin.LeftColumn, StringComparison.OrdinalIgnoreCase) &&
+                            alias.Equals(testedJoin.LeftTableAlias, StringComparison.OrdinalIgnoreCase);
+
+                        object? value;
+                        if (isMissingFK)
+                        {
+                            value = 99999; // Non-existent foreign key
+                        }
+                        else
+                        {
+                            value = GenerateColumnValue(col, alias, query, schemas,
+                                sharedIds, rowId, satisfy: true, rowIdx);
+                        }
+
+                        row.SetValue(col.ColumnName, value);
                     }
 
-                    row.SetValue(col.ColumnName, value);
+                    scenario.AddRow(tableName, row);
                 }
 
-                scenario.AddRow(tableName, row);
                 sharedIds[tableName] = currentId;
-                currentId++;
+                currentId += rowCount + 1;
             }
         }
 
@@ -364,20 +387,26 @@ namespace SqlTestDataGenerator.DataGeneration
                     .FirstOrDefault(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase))
                     ?.Alias ?? tableName;
 
-                var row = new GeneratedRow { TableName = tableName };
-
-                foreach (var col in schema.Columns)
+                int rowCount = GetRequestedRowCount();
+                for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
-                    if (col.IsIdentity || col.IsComputed) continue;
+                    var row = new GeneratedRow { TableName = tableName };
+                    int rowId = currentId + rowIdx;
 
-                    var value = GenerateColumnValue(col, alias, query, schemas,
-                        sharedIds, currentId, satisfy: true, 0);
-                    row.SetValue(col.ColumnName, value);
+                    foreach (var col in schema.Columns)
+                    {
+                        if (col.IsComputed) continue;
+
+                        var value = GenerateColumnValue(col, alias, query, schemas,
+                            sharedIds, rowId, satisfy: true, rowIdx);
+                        row.SetValue(col.ColumnName, value);
+                    }
+
+                    scenario.AddRow(tableName, row);
                 }
 
-                scenario.AddRow(tableName, row);
                 sharedIds[tableName] = currentId;
-                currentId++;
+                currentId += rowCount + 1;
             }
 
             // DO NOT generate subquery support data → the IN/EXISTS condition will fail
@@ -407,7 +436,9 @@ namespace SqlTestDataGenerator.DataGeneration
                     ?.Alias ?? tableName;
 
                 bool isAggSource = IsAggregateSourceTable(tableName, alias, query);
-                int rowCount = isAggSource ? rowMultiplier : 1;
+                int rowCount = isAggSource
+                    ? Math.Max(rowMultiplier, GetRequestedRowCount())
+                    : GetRequestedRowCount();
 
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
@@ -416,7 +447,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                     foreach (var col in schema.Columns)
                     {
-                        if (col.IsIdentity || col.IsComputed) continue;
+                        if (col.IsComputed) continue;
 
                         bool isBoundaryColumn = testedCondition != null &&
                             col.ColumnName.Equals(testedCondition.ColumnName, StringComparison.OrdinalIgnoreCase) &&
@@ -458,6 +489,12 @@ namespace SqlTestDataGenerator.DataGeneration
             bool satisfy, int rowIndex)
         {
             var generator = _valueFactory.GetGenerator(col.TypeCategory);
+
+            // Always generate explicit values for IDENTITY columns so scripts can include full rows.
+            if (col.IsIdentity)
+            {
+                return rowId;
+            }
 
             // 1. Check if this column has a FK → use the parent table's ID
             var schema = schemas.Values.FirstOrDefault(s =>
@@ -659,7 +696,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                     foreach (var col in schema.Columns)
                     {
-                        if (col.IsIdentity || col.IsComputed) continue;
+                        if (col.IsComputed) continue;
 
                         // Satisfy subquery WHERE conditions
                         var subCondition = subquery.Conditions
@@ -715,7 +752,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                     foreach (var col in schema.Columns)
                     {
-                        if (col.IsIdentity || col.IsComputed) continue;
+                        if (col.IsComputed) continue;
 
                         if (col.IsPrimaryKey)
                             row.SetValue(col.ColumnName, baseId);

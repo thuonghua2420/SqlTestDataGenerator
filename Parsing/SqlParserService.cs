@@ -44,7 +44,10 @@ namespace SqlTestDataGenerator.Parsing
             // Step 3: Extract tables
             var tableVisitor = new TableExtractorVisitor();
             fragment.Accept(tableVisitor);
-            result.Tables = tableVisitor.Tables;
+            var cteNames = ExtractCteNames(fragment);
+            result.Tables = tableVisitor.Tables
+                .Where(t => !cteNames.Contains(t.TableName))
+                .ToList();
 
             // Step 4: Extract JOINs and update table roles
             var joinVisitor = new JoinExtractorVisitor();
@@ -343,6 +346,34 @@ namespace SqlTestDataGenerator.Parsing
 
         private bool IsAggregateFunction(string name) =>
             name.ToUpperInvariant() is "COUNT" or "SUM" or "AVG" or "MAX" or "MIN";
+
+        private HashSet<string> ExtractCteNames(TSqlFragment fragment)
+        {
+            var cteNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (fragment is not TSqlScript script)
+                return cteNames;
+
+            foreach (var batch in script.Batches)
+            {
+                foreach (var stmt in batch.Statements)
+                {
+                    if (stmt is SelectStatement selectStmt &&
+                        selectStmt.WithCtesAndXmlNamespaces?.CommonTableExpressions != null)
+                    {
+                        foreach (var cte in selectStmt.WithCtesAndXmlNamespaces.CommonTableExpressions)
+                        {
+                            if (!string.IsNullOrWhiteSpace(cte.ExpressionName?.Value))
+                            {
+                                cteNames.Add(cte.ExpressionName.Value);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return cteNames;
+        }
 
         private string GetFragmentText(TSqlFragment node)
         {

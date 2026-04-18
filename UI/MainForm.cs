@@ -35,9 +35,11 @@ namespace SqlTestDataGenerator.UI
 
         private SplitContainer _mainSplitter = null!;
         private SplitContainer _topSplitter = null!;
+        private SplitContainer _bottomSplitter = null!;
 
         private TextBox _sqlInput = null!;
         private TextBox _analysisOutput = null!;
+        private TextBox _scriptCleanOutput = null!;
         private TextBox _scriptOutput = null!;
 
         private Button _analyzeBtn = null!;
@@ -52,19 +54,20 @@ namespace SqlTestDataGenerator.UI
         private CheckedListBox _scenarioList = null!;
         private Label _statusLabel = null!;
         private NumericUpDown _startIdInput = null!;
+        private NumericUpDown _rowsPerTableInput = null!;
 
-        // ── Colors (Modern Dark Theme) ──
-        private readonly Color _bgDark = Color.FromArgb(24, 24, 32);
-        private readonly Color _bgPanel = Color.FromArgb(32, 33, 44);
-        private readonly Color _bgInput = Color.FromArgb(40, 42, 56);
-        private readonly Color _bgHeader = Color.FromArgb(18, 18, 26);
-        private readonly Color _accentBlue = Color.FromArgb(88, 130, 247);
-        private readonly Color _accentGreen = Color.FromArgb(72, 209, 156);
-        private readonly Color _accentOrange = Color.FromArgb(255, 169, 77);
-        private readonly Color _accentRed = Color.FromArgb(255, 99, 115);
-        private readonly Color _textPrimary = Color.FromArgb(230, 233, 240);
-        private readonly Color _textSecondary = Color.FromArgb(160, 166, 180);
-        private readonly Color _borderColor = Color.FromArgb(55, 58, 75);
+        // ── Colors (Standard Light Theme) ──
+        private readonly Color _bgDark = SystemColors.Control;
+        private readonly Color _bgPanel = SystemColors.Control;
+        private readonly Color _bgInput = Color.White;
+        private readonly Color _bgHeader = SystemColors.Control;
+        private readonly Color _accentBlue = Color.FromArgb(0, 120, 215);
+        private readonly Color _accentGreen = Color.FromArgb(16, 124, 16);
+        private readonly Color _accentOrange = Color.FromArgb(180, 100, 0);
+        private readonly Color _accentRed = Color.FromArgb(200, 50, 50);
+        private readonly Color _textPrimary = SystemColors.ControlText;
+        private readonly Color _textSecondary = SystemColors.GrayText;
+        private readonly Color _borderColor = SystemColors.ControlDark;
 
         public MainForm()
         {
@@ -139,7 +142,7 @@ namespace SqlTestDataGenerator.UI
                 Text = "Start ID:",
                 AutoSize = true,
                 Location = new Point(320, 13),
-                ForeColor = _textSecondary,
+                ForeColor = SystemColors.ControlText,
                 Font = new Font("Segoe UI", 9F)
             };
 
@@ -152,12 +155,35 @@ namespace SqlTestDataGenerator.UI
                 Location = new Point(385, 9),
                 Width = 90,
                 Font = new Font("Segoe UI", 9F),
-                BackColor = _bgInput,
-                ForeColor = _textPrimary,
+                BackColor = SystemColors.Window,
+                ForeColor = SystemColors.WindowText,
                 BorderStyle = BorderStyle.FixedSingle
             };
 
-            _toolbarPanel.Controls.AddRange(new Control[] { _analyzeBtn, _generateBtn, startIdLabel, _startIdInput });
+            var rowsPerTableLabel = new Label
+            {
+                Text = "Rows/Table:",
+                AutoSize = true,
+                Location = new Point(490, 13),
+                ForeColor = SystemColors.ControlText,
+                Font = new Font("Segoe UI", 9F)
+            };
+
+            _rowsPerTableInput = new NumericUpDown
+            {
+                Minimum = 1,
+                Maximum = 1000,
+                Value = 1,
+                Increment = 1,
+                Location = new Point(565, 9),
+                Width = 70,
+                Font = new Font("Segoe UI", 9F),
+                BackColor = SystemColors.Window,
+                ForeColor = SystemColors.WindowText,
+                BorderStyle = BorderStyle.FixedSingle
+            };
+
+            _toolbarPanel.Controls.AddRange(new Control[] { _analyzeBtn, _generateBtn, startIdLabel, _startIdInput, rowsPerTableLabel, _rowsPerTableInput });
 
             // ═══ Main Content ═══
             _mainSplitter = new SplitContainer
@@ -252,15 +278,48 @@ namespace SqlTestDataGenerator.UI
             _topSplitter.Panel1.Controls.Add(sqlPanel);
             _topSplitter.Panel2.Controls.Add(analysisPanel);
 
-            // Bottom: Generated Script
-            var scriptPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(8) };
-            var scriptLabel = new Label
+            // Bottom: Split into Clean INSERT (left) + Full Log (right)
+            _bottomSplitter = new SplitContainer
             {
-                Text = "📜 Generated INSERT Scripts",
+                Dock = DockStyle.Fill,
+                Orientation = Orientation.Vertical,
+                SplitterDistance = 500,
+                BackColor = SystemColors.ControlDark,
+                SplitterWidth = 3
+            };
+
+            // Left: Clean INSERT only
+            var cleanPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(8) };
+            var cleanLabel = new Label
+            {
+                Text = "📜 INSERT Scripts",
                 Dock = DockStyle.Top,
                 Height = 30,
                 Font = new Font("Segoe UI Semibold", 11F),
                 ForeColor = _accentOrange,
+                Padding = new Padding(4, 6, 0, 0)
+            };
+            _scriptCleanOutput = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Multiline = true,
+                ScrollBars = ScrollBars.Both,
+                ReadOnly = true,
+                WordWrap = false,
+                Font = new Font("Cascadia Code, Consolas", 9.5F),
+            };
+            cleanPanel.Controls.Add(_scriptCleanOutput);
+            cleanPanel.Controls.Add(cleanLabel);
+
+            // Right: Full log (with comments, transactions)
+            var logPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(8) };
+            var logLabel = new Label
+            {
+                Text = "📋 Full Log",
+                Dock = DockStyle.Top,
+                Height = 30,
+                Font = new Font("Segoe UI Semibold", 11F),
+                ForeColor = _accentBlue,
                 Padding = new Padding(4, 6, 0, 0)
             };
             _scriptOutput = new TextBox
@@ -272,11 +331,14 @@ namespace SqlTestDataGenerator.UI
                 WordWrap = false,
                 Font = new Font("Cascadia Code, Consolas", 9.5F),
             };
-            scriptPanel.Controls.Add(_scriptOutput);
-            scriptPanel.Controls.Add(scriptLabel);
+            logPanel.Controls.Add(_scriptOutput);
+            logPanel.Controls.Add(logLabel);
+
+            _bottomSplitter.Panel1.Controls.Add(cleanPanel);
+            _bottomSplitter.Panel2.Controls.Add(logPanel);
 
             _mainSplitter.Panel1.Controls.Add(_topSplitter);
-            _mainSplitter.Panel2.Controls.Add(scriptPanel);
+            _mainSplitter.Panel2.Controls.Add(_bottomSplitter);
 
             // ═══ Bottom Toolbar ═══
             _bottomToolbar = new Panel
@@ -319,38 +381,50 @@ namespace SqlTestDataGenerator.UI
 
         private void ApplyTheme()
         {
-            this.BackColor = _bgDark;
-            this.ForeColor = _textPrimary;
+            this.BackColor = SystemColors.Control;
+            this.ForeColor = SystemColors.ControlText;
 
-            _headerPanel.BackColor = _bgHeader;
-            _toolbarPanel.BackColor = _bgPanel;
-            _bottomToolbar.BackColor = _bgPanel;
+            _headerPanel.BackColor = SystemColors.Control;
+            _toolbarPanel.BackColor = SystemColors.Control;
+            _bottomToolbar.BackColor = SystemColors.Control;
 
-            _titleLabel.ForeColor = _textPrimary;
+            _titleLabel.ForeColor = SystemColors.ControlText;
             _connectionStatusLabel.ForeColor = _accentRed;
 
-            _sqlInput.BackColor = _bgInput;
-            _sqlInput.ForeColor = _textPrimary;
-            _sqlInput.BorderStyle = BorderStyle.None;
+            _sqlInput.BackColor = SystemColors.Window;
+            _sqlInput.ForeColor = SystemColors.WindowText;
+            _sqlInput.BorderStyle = BorderStyle.FixedSingle;
 
-            _analysisOutput.BackColor = _bgInput;
-            _analysisOutput.ForeColor = _textPrimary;
-            _analysisOutput.BorderStyle = BorderStyle.None;
+            _analysisOutput.BackColor = SystemColors.Window;
+            _analysisOutput.ForeColor = SystemColors.WindowText;
+            _analysisOutput.BorderStyle = BorderStyle.FixedSingle;
 
-            _scriptOutput.BackColor = _bgInput;
-            _scriptOutput.ForeColor = _textPrimary;
-            _scriptOutput.BorderStyle = BorderStyle.None;
+            _scriptCleanOutput.BackColor = SystemColors.Window;
+            _scriptCleanOutput.ForeColor = SystemColors.WindowText;
+            _scriptCleanOutput.BorderStyle = BorderStyle.FixedSingle;
 
-            _scenarioList.BackColor = _bgInput;
-            _scenarioList.ForeColor = _textPrimary;
+            _scriptOutput.BackColor = SystemColors.Window;
+            _scriptOutput.ForeColor = SystemColors.WindowText;
+            _scriptOutput.BorderStyle = BorderStyle.FixedSingle;
 
-            _mainSplitter.Panel1.BackColor = _bgDark;
-            _mainSplitter.Panel2.BackColor = _bgDark;
-            _topSplitter.Panel1.BackColor = _bgDark;
-            _topSplitter.Panel2.BackColor = _bgDark;
+            _bottomSplitter.Panel1.BackColor = SystemColors.Control;
+            _bottomSplitter.Panel2.BackColor = SystemColors.Control;
 
-            _startIdInput.BackColor = _bgInput;
-            _startIdInput.ForeColor = _textPrimary;
+            _scenarioList.BackColor = SystemColors.Window;
+            _scenarioList.ForeColor = SystemColors.WindowText;
+            _scenarioList.BorderStyle = BorderStyle.FixedSingle;
+
+            _mainSplitter.BackColor = SystemColors.ControlDark;
+            _mainSplitter.Panel1.BackColor = SystemColors.Control;
+            _mainSplitter.Panel2.BackColor = SystemColors.Control;
+            _topSplitter.BackColor = SystemColors.ControlDark;
+            _topSplitter.Panel1.BackColor = SystemColors.Control;
+            _topSplitter.Panel2.BackColor = SystemColors.Control;
+
+            _startIdInput.BackColor = SystemColors.Window;
+            _startIdInput.ForeColor = SystemColors.WindowText;
+            _rowsPerTableInput.BackColor = SystemColors.Window;
+            _rowsPerTableInput.ForeColor = SystemColors.WindowText;
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -384,7 +458,7 @@ namespace SqlTestDataGenerator.UI
                 {
                     _schemaIntrospector = new SchemaIntrospector(() => _connectionManager.CreateNewConnection());
                     _connectionStatusLabel.Text = $"● Connected: {form.ServerName}/{form.DatabaseName}";
-                    _connectionStatusLabel.ForeColor = _accentGreen;
+                    _connectionStatusLabel.ForeColor = Color.Green;
                     _connectBtn.Visible = false;
                     _disconnectBtn.Visible = true;
                     SetStatus("Database connected successfully.");
@@ -441,7 +515,8 @@ namespace SqlTestDataGenerator.UI
                 _scenarioList.Items.Clear();
                 foreach (var s in scenarios)
                 {
-                    _scenarioList.Items.Add($"[{s.Type}] {s.Name}", true);
+                    var shouldCheck = s.Type == DataGeneration.Models.ScenarioType.Positive;
+                    _scenarioList.Items.Add($"[{s.Type}] {s.Name}", shouldCheck);
                 }
 
                 _generateBtn.Enabled = true;
@@ -465,6 +540,7 @@ namespace SqlTestDataGenerator.UI
             {
                 SetStatus("Generating test data...");
                 _dataEngine.StartId = (int)_startIdInput.Value;
+                _dataEngine.RowsPerTable = (int)_rowsPerTableInput.Value;
 
                 // Get schemas from database if connected
                 _schemas = null;
@@ -506,16 +582,25 @@ namespace SqlTestDataGenerator.UI
                     _currentDataSet = _dataEngine.GenerateWithoutSchema(_currentQuery, selectedScenarios);
                 }
 
-                // Generate INSERT scripts
+                // Generate full INSERT scripts (with comments + transactions)
                 _insertGenerator.Schemas = _schemas;
                 _insertGenerator.HandleIdentityInsert = _schemas != null;
-                var script = _insertGenerator.GenerateScript(_currentDataSet);
+                _insertGenerator.IncludeComments = true;
+                _insertGenerator.WrapInTransaction = true;
+                var fullScript = _insertGenerator.GenerateScript(_currentDataSet);
 
-                _scriptOutput.Text = script;
-                SetStatus($"Generated {selectedScenarios.Count} scenarios with INSERT scripts.");
+                // Generate clean INSERT scripts (no comments, no transactions)
+                _insertGenerator.IncludeComments = false;
+                _insertGenerator.WrapInTransaction = false;
+                var cleanScript = _insertGenerator.GenerateScript(_currentDataSet);
+
+                _scriptCleanOutput.Text = cleanScript;
+                _scriptOutput.Text = fullScript;
+                SetStatus($"Generated {selectedScenarios.Count} scenario(s), {_rowsPerTableInput.Value} row(s)/table.");
             }
             catch (Exception ex)
             {
+                _scriptCleanOutput.Text = $"-- Error: {ex.Message}";
                 _scriptOutput.Text = $"-- Error generating data: {ex.Message}\r\n-- {ex.StackTrace}";
                 SetStatus("Generation failed.");
             }
@@ -523,10 +608,10 @@ namespace SqlTestDataGenerator.UI
 
         private void CopyBtn_Click(object? sender, EventArgs e)
         {
-            if (!string.IsNullOrEmpty(_scriptOutput.Text))
+            if (!string.IsNullOrEmpty(_scriptCleanOutput.Text))
             {
-                Clipboard.SetText(_scriptOutput.Text);
-                SetStatus("INSERT script copied to clipboard!");
+                Clipboard.SetText(_scriptCleanOutput.Text);
+                SetStatus("Clean INSERT script copied to clipboard!");
             }
         }
 
@@ -581,17 +666,14 @@ namespace SqlTestDataGenerator.UI
             {
                 Text = text,
                 Size = new Size(width, 32),
-                FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 9F, FontStyle.Bold),
-                ForeColor = Color.White,
-                BackColor = Color.FromArgb(accentColor.R / 3, accentColor.G / 3, accentColor.B / 3),
+                FlatStyle = FlatStyle.Standard,
+                Font = new Font("Segoe UI", 9F),
+                ForeColor = SystemColors.ControlText,
+                BackColor = SystemColors.Control,
                 Cursor = Cursors.Hand,
-                TextAlign = ContentAlignment.MiddleCenter
+                TextAlign = ContentAlignment.MiddleCenter,
+                UseVisualStyleBackColor = true
             };
-            btn.FlatAppearance.BorderColor = accentColor;
-            btn.FlatAppearance.BorderSize = 1;
-            btn.FlatAppearance.MouseOverBackColor = Color.FromArgb(60, accentColor);
-            btn.FlatAppearance.MouseDownBackColor = Color.FromArgb(80, accentColor);
 
             return btn;
         }
