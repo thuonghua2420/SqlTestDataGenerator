@@ -1,0 +1,296 @@
+using SqlTestDataGenerator.Schema.Models;
+using System.Globalization;
+using System.Text;
+
+namespace SqlTestDataGenerator.Schema
+{
+    /// <summary>
+    /// Normalizes CLR values to SQL Server-compatible runtime values based on column schema.
+    /// This keeps generation, validation, and execution aligned to the same final representation.
+    /// </summary>
+    public static class SqlServerValueNormalizer
+    {
+        public static object? NormalizeValue(ColumnSchema column, object? value)
+        {
+            if (value == null || value == DBNull.Value)
+                return null;
+
+            return column.DataType.ToLowerInvariant() switch
+            {
+                "bigint" or "int" or "smallint" or "tinyint" => NormalizeInteger(column, value),
+                "decimal" or "numeric" or "money" or "smallmoney" => NormalizeDecimal(column, value),
+                "float" or "real" => NormalizeFloat(column, value),
+                "bit" => NormalizeBoolean(value),
+                "date" or "datetime" or "datetime2" or "smalldatetime" => NormalizeDateTime(column, value),
+                "datetimeoffset" => NormalizeDateTimeOffset(value),
+                "time" => NormalizeTime(value),
+                "char" or "varchar" or "nchar" or "nvarchar" or "text" or "ntext" => NormalizeString(column, value),
+                "uniqueidentifier" => NormalizeGuid(value),
+                "binary" or "varbinary" or "image" => NormalizeBinary(column, value),
+                "xml" => NormalizeXml(value),
+                _ => value
+            };
+        }
+
+        private static object NormalizeInteger(ColumnSchema column, object value)
+        {
+            var parsed = ConvertToDecimal(value);
+            var integral = decimal.Truncate(parsed);
+
+            return column.DataType.ToLowerInvariant() switch
+            {
+                "tinyint" => (byte)Clamp(integral, byte.MinValue, byte.MaxValue),
+                "smallint" => (short)Clamp(integral, short.MinValue, short.MaxValue),
+                "int" => (int)Clamp(integral, int.MinValue, int.MaxValue),
+                _ => (long)Clamp(integral, long.MinValue, long.MaxValue)
+            };
+        }
+
+        private static object NormalizeDecimal(ColumnSchema column, object value)
+        {
+            var parsed = ConvertToDecimal(value);
+            var scale = GetScale(column);
+            var step = GetStep(scale);
+            var max = GetMaxAbsValue(column, step);
+            var rounded = decimal.Round(parsed, scale, MidpointRounding.AwayFromZero);
+
+            if (rounded > max)
+                rounded = max;
+            else if (rounded < -max)
+                rounded = -max;
+
+            return rounded;
+        }
+
+        private static object NormalizeFloat(ColumnSchema column, object value)
+        {
+            var parsed = ConvertToDouble(value);
+            return column.DataType.Equals("real", StringComparison.OrdinalIgnoreCase)
+                ? (object)(float)parsed
+                : parsed;
+        }
+
+        private static object NormalizeBoolean(object value)
+        {
+            return value switch
+            {
+                bool b => b,
+                byte b => b != 0,
+                short s => s != 0,
+                int i => i != 0,
+                long l => l != 0,
+                decimal d => d != 0m,
+                string s when bool.TryParse(s, out var parsedBool) => parsedBool,
+                string s when int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedInt) => parsedInt != 0,
+                _ => Convert.ToBoolean(value, CultureInfo.InvariantCulture)
+            };
+        }
+
+        private static object NormalizeDateTime(ColumnSchema column, object value)
+        {
+            var dateTime = ToDateTime(value);
+            dateTime = DateTime.SpecifyKind(dateTime, DateTimeKind.Unspecified);
+
+            return column.DataType.ToLowerInvariant() switch
+            {
+                "date" => dateTime.Date,
+                "smalldatetime" => new DateTime(
+                    dateTime.Year, dateTime.Month, dateTime.Day,
+                    dateTime.Hour, dateTime.Minute, 0, DateTimeKind.Unspecified),
+                _ => dateTime
+            };
+        }
+
+        private static object NormalizeDateTimeOffset(object value)
+        {
+            return value switch
+            {
+                DateTimeOffset dto => dto,
+                DateTime dt => new DateTimeOffset(DateTime.SpecifyKind(dt, DateTimeKind.Unspecified), TimeSpan.Zero),
+                string s when DateTimeOffset.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var parsedDto) => parsedDto,
+                string s when DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsedDt) =>
+                    new DateTimeOffset(DateTime.SpecifyKind(parsedDt, DateTimeKind.Unspecified), TimeSpan.Zero),
+                _ => throw new InvalidOperationException($"Cannot normalize value '{value}' to datetimeoffset.")
+            };
+        }
+
+        private static object NormalizeTime(object value)
+        {
+            return value switch
+            {
+                TimeSpan ts => ts,
+                DateTime dt => dt.TimeOfDay,
+                DateTimeOffset dto => dto.TimeOfDay,
+                string s when TimeSpan.TryParse(s, CultureInfo.InvariantCulture, out var parsedTs) => parsedTs,
+                string s when DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsedDt) => parsedDt.TimeOfDay,
+                _ => throw new InvalidOperationException($"Cannot normalize value '{value}' to time.")
+            };
+        }
+
+        private static object NormalizeString(ColumnSchema column, object value)
+        {
+            var text = value switch
+            {
+                string s => s,
+                Guid g => g.ToString(),
+                DateTime dt => dt.ToString("O", CultureInfo.InvariantCulture),
+                DateTimeOffset dto => dto.ToString("O", CultureInfo.InvariantCulture),
+                TimeSpan ts => ts.ToString(),
+                _ => Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty
+            };
+
+            if (column.MaxLength.HasValue && column.MaxLength.Value > 0 && text.Length > column.MaxLength.Value)
+            {
+                text = text[..column.MaxLength.Value];
+            }
+
+            return text;
+        }
+
+        private static object NormalizeGuid(object value)
+        {
+            return value switch
+            {
+                Guid g => g,
+                string s when Guid.TryParse(s, out var parsed) => parsed,
+                _ => throw new InvalidOperationException($"Cannot normalize value '{value}' to uniqueidentifier.")
+            };
+        }
+
+        private static object NormalizeBinary(ColumnSchema column, object value)
+        {
+            byte[] bytes = value switch
+            {
+                byte[] existing => existing,
+                string s => Encoding.UTF8.GetBytes(s),
+                _ => throw new InvalidOperationException($"Cannot normalize value '{value}' to binary.")
+            };
+
+            if (column.MaxLength.HasValue && column.MaxLength.Value > 0 && bytes.Length > column.MaxLength.Value)
+            {
+                return bytes.Take(column.MaxLength.Value).ToArray();
+            }
+
+            return bytes;
+        }
+
+        private static object NormalizeXml(object value)
+        {
+            return value switch
+            {
+                string s => s,
+                _ => Convert.ToString(value, CultureInfo.InvariantCulture) ?? "<root />"
+            };
+        }
+
+        private static DateTime ToDateTime(object value)
+        {
+            return value switch
+            {
+                DateTime dt => dt,
+                DateTimeOffset dto => dto.DateTime,
+                string s when DateTimeOffset.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var parsedDto) => parsedDto.DateTime,
+                string s when DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsedDt) => parsedDt,
+                _ => throw new InvalidOperationException($"Cannot normalize value '{value}' to datetime.")
+            };
+        }
+
+        private static decimal ConvertToDecimal(object value)
+        {
+            return value switch
+            {
+                decimal d => d,
+                byte b => b,
+                short s => s,
+                int i => i,
+                long l => l,
+                float f => Convert.ToDecimal(f, CultureInfo.InvariantCulture),
+                double d => Convert.ToDecimal(d, CultureInfo.InvariantCulture),
+                string s when decimal.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out var parsed) => parsed,
+                _ => Convert.ToDecimal(value, CultureInfo.InvariantCulture)
+            };
+        }
+
+        private static double ConvertToDouble(object value)
+        {
+            return value switch
+            {
+                double d => d,
+                float f => f,
+                decimal d => Convert.ToDouble(d, CultureInfo.InvariantCulture),
+                byte b => b,
+                short s => s,
+                int i => i,
+                long l => l,
+                string s when double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out var parsed) => parsed,
+                _ => Convert.ToDouble(value, CultureInfo.InvariantCulture)
+            };
+        }
+
+        private static decimal Clamp(decimal value, decimal min, decimal max)
+        {
+            if (value < min) return min;
+            if (value > max) return max;
+            return value;
+        }
+
+        private static int GetScale(ColumnSchema column)
+        {
+            if (column.NumericScale.HasValue)
+                return Math.Max(0, column.NumericScale.Value);
+
+            return column.DataType.ToLowerInvariant() switch
+            {
+                "money" or "smallmoney" => 4,
+                _ => 0
+            };
+        }
+
+        private static int GetPrecision(ColumnSchema column)
+        {
+            if (column.NumericPrecision.HasValue)
+                return Math.Max(1, column.NumericPrecision.Value);
+
+            return column.DataType.ToLowerInvariant() switch
+            {
+                "money" => 19,
+                "smallmoney" => 10,
+                "float" => 15,
+                "real" => 7,
+                _ => 18
+            };
+        }
+
+        private static decimal GetStep(int scale)
+        {
+            decimal step = 1m;
+            for (int i = 0; i < scale; i++)
+            {
+                step /= 10m;
+            }
+
+            return step;
+        }
+
+        private static decimal Pow10(int exponent)
+        {
+            decimal result = 1m;
+            for (int i = 0; i < exponent; i++)
+            {
+                result *= 10m;
+            }
+
+            return result;
+        }
+
+        private static decimal GetMaxAbsValue(ColumnSchema column, decimal step)
+        {
+            var precision = GetPrecision(column);
+            var scale = GetScale(column);
+            var integerDigits = Math.Max(0, precision - scale);
+            var wholePartLimit = Pow10(integerDigits);
+            var max = wholePartLimit - step;
+            return max > 0m ? max : step;
+        }
+    }
+}

@@ -1,3 +1,4 @@
+using Microsoft.Data.SqlClient;
 using SqlTestDataGenerator.Database;
 using SqlTestDataGenerator.DataGeneration;
 using SqlTestDataGenerator.Output;
@@ -5,6 +6,7 @@ using SqlTestDataGenerator.Parsing;
 using SqlTestDataGenerator.Parsing.Models;
 using SqlTestDataGenerator.Schema;
 using SqlTestDataGenerator.Schema.Models;
+using System.Data;
 using System.Drawing.Drawing2D;
 
 namespace SqlTestDataGenerator.UI
@@ -15,9 +17,11 @@ namespace SqlTestDataGenerator.UI
         private readonly SqlParserService _parser = new();
         private readonly BranchCoverageAnalyzer _branchAnalyzer = new();
         private readonly DataGenerationEngine _dataEngine = new();
+        private readonly GeneratedDataSetNormalizer _dataNormalizer = new();
         private readonly InsertScriptGenerator _insertGenerator = new();
         private readonly CleanupScriptGenerator _cleanupGenerator = new();
         private readonly DependencyOrderResolver _orderResolver = new();
+        private readonly GeneratedDataDbExecutor _dbExecutor = new();
         private DatabaseConnectionManager? _connectionManager;
         private SchemaIntrospector? _schemaIntrospector;
 
@@ -44,6 +48,7 @@ namespace SqlTestDataGenerator.UI
 
         private Button _analyzeBtn = null!;
         private Button _generateBtn = null!;
+        private Button _insertDbBtn = null!;
         private Button _copyBtn = null!;
         private Button _saveBtn = null!;
         private Button _copyCleanupBtn = null!;
@@ -137,11 +142,16 @@ namespace SqlTestDataGenerator.UI
             _generateBtn.Enabled = false;
             _generateBtn.Click += GenerateBtn_Click;
 
+            _insertDbBtn = CreateButton("Insert to DB", _accentOrange, 130);
+            _insertDbBtn.Location = new Point(308, 8);
+            _insertDbBtn.Enabled = false;
+            _insertDbBtn.Click += InsertDbBtn_Click;
+
             var startIdLabel = new Label
             {
                 Text = "Start ID:",
                 AutoSize = true,
-                Location = new Point(320, 13),
+                Location = new Point(452, 13),
                 ForeColor = SystemColors.ControlText,
                 Font = new Font("Segoe UI", 9F)
             };
@@ -152,7 +162,7 @@ namespace SqlTestDataGenerator.UI
                 Maximum = 9999999,
                 Value = 90000,
                 Increment = 1000,
-                Location = new Point(385, 9),
+                Location = new Point(517, 9),
                 Width = 90,
                 Font = new Font("Segoe UI", 9F),
                 BackColor = SystemColors.Window,
@@ -164,7 +174,7 @@ namespace SqlTestDataGenerator.UI
             {
                 Text = "Rows/Table:",
                 AutoSize = true,
-                Location = new Point(490, 13),
+                Location = new Point(622, 13),
                 ForeColor = SystemColors.ControlText,
                 Font = new Font("Segoe UI", 9F)
             };
@@ -175,7 +185,7 @@ namespace SqlTestDataGenerator.UI
                 Maximum = 1000,
                 Value = 1,
                 Increment = 1,
-                Location = new Point(565, 9),
+                Location = new Point(697, 9),
                 Width = 70,
                 Font = new Font("Segoe UI", 9F),
                 BackColor = SystemColors.Window,
@@ -183,7 +193,7 @@ namespace SqlTestDataGenerator.UI
                 BorderStyle = BorderStyle.FixedSingle
             };
 
-            _toolbarPanel.Controls.AddRange(new Control[] { _analyzeBtn, _generateBtn, startIdLabel, _startIdInput, rowsPerTableLabel, _rowsPerTableInput });
+            _toolbarPanel.Controls.AddRange(new Control[] { _analyzeBtn, _generateBtn, _insertDbBtn, startIdLabel, _startIdInput, rowsPerTableLabel, _rowsPerTableInput });
 
             // ═══ Main Content ═══
             _mainSplitter = new SplitContainer
@@ -462,6 +472,7 @@ namespace SqlTestDataGenerator.UI
                     _connectBtn.Visible = false;
                     _disconnectBtn.Visible = true;
                     SetStatus("Database connected successfully.");
+                    UpdateDbInsertButtonState();
                 }
                 else
                 {
@@ -480,6 +491,7 @@ namespace SqlTestDataGenerator.UI
             _connectBtn.Visible = true;
             _disconnectBtn.Visible = false;
             SetStatus("Disconnected.");
+            UpdateDbInsertButtonState();
         }
 
         private void AnalyzeBtn_Click(object? sender, EventArgs e)
@@ -501,6 +513,8 @@ namespace SqlTestDataGenerator.UI
                     _analysisOutput.Text = "❌ PARSE ERRORS:\r\n" +
                         string.Join("\r\n", _currentQuery.Errors);
                     _generateBtn.Enabled = false;
+                    _currentDataSet = null;
+                    UpdateDbInsertButtonState();
                     SetStatus("Parse errors found.");
                     return;
                 }
@@ -528,6 +542,8 @@ namespace SqlTestDataGenerator.UI
             {
                 _analysisOutput.Text = $"❌ Error: {ex.Message}";
                 _generateBtn.Enabled = false;
+                _currentDataSet = null;
+                UpdateDbInsertButtonState();
                 SetStatus("Analysis failed.");
             }
         }
@@ -548,8 +564,8 @@ namespace SqlTestDataGenerator.UI
                 {
                     try
                     {
-                        var tableNames = _currentQuery.Tables.Select(t => t.TableName).Distinct();
-                        _schemas = _schemaIntrospector.GetSchemas(tableNames);
+                        var tableNames = GetAllReferencedTableNames(_currentQuery);
+                        _schemas = LoadSchemaClosure(tableNames);
                     }
                     catch (Exception ex)
                     {
@@ -582,6 +598,14 @@ namespace SqlTestDataGenerator.UI
                     _currentDataSet = _dataEngine.GenerateWithoutSchema(_currentQuery, selectedScenarios);
                 }
 
+                if (_currentDataSet == null)
+                    throw new InvalidOperationException("Data generation returned no dataset.");
+
+                if (_schemas != null && _schemas.Any())
+                {
+                    _dataNormalizer.Normalize(_currentDataSet, _schemas);
+                }
+
                 // Generate full INSERT scripts (with comments + transactions)
                 _insertGenerator.Schemas = _schemas;
                 _insertGenerator.HandleIdentityInsert = _schemas != null;
@@ -596,13 +620,131 @@ namespace SqlTestDataGenerator.UI
 
                 _scriptCleanOutput.Text = cleanScript;
                 _scriptOutput.Text = fullScript;
+                UpdateDbInsertButtonState();
                 SetStatus($"Generated {selectedScenarios.Count} scenario(s), {_rowsPerTableInput.Value} row(s)/table.");
             }
             catch (Exception ex)
             {
+                _currentDataSet = null;
+                UpdateDbInsertButtonState();
                 _scriptCleanOutput.Text = $"-- Error: {ex.Message}";
                 _scriptOutput.Text = $"-- Error generating data: {ex.Message}\r\n-- {ex.StackTrace}";
                 SetStatus("Generation failed.");
+            }
+        }
+
+        private async void InsertDbBtn_Click(object? sender, EventArgs e)
+        {
+            if (_currentDataSet == null)
+            {
+                MessageBox.Show("Please generate data first.", "No Data", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (_connectionManager == null || !_connectionManager.IsConnected)
+            {
+                MessageBox.Show("Please connect to database first.", "Not Connected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (_currentQuery == null)
+            {
+                MessageBox.Show("No analyzed query found.", "Missing Query", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                if (_schemaIntrospector != null)
+                {
+                    var tableNames = GetAllReferencedTableNames(_currentQuery);
+                    _schemas = LoadSchemaClosure(tableNames);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Cannot read schema from database:\r\n{ex.Message}",
+                    "Schema Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (_schemas == null || !_schemas.Any())
+            {
+                MessageBox.Show("Schema metadata is missing. Please connect database and generate data again.",
+                    "Schema Required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            var generatedTables = _currentDataSet.Scenarios
+                .SelectMany(s => s.TableRows.Keys)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (!generatedTables.Any())
+            {
+                MessageBox.Show("No generated table rows found to insert.",
+                    "No Rows", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            var confirm = MessageBox.Show(
+                $"This will DELETE existing rows from {generatedTables.Count} generated table(s), " +
+                "and can also clear dependent child tables (FK) to avoid conflicts.\r\n" +
+                "Then it will INSERT newly generated rows.\r\n\r\nDo you want to continue?",
+                "Confirm Direct Insert",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning);
+
+            if (confirm != DialogResult.Yes)
+                return;
+
+            try
+            {
+                _insertDbBtn.Enabled = false;
+                SetStatus("Inserting generated data to database...");
+
+                using var conn = _connectionManager.CreateNewConnection();
+                var result = await _dbExecutor.ClearAndInsertAsync(conn, _currentDataSet, _schemas);
+                bool? hasQueryRows = null;
+                try
+                {
+                    hasQueryRows = await QueryReturnsRowsAsync(conn, _currentQuery.OriginalSql);
+                }
+                catch
+                {
+                    // Query verification is best-effort only. Data insert already succeeded.
+                }
+
+                SetStatus($"Inserted {result.RowsInserted} row(s) into {result.TablesInserted} table(s).");
+                MessageBox.Show(
+                    $"Direct insert completed.\r\n\r\n" +
+                    $"- Generated tables: {result.GeneratedTables}\r\n" +
+                    $"- Planned tables: {result.PlannedTables}\r\n" +
+                    $"- Synthesized ancestor tables: {result.SynthesizedAncestorTables}\r\n" +
+                    $"- Tables cleared: {result.TablesCleared}\r\n" +
+                    $"- Dependent tables auto-cleared: {result.DependentTablesCleared}\r\n" +
+                    $"- Rows deleted: {result.RowsDeleted}\r\n" +
+                    $"- Tables inserted: {result.TablesInserted}\r\n" +
+                    $"- Rows inserted: {result.RowsInserted}\r\n" +
+                    $"- FK clear fallback used: {(result.UsedConstraintDisableFallback ? "YES" : "NO")}\r\n" +
+                    $"- FK insert bypass used: {(result.UsedInsertConstraintBypass ? "YES" : "NO")}\r\n" +
+                    $"- Query returns rows: {FormatQueryRowsResult(hasQueryRows)}",
+                    "Insert Completed",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                SetStatus("Direct insert failed.");
+                MessageBox.Show(
+                    $"Direct insert failed:\r\n{BuildErrorChain(ex)}",
+                    "Insert Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+            finally
+            {
+                UpdateDbInsertButtonState();
             }
         }
 
@@ -654,6 +796,103 @@ namespace SqlTestDataGenerator.UI
         {
             _statusLabel.Text = text;
             _statusLabel.Location = new Point(_bottomToolbar.Width - _statusLabel.Width - 20, 15);
+        }
+
+        private void UpdateDbInsertButtonState()
+        {
+            _insertDbBtn.Enabled = _currentDataSet != null &&
+                                   _connectionManager?.IsConnected == true;
+        }
+
+        private static HashSet<string> GetAllReferencedTableNames(ParsedQuery query)
+        {
+            var tableNames = query.Tables
+                .Select(t => t.TableName)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var subquery in query.Subqueries)
+            {
+                CollectSubqueryTables(subquery, tableNames);
+            }
+
+            return tableNames;
+        }
+
+        private static void CollectSubqueryTables(SubqueryInfo subquery, HashSet<string> tableNames)
+        {
+            foreach (var t in subquery.Tables)
+            {
+                tableNames.Add(t.TableName);
+            }
+
+            foreach (var nested in subquery.NestedSubqueries)
+            {
+                CollectSubqueryTables(nested, tableNames);
+            }
+        }
+
+        private Dictionary<string, TableSchema> LoadSchemaClosure(IEnumerable<string> seedTables)
+        {
+            if (_schemaIntrospector == null)
+                throw new InvalidOperationException("Schema introspector is not available.");
+
+            var result = new Dictionary<string, TableSchema>(StringComparer.OrdinalIgnoreCase);
+            var queue = new Queue<string>(seedTables
+                .Where(t => !string.IsNullOrWhiteSpace(t))
+                .Distinct(StringComparer.OrdinalIgnoreCase));
+
+            while (queue.Count > 0)
+            {
+                var tableName = queue.Dequeue();
+                if (result.ContainsKey(tableName))
+                    continue;
+
+                var schema = _schemaIntrospector.GetTableSchema(tableName);
+                result[tableName] = schema;
+
+                foreach (var fk in schema.ForeignKeys)
+                {
+                    if (!result.ContainsKey(fk.ReferencedTable))
+                    {
+                        queue.Enqueue(fk.ReferencedTable);
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        private static async Task<bool> QueryReturnsRowsAsync(SqlConnection connection, string sql)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.CommandTimeout = 30;
+
+            using var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SingleRow);
+            return await reader.ReadAsync();
+        }
+
+        private static string FormatQueryRowsResult(bool? hasRows)
+        {
+            return hasRows switch
+            {
+                true => "YES",
+                false => "NO",
+                _ => "UNKNOWN (cannot execute verification query)"
+            };
+        }
+
+        private static string BuildErrorChain(Exception ex)
+        {
+            var messages = new List<string>();
+            var current = ex;
+            while (current != null)
+            {
+                messages.Add(current.Message);
+                current = current.InnerException;
+            }
+
+            return string.Join("\r\n--> ", messages);
         }
 
         // ═══════════════════════════════════════════════════════════════

@@ -61,6 +61,10 @@ D:\project\create-data\SqlTestDataGenerator\obj\Debug\net8.0-windows\SqlTestData
 D:\project\create-data\SqlTestDataGenerator\obj\Debug\net8.0-windows\refint\SqlTestDataGenerator.dll
 D:\project\create-data\SqlTestDataGenerator\obj\Debug\net8.0-windows\SqlTestDataGenerator.pdb
 D:\project\create-data\SqlTestDataGenerator\obj\Debug\net8.0-windows\SqlTestDataGenerator.genruntimeconfig.cache
-D:\project\create-data\SqlTestDataGenerator\obj\Debug\net8.0-windows\ref\SqlTestDataGenerator.dll
 D:\project\create-data\SqlTestDataGenerator\obj\Debug\net8.0-windows\SqlTestDataGenerator.sourcelink.json
 D:\project\create-data\SqlTestDataGenerator\bin\Debug\net8.0-windows\SqlTestDataGenerator.exe
+D:\project\create-data\artifacts\SqlTestDataGenerator\SqlTestDataGenerator.deps.json
+D:\project\create-data\artifacts\SqlTestDataGenerator\SqlTestDataGenerator.runtimeconfig.json
+D:\project\create-data\artifacts\SqlTestDataGenerator\SqlTestDataGenerator.dll
+D:\project\create-data\artifacts\SqlTestDataGenerator\SqlTestDataGenerator.pdb
+D:\project\create-data\SqlTestDataGenerator\obj\Debug\net8.0-windows\ref\SqlTestDataGenerator.dll

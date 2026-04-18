@@ -87,15 +87,15 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
     /// </summary>
     public class DecimalValueGenerator : IValueGenerator
     {
-        private decimal _counter = 100.00m;
+        private long _sequence;
 
         public bool CanHandle(DataTypeCategory category) =>
             category == DataTypeCategory.Decimal || category == DataTypeCategory.Float;
 
         public object GenerateDefault(ColumnSchema column)
         {
-            _counter += 10.50m;
-            return _counter;
+            _sequence++;
+            return GenerateSequentialValue(column, _sequence);
         }
 
         public object GenerateSatisfying(ColumnSchema column, string op, string value)
@@ -103,7 +103,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
             if (!decimal.TryParse(value, System.Globalization.CultureInfo.InvariantCulture, out var numValue))
                 return GenerateDefault(column);
 
-            return op switch
+            var candidate = op switch
             {
                 "=" => numValue,
                 "<>" or "!=" => numValue + 1.0m,
@@ -113,14 +113,15 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
                 "<=" => numValue,
                 _ => numValue
             };
+            return NormalizeNumericValue(candidate, column);
         }
 
         public object GenerateViolating(ColumnSchema column, string op, string value)
         {
             if (!decimal.TryParse(value, System.Globalization.CultureInfo.InvariantCulture, out var numValue))
-                return 0m;
+                return NormalizeNumericValue(0m, column);
 
-            return op switch
+            var candidate = op switch
             {
                 "=" => numValue + 1.0m,
                 "<>" or "!=" => numValue,
@@ -130,11 +131,125 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
                 "<=" => numValue + 0.01m,
                 _ => 0m
             };
+            return NormalizeNumericValue(candidate, column);
         }
 
         public object GenerateFromLiteral(string literal, ColumnSchema column)
         {
-            return decimal.TryParse(literal, System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : GenerateDefault(column);
+            return decimal.TryParse(literal, System.Globalization.CultureInfo.InvariantCulture, out var v)
+                ? NormalizeNumericValue(v, column)
+                : GenerateDefault(column);
+        }
+
+        private static object GenerateSequentialValue(ColumnSchema column, long sequence)
+        {
+            if (IsFloatingType(column))
+            {
+                return column.DataType.Equals("real", StringComparison.OrdinalIgnoreCase)
+                    ? (object)(float)(sequence + 0.125d)
+                    : sequence + 0.125d;
+            }
+
+            var scale = GetScale(column);
+            var step = GetStep(scale);
+            var max = GetMaxAbsValue(column, step);
+            if (max <= 0m)
+                return NormalizeNumericValue(step, column);
+
+            var slotCountDecimal = decimal.Floor(max / step);
+            var slotCount = slotCountDecimal >= long.MaxValue
+                ? long.MaxValue
+                : Math.Max(1L, decimal.ToInt64(slotCountDecimal));
+
+            var ordinal = ((sequence - 1) % slotCount) + 1;
+            var candidate = ordinal * step;
+            return NormalizeNumericValue(candidate, column);
+        }
+
+        private static object NormalizeNumericValue(decimal value, ColumnSchema column)
+        {
+            if (IsFloatingType(column))
+            {
+                var dbl = (double)value;
+                return column.DataType.Equals("real", StringComparison.OrdinalIgnoreCase)
+                    ? (object)(float)dbl
+                    : dbl;
+            }
+
+            var scale = GetScale(column);
+            var step = GetStep(scale);
+            var max = GetMaxAbsValue(column, step);
+            var rounded = decimal.Round(value, scale, MidpointRounding.AwayFromZero);
+
+            if (rounded > max)
+                rounded = max;
+            else if (rounded < -max)
+                rounded = -max;
+
+            return rounded;
+        }
+
+        private static bool IsFloatingType(ColumnSchema column) =>
+            column.DataType.Equals("float", StringComparison.OrdinalIgnoreCase) ||
+            column.DataType.Equals("real", StringComparison.OrdinalIgnoreCase);
+
+        private static int GetScale(ColumnSchema column)
+        {
+            if (column.NumericScale.HasValue)
+                return Math.Max(0, column.NumericScale.Value);
+
+            return column.DataType.ToLowerInvariant() switch
+            {
+                "money" or "smallmoney" => 4,
+                _ => 0
+            };
+        }
+
+        private static int GetPrecision(ColumnSchema column)
+        {
+            if (column.NumericPrecision.HasValue)
+                return Math.Max(1, column.NumericPrecision.Value);
+
+            return column.DataType.ToLowerInvariant() switch
+            {
+                "money" => 19,
+                "smallmoney" => 10,
+                "float" => 15,
+                "real" => 7,
+                _ => 18
+            };
+        }
+
+        private static decimal GetStep(int scale)
+        {
+            decimal step = 1m;
+            for (int i = 0; i < scale; i++)
+            {
+                step /= 10m;
+            }
+
+            return step;
+        }
+
+        private static decimal Pow10(int exponent)
+        {
+            decimal result = 1m;
+            for (int i = 0; i < exponent; i++)
+            {
+                result *= 10m;
+            }
+
+            return result;
+        }
+
+        private static decimal GetMaxAbsValue(ColumnSchema column, decimal step)
+        {
+            var precision = GetPrecision(column);
+            var scale = GetScale(column);
+            var integerDigits = Math.Max(0, precision - scale);
+            var wholePartLimit = Pow10(integerDigits);
+            var max = wholePartLimit - step;
+            return max > 0m ? max : step;
         }
     }
 
@@ -144,14 +259,15 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
     public class StringValueGenerator : IValueGenerator
     {
         private int _counter;
+        private const string Base36Chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
         public bool CanHandle(DataTypeCategory category) => category == DataTypeCategory.String;
 
         public object GenerateDefault(ColumnSchema column)
         {
             var maxLen = NormalizeMaxLength(column.MaxLength);
-            var val = $"TestData_{++_counter}";
-            return val.Length > maxLen ? val[..maxLen] : val;
+            _counter++;
+            return GenerateLengthSafeUniqueString(maxLen, _counter);
         }
 
         public object GenerateSatisfying(ColumnSchema column, string op, string value)
@@ -167,13 +283,19 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
 
         public object GenerateViolating(ColumnSchema column, string op, string value)
         {
-            return op switch
+            var maxLen = NormalizeMaxLength(column.MaxLength);
+            var raw = op switch
             {
                 "=" => value + "_different",
                 "<>" or "!=" => value,
                 "LIKE" => "ZZZZZ_nomatch",
                 _ => "NoMatch"
             };
+            if (raw.Length <= maxLen)
+                return raw;
+
+            _counter++;
+            return GenerateLengthSafeUniqueString(maxLen, _counter);
         }
 
         public object GenerateFromLiteral(string literal, ColumnSchema column)
@@ -202,6 +324,57 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
                 return 4000;
             return maxLength.Value;
         }
+
+        private static string GenerateCompactUniqueString(int maxLen, int sequence)
+        {
+            if (maxLen <= 0)
+                return string.Empty;
+
+            return EncodeBase36(sequence, maxLen);
+        }
+
+        private static string GenerateLengthSafeUniqueString(int maxLen, int sequence)
+        {
+            if (maxLen <= 0)
+                return string.Empty;
+
+            var verbose = $"TestData_{sequence}";
+            if (verbose.Length <= maxLen)
+                return verbose;
+
+            if (maxLen <= 4)
+                return GenerateCompactUniqueString(maxLen, sequence);
+
+            var prefix = "TD";
+            var payloadWidth = Math.Max(1, maxLen - prefix.Length);
+            var payload = GenerateCompactUniqueString(payloadWidth, sequence);
+            var candidate = prefix + payload;
+            return candidate.Length > maxLen ? candidate[..maxLen] : candidate;
+        }
+
+        private static string EncodeBase36(int value, int width)
+        {
+            if (width <= 0)
+                return string.Empty;
+
+            var current = Math.Abs(value);
+            var chars = new char[Math.Max(1, width)];
+            int index = chars.Length - 1;
+
+            do
+            {
+                chars[index--] = Base36Chars[current % Base36Chars.Length];
+                current /= Base36Chars.Length;
+            }
+            while (current > 0 && index >= 0);
+
+            while (index >= 0)
+            {
+                chars[index--] = '0';
+            }
+
+            return new string(chars);
+        }
     }
 
     /// <summary>
@@ -209,17 +382,27 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
     /// </summary>
     public class DateTimeValueGenerator : IValueGenerator
     {
+        private int _counter;
+        private static readonly DateTime BaseDateTime = new(2024, 1, 1, 8, 0, 0, DateTimeKind.Unspecified);
+
         public bool CanHandle(DataTypeCategory category) =>
             category == DataTypeCategory.DateTime || category == DataTypeCategory.DateTimeOffset;
 
-        public object GenerateDefault(ColumnSchema column) => DateTime.Now;
+        public object GenerateDefault(ColumnSchema column)
+        {
+            _counter++;
+            var next = column.DataType.Equals("date", StringComparison.OrdinalIgnoreCase)
+                ? BaseDateTime.AddDays(_counter)
+                : BaseDateTime.AddMinutes(_counter);
+            return NormalizeDateValue(next, column);
+        }
 
         public object GenerateSatisfying(ColumnSchema column, string op, string value)
         {
             if (!DateTime.TryParse(value, out var dateValue))
                 return GenerateDefault(column);
 
-            return op switch
+            var candidate = op switch
             {
                 "=" => dateValue,
                 "<>" or "!=" => dateValue.AddDays(30),
@@ -229,14 +412,15 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
                 "<=" => dateValue,
                 _ => dateValue
             };
+            return NormalizeDateValue(candidate, column);
         }
 
         public object GenerateViolating(ColumnSchema column, string op, string value)
         {
             if (!DateTime.TryParse(value, out var dateValue))
-                return DateTime.MinValue;
+                return NormalizeDateValue(DateTime.MinValue, column);
 
-            return op switch
+            var candidate = op switch
             {
                 "=" => dateValue.AddDays(1),
                 "<>" or "!=" => dateValue,
@@ -246,11 +430,25 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
                 "<=" => dateValue.AddDays(1),
                 _ => DateTime.MinValue
             };
+            return NormalizeDateValue(candidate, column);
         }
 
         public object GenerateFromLiteral(string literal, ColumnSchema column)
         {
-            return DateTime.TryParse(literal, out var v) ? v : DateTime.Now;
+            return DateTime.TryParse(literal, out var v) ? NormalizeDateValue(v, column) : GenerateDefault(column);
+        }
+
+        private static object NormalizeDateValue(DateTime value, ColumnSchema column)
+        {
+            return column.DataType.ToLowerInvariant() switch
+            {
+                "date" => value.Date,
+                "smalldatetime" => new DateTime(
+                    value.Year, value.Month, value.Day,
+                    value.Hour, value.Minute, 0, value.Kind),
+                "datetimeoffset" => new DateTimeOffset(value, TimeSpan.Zero),
+                _ => value
+            };
         }
     }
 

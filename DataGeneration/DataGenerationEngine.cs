@@ -517,6 +517,13 @@ namespace SqlTestDataGenerator.DataGeneration
                 {
                     return fkId;
                 }
+
+                if (fk != null &&
+                    col.IsNullable &&
+                    fk.ReferencedTable.Equals(currentTableSchema.TableName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return null;
+                }
             }
 
             // 2. Check if this is a PK column → use the rowId
