@@ -115,6 +115,8 @@ namespace SqlTestDataGenerator.Schema
 
                 columns.Add(new ColumnSchema
                 {
+                    TableName = tableName,
+                    SchemaName = schemaName,
                     ColumnName = reader.GetString(0),
                     DataType = reader.GetString(1),
                     IsNullable = reader.GetString(2) == "YES",

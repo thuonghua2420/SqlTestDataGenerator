@@ -56,13 +56,13 @@ namespace SqlTestDataGenerator.Database
                     .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
                 var fkGraph = await LoadForeignKeyGraphAsync(connection, tx, cancellationToken);
-                foreach (var generatedTable in generatedTables)
+                foreach (var plannedTable in plannedTables)
                 {
-                    fkGraph.EnsureTable(generatedTable.SchemaName, generatedTable.TableName);
+                    fkGraph.EnsureTable(plannedTable.SchemaName, plannedTable.TableName);
                 }
 
-                var clearTableKeys = ExpandWithDependentTables(generatedTableKeys, fkGraph.ParentToChildren);
-                var deleteOrder = BuildDeleteOrder(generatedTableKeys, clearTableKeys, fkGraph.ParentToChildren);
+                var clearTableKeys = ExpandWithDependentTables(plannedTableKeys, fkGraph.ParentToChildren);
+                var deleteOrder = BuildDeleteOrder(plannedTableKeys, clearTableKeys, fkGraph.ParentToChildren);
                 var insertOrder = ResolveInsertOrder(plannedRows.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase), schemas);
 
                 await EnsurePlannedRowsAreInsertableAsync(
@@ -71,6 +71,7 @@ namespace SqlTestDataGenerator.Database
                     plannedRows,
                     schemas,
                     clearTableKeys,
+                    insertOrder,
                     cancellationToken);
 
                 var result = new DirectInsertResult
@@ -79,7 +80,7 @@ namespace SqlTestDataGenerator.Database
                     PlannedTables = plannedTableKeys.Count,
                     SynthesizedAncestorTables = Math.Max(0, plannedTableKeys.Count - generatedTableKeys.Count),
                     TablesCleared = clearTableKeys.Count,
-                    DependentTablesCleared = Math.Max(0, clearTableKeys.Count - generatedTableKeys.Count),
+                    DependentTablesCleared = Math.Max(0, clearTableKeys.Count - plannedTableKeys.Count),
                     ClearedTables = deleteOrder
                         .Where(fkGraph.TableMap.ContainsKey)
                         .Select(k => fkGraph.TableMap[k].DisplayName)
@@ -516,6 +517,7 @@ namespace SqlTestDataGenerator.Database
             Dictionary<string, List<GeneratedRow>> plannedRows,
             Dictionary<string, TableSchema> schemas,
             HashSet<string> clearTableKeys,
+            List<string> insertOrder,
             CancellationToken cancellationToken)
         {
             var uniqueExistsCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
@@ -527,14 +529,99 @@ namespace SqlTestDataGenerator.Database
 
                 EnsureRequiredColumns(schema, kvp.Value);
                 NormalizeRowValues(schema, kvp.Value);
+            }
+
+            await EnsurePrimaryKeysAsync(
+                connection,
+                transaction,
+                plannedRows,
+                schemas,
+                clearTableKeys,
+                insertOrder,
+                uniqueExistsCache,
+                cancellationToken);
+
+            foreach (var tableName in insertOrder)
+            {
+                if (!plannedRows.TryGetValue(tableName, out var rows))
+                    continue;
+                if (!schemas.TryGetValue(tableName, out var schema))
+                    continue;
+
                 await EnsureUniqueConstraintsAsync(
                     connection,
                     transaction,
                     schema,
-                    kvp.Value,
+                    rows,
                     clearTableKeys,
                     uniqueExistsCache,
                     cancellationToken);
+            }
+        }
+
+        private async Task EnsurePrimaryKeysAsync(
+            SqlConnection connection,
+            SqlTransaction transaction,
+            Dictionary<string, List<GeneratedRow>> plannedRows,
+            Dictionary<string, TableSchema> schemas,
+            HashSet<string> clearTableKeys,
+            List<string> insertOrder,
+            Dictionary<string, bool> uniqueExistsCache,
+            CancellationToken cancellationToken)
+        {
+            var childFkMap = BuildChildForeignKeyMap(schemas);
+
+            foreach (var tableName in insertOrder)
+            {
+                if (!plannedRows.TryGetValue(tableName, out var rows) || rows.Count == 0)
+                    continue;
+                if (!schemas.TryGetValue(tableName, out var schema))
+                    continue;
+                if (schema.PrimaryKey?.Columns.Any() != true)
+                    continue;
+
+                var pkColumns = schema.PrimaryKey.Columns
+                    .Select(schema.GetColumn)
+                    .Where(c => c != null && !c.IsComputed)
+                    .Select(c => c!)
+                    .ToList();
+                if (!pkColumns.Any())
+                    continue;
+
+                var pkSpec = new UniqueConstraintSpec("PRIMARY_KEY", pkColumns);
+                var seenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                bool tableWillBeCleared = clearTableKeys.Contains(BuildTableKey(schema.SchemaName, schema.TableName));
+
+                foreach (var row in rows)
+                {
+                    int attempts = 0;
+                    while (true)
+                    {
+                        if (++attempts > MaxUniqueMutationAttempts)
+                        {
+                            throw new InvalidOperationException(
+                                $"Exceeded {MaxUniqueMutationAttempts} attempts while canonicalizing primary key for " +
+                                $"[{schema.SchemaName}.{schema.TableName}].");
+                        }
+
+                        var key = BuildConstraintKey(pkColumns, row);
+                        if (key != null &&
+                            !seenKeys.Contains(key) &&
+                            (tableWillBeCleared || !await UniqueConstraintExistsInDbAsync(
+                                connection, transaction, schema, pkSpec, row, uniqueExistsCache, cancellationToken)))
+                        {
+                            seenKeys.Add(key);
+                            break;
+                        }
+
+                        if (!TryRemapPrimaryKeyRow(schema, pkColumns, row, plannedRows, childFkMap))
+                        {
+                            throw new InvalidOperationException(
+                                $"Cannot satisfy unique constraint [{schema.SchemaName}.{schema.TableName}.PRIMARY_KEY] " +
+                                $"for generated data.");
+                        }
+                    }
+                }
             }
         }
 
@@ -744,11 +831,128 @@ namespace SqlTestDataGenerator.Database
                 if (!CanMutateConstraintColumn(schema, column))
                     continue;
 
-                row.SetValue(column.ColumnName, GenerateSyntheticValue(column));
-                return true;
+                if (TryGenerateDistinctMutationValue(column, row.GetValue(column.ColumnName), out var mutatedValue))
+                {
+                    row.SetValue(column.ColumnName, mutatedValue);
+                    return true;
+                }
             }
 
             return false;
+        }
+
+        private bool TryGenerateDistinctMutationValue(
+            ColumnSchema column,
+            object? currentValue,
+            out object mutatedValue)
+        {
+            var currentKey = IsNullValue(currentValue) ? null : BuildValueKey(currentValue!);
+
+            if (column.TypeCategory == DataTypeCategory.Boolean && currentValue is bool boolValue)
+            {
+                mutatedValue = !boolValue;
+                return true;
+            }
+
+            for (int attempt = 0; attempt < 16; attempt++)
+            {
+                var candidate = GenerateSyntheticValue(column);
+                if (candidate == DBNull.Value)
+                    continue;
+
+                var candidateKey = BuildValueKey(candidate);
+                if (!string.Equals(candidateKey, currentKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    mutatedValue = candidate;
+                    return true;
+                }
+            }
+
+            mutatedValue = currentValue ?? DBNull.Value;
+            return false;
+        }
+
+        private bool TryRemapPrimaryKeyRow(
+            TableSchema schema,
+            IReadOnlyList<ColumnSchema> pkColumns,
+            GeneratedRow row,
+            Dictionary<string, List<GeneratedRow>> plannedRows,
+            Dictionary<string, List<ChildForeignKeyRef>> childFkMap)
+        {
+            var oldValues = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            var newValues = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var column in pkColumns)
+            {
+                var oldValue = row.GetValue(column.ColumnName);
+                oldValues[column.ColumnName] = oldValue;
+
+                if (!TryGenerateDistinctMutationValue(column, oldValue, out var mutatedValue))
+                    return false;
+
+                row.SetValue(column.ColumnName, mutatedValue);
+                newValues[column.ColumnName] = mutatedValue;
+            }
+
+            PropagatePrimaryKeyChanges(schema, oldValues, newValues, plannedRows, childFkMap);
+            return true;
+        }
+
+        private static Dictionary<string, List<ChildForeignKeyRef>> BuildChildForeignKeyMap(
+            Dictionary<string, TableSchema> schemas)
+        {
+            var map = new Dictionary<string, List<ChildForeignKeyRef>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var childSchema in schemas.Values)
+            {
+                foreach (var fk in childSchema.ForeignKeys)
+                {
+                    var parentKey = BuildTableKey(fk.ReferencedSchema, fk.ReferencedTable);
+                    if (!map.TryGetValue(parentKey, out var refs))
+                    {
+                        refs = new List<ChildForeignKeyRef>();
+                        map[parentKey] = refs;
+                    }
+
+                    refs.Add(new ChildForeignKeyRef(
+                        childSchema.TableName,
+                        NormalizeSchema(childSchema.SchemaName),
+                        fk.ColumnName,
+                        fk.ReferencedColumn));
+                }
+            }
+
+            return map;
+        }
+
+        private static void PropagatePrimaryKeyChanges(
+            TableSchema parentSchema,
+            Dictionary<string, object?> oldValues,
+            Dictionary<string, object?> newValues,
+            Dictionary<string, List<GeneratedRow>> plannedRows,
+            Dictionary<string, List<ChildForeignKeyRef>> childFkMap)
+        {
+            var parentKey = BuildTableKey(parentSchema.SchemaName, parentSchema.TableName);
+            if (!childFkMap.TryGetValue(parentKey, out var childRefs))
+                return;
+
+            foreach (var childRef in childRefs)
+            {
+                if (!plannedRows.TryGetValue(childRef.ChildTableName, out var childRows))
+                    continue;
+                if (!oldValues.TryGetValue(childRef.ReferencedColumnName, out var oldValue))
+                    continue;
+                if (!newValues.TryGetValue(childRef.ReferencedColumnName, out var newValue))
+                    continue;
+
+                foreach (var childRow in childRows)
+                {
+                    if (ValuesEqual(childRow.GetValue(childRef.ChildColumnName), oldValue))
+                    {
+                        childRow.SetValue(childRef.ChildColumnName, newValue);
+                    }
+                }
+            }
         }
 
         private static bool CanMutateConstraintColumn(TableSchema schema, ColumnSchema column)
@@ -1396,6 +1600,26 @@ JOIN sys.schemas sp ON tp.schema_id = sp.schema_id;";
             {
                 Name = name;
                 Columns = columns;
+            }
+        }
+
+        private sealed class ChildForeignKeyRef
+        {
+            public string ChildTableName { get; }
+            public string ChildSchemaName { get; }
+            public string ChildColumnName { get; }
+            public string ReferencedColumnName { get; }
+
+            public ChildForeignKeyRef(
+                string childTableName,
+                string childSchemaName,
+                string childColumnName,
+                string referencedColumnName)
+            {
+                ChildTableName = childTableName;
+                ChildSchemaName = childSchemaName;
+                ChildColumnName = childColumnName;
+                ReferencedColumnName = referencedColumnName;
             }
         }
     }

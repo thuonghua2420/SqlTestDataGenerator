@@ -72,9 +72,10 @@ namespace SqlTestDataGenerator.DataGeneration
 
             foreach (var scenario in scenarios)
             {
-                scenario.InsertOrder = insertOrder;
-                GenerateScenarioData(scenario, query, schemas, insertOrder);
-                dataSet.Scenarios.Add(scenario);
+                var workingScenario = CloneScenarioDescriptor(scenario);
+                workingScenario.InsertOrder = new List<string>(insertOrder);
+                GenerateScenarioData(workingScenario, query, schemas, insertOrder);
+                dataSet.Scenarios.Add(workingScenario);
             }
 
             return dataSet;
@@ -143,6 +144,7 @@ namespace SqlTestDataGenerator.DataGeneration
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+            var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
             // Determine how many rows we need for HAVING conditions
@@ -174,7 +176,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         if (col.IsComputed) continue;
 
                         var value = GenerateColumnValue(col, alias, query, schemas,
-                            tableRowIds, rowId, satisfy: true, rowIdx);
+                            tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx);
                         row.SetValue(col.ColumnName, value);
                     }
 
@@ -186,7 +188,7 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             // Handle subquery support data
-            GenerateSubquerySupportData(scenario, query, schemas, baseId + 500, satisfy: true);
+            GenerateSubquerySupportData(scenario, query, schemas, ref currentId, satisfy: true);
         }
 
         // ─── WHERE negative: one condition violated ─────────────────────
@@ -195,6 +197,7 @@ namespace SqlTestDataGenerator.DataGeneration
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+            var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
             // Find the condition being tested
@@ -227,7 +230,7 @@ namespace SqlTestDataGenerator.DataGeneration
                              alias.Equals(testedCondition.TableAlias, StringComparison.OrdinalIgnoreCase));
 
                         var value = GenerateColumnValue(col, alias, query, schemas,
-                            tableRowIds, rowId, satisfy: !isTestedColumn, rowIdx);
+                            tableRowIds, referencedTableIdPools, rowId, satisfy: !isTestedColumn, rowIdx);
                         row.SetValue(col.ColumnName, value);
                     }
 
@@ -245,6 +248,7 @@ namespace SqlTestDataGenerator.DataGeneration
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+            var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
             var testedCondition = query.HavingConditions
@@ -288,7 +292,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         else
                         {
                             value = GenerateColumnValue(col, alias, query, schemas,
-                                tableRowIds, rowId, satisfy: true, rowIdx);
+                                tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx);
                         }
 
                         row.SetValue(col.ColumnName, value);
@@ -308,6 +312,7 @@ namespace SqlTestDataGenerator.DataGeneration
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+            var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
             // Find which join is being tested
@@ -353,7 +358,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         else
                         {
                             value = GenerateColumnValue(col, alias, query, schemas,
-                                tableRowIds, rowId, satisfy: true, rowIdx);
+                                tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx);
                         }
 
                         row.SetValue(col.ColumnName, value);
@@ -375,6 +380,7 @@ namespace SqlTestDataGenerator.DataGeneration
             // Similar to positive but the subquery-referenced column has a value
             // that does NOT appear in the subquery result
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+            var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
             foreach (var tableName in insertOrder)
@@ -397,7 +403,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         if (col.IsComputed) continue;
 
                         var value = GenerateColumnValue(col, alias, query, schemas,
-                            tableRowIds, rowId, satisfy: true, rowIdx);
+                            tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx);
                         row.SetValue(col.ColumnName, value);
                     }
 
@@ -418,6 +424,7 @@ namespace SqlTestDataGenerator.DataGeneration
         {
             // Similar to positive, but range conditions use exact boundary values
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+            var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
             var testedCondition = query.WhereConditions
@@ -461,7 +468,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         else
                         {
                             value = GenerateColumnValue(col, alias, query, schemas,
-                                tableRowIds, rowId, satisfy: true, rowIdx);
+                                tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx);
                         }
 
                         row.SetValue(col.ColumnName, value);
@@ -474,7 +481,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 currentId += rowCount + 1;
             }
 
-            GenerateSubquerySupportData(scenario, query, schemas, baseId + 500, satisfy: true);
+            GenerateSubquerySupportData(scenario, query, schemas, ref currentId, satisfy: true);
         }
 
         // ═════════════════════════════════════════════════════════════════
@@ -484,7 +491,9 @@ namespace SqlTestDataGenerator.DataGeneration
         private object? GenerateColumnValue(
             ColumnSchema col, string tableAlias, ParsedQuery query,
             Dictionary<string, TableSchema> schemas,
-            Dictionary<string, List<int>> tableRowIds, int rowId,
+            Dictionary<string, List<int>> tableRowIds,
+            Dictionary<string, List<int>> referencedTableIdPools,
+            int rowId,
             bool satisfy, int rowIndex)
         {
             var generator = _valueFactory.GetGenerator(col.TypeCategory);
@@ -515,6 +524,12 @@ namespace SqlTestDataGenerator.DataGeneration
                 if (fk != null && TryResolveRelatedRowId(tableRowIds, fk.ReferencedTable, rowIndex, out var fkId))
                 {
                     return fkId;
+                }
+
+                if (fk != null &&
+                    !fk.ReferencedTable.Equals(currentTableSchema.TableName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return GetOrCreateReferencedRowId(referencedTableIdPools, fk.ReferencedTable, rowIndex, rowId);
                 }
 
                 if (fk != null &&
@@ -584,6 +599,32 @@ namespace SqlTestDataGenerator.DataGeneration
                 return satisfy
                     ? generator.GenerateSatisfying(col, opStr, condition.Value)
                     : generator.GenerateViolating(col, opStr, condition.Value);
+            }
+
+            // 3.5 Check HAVING aggregate conditions for positive-path generation
+            if (satisfy)
+            {
+                var aggregateCondition = query.HavingConditions
+                    .FirstOrDefault(c =>
+                        c.AggregateFunc.HasValue &&
+                        c.ColumnName.Equals(col.ColumnName, StringComparison.OrdinalIgnoreCase) &&
+                        (string.IsNullOrEmpty(c.TableAlias) ||
+                         c.TableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase)));
+
+                if (aggregateCondition != null)
+                {
+                    var opStr = ConditionOpToString(aggregateCondition.Operator);
+
+                    if (aggregateCondition.Operator == ComparisonOp.Between)
+                    {
+                        return GenerateBetweenValue(col, aggregateCondition.Value, aggregateCondition.SecondValue, inside: true);
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(aggregateCondition.Value))
+                    {
+                        return generator.GenerateSatisfying(col, opStr, aggregateCondition.Value);
+                    }
+                }
             }
 
             // 4. Check JOIN conditions
@@ -666,8 +707,11 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private void GenerateSubquerySupportData(
             BranchScenario scenario, ParsedQuery query,
-            Dictionary<string, TableSchema> schemas, int baseId, bool satisfy)
+            Dictionary<string, TableSchema> schemas, ref int nextId, bool satisfy)
         {
+            var tableRowIds = InitializeGeneratedIdMapFromScenario(scenario, schemas);
+            var aliasToTableMap = new Dictionary<string, string>(query.AliasToTableMap, StringComparer.OrdinalIgnoreCase);
+
             foreach (var subquery in query.Subqueries)
             {
                 if (!satisfy) continue; // Don't create matching data if we want a miss
@@ -675,108 +719,314 @@ namespace SqlTestDataGenerator.DataGeneration
                 // For IN subqueries: create data that makes the parent value appear in the subquery result
                 if (subquery.Operator is SubqueryOperator.In or SubqueryOperator.Exists)
                 {
-                    GenerateSubqueryMatchData(scenario, subquery, query, schemas, baseId);
-                    baseId += 100;
+                    GenerateSubqueryMatchData(
+                        scenario,
+                        subquery,
+                        query,
+                        schemas,
+                        ref nextId,
+                        tableRowIds,
+                        aliasToTableMap);
                 }
             }
         }
 
         private void GenerateSubqueryMatchData(
             BranchScenario scenario, SubqueryInfo subquery,
-            ParsedQuery query, Dictionary<string, TableSchema> schemas, int baseId)
+            ParsedQuery query,
+            Dictionary<string, TableSchema> schemas,
+            ref int nextId,
+            Dictionary<string, List<int>> tableRowIds,
+            Dictionary<string, string> aliasToTableMap)
         {
-            // For each table in the subquery, generate rows that make the subquery return
-            // values matching the parent column
-            foreach (var subTable in subquery.Tables)
+            var localAliasMap = ExtendAliasMap(aliasToTableMap, subquery.Tables);
+            var directTableNames = subquery.Tables
+                .Select(t => t.TableName)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            List<string> insertOrder;
+            try
             {
-                if (!schemas.TryGetValue(subTable.TableName, out var schema))
+                insertOrder = _orderResolver.ResolveInsertOrder(directTableNames, schemas);
+            }
+            catch
+            {
+                insertOrder = directTableNames.ToList();
+            }
+
+            foreach (var tableName in directTableNames)
+            {
+                if (!insertOrder.Contains(tableName, StringComparer.OrdinalIgnoreCase))
+                {
+                    insertOrder.Add(tableName);
+                }
+            }
+
+            foreach (var tableName in insertOrder)
+            {
+                if (!schemas.TryGetValue(tableName, out var schema))
                     continue;
 
-                // Check if we already have data for this table
-                if (scenario.TableRows.ContainsKey(subTable.TableName) &&
-                    scenario.TableRows[subTable.TableName].Any())
+                var subTable = subquery.Tables
+                    .FirstOrDefault(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase));
+                var tableAlias = subTable?.EffectiveName ?? tableName;
+                var row = new GeneratedRow { TableName = tableName };
+                int rowId = nextId++;
+
+                foreach (var col in schema.Columns)
                 {
-                    // Add additional rows for subquery conditions
-                    var row = new GeneratedRow { TableName = subTable.TableName };
-                    int rowId = baseId;
+                    if (col.IsComputed) continue;
 
-                    foreach (var col in schema.Columns)
-                    {
-                        if (col.IsComputed) continue;
-
-                        // Satisfy subquery WHERE conditions
-                        var subCondition = subquery.Conditions
-                            .FirstOrDefault(c =>
-                                c.ColumnName.Equals(col.ColumnName, StringComparison.OrdinalIgnoreCase));
-
-                        if (subCondition != null && !string.IsNullOrEmpty(subCondition.Value))
-                        {
-                            var generator = _valueFactory.GetGenerator(col.TypeCategory);
-                            var opStr = ConditionOpToString(subCondition.Operator);
-                            row.SetValue(col.ColumnName, generator.GenerateSatisfying(col, opStr, subCondition.Value));
-                        }
-                        else if (col.IsPrimaryKey)
-                        {
-                            row.SetValue(col.ColumnName, rowId);
-                        }
-                        else
-                        {
-                            // Try to match the parent table's column value
-                            if (col.ColumnName.Equals(subquery.SelectColumn, StringComparison.OrdinalIgnoreCase))
-                            {
-                                // Use the parent's value from existing data
-                                var parentRow = scenario.TableRows
-                                    .SelectMany(kvp => kvp.Value)
-                                    .FirstOrDefault(r =>
-                                    {
-                                        var val = r.GetValue(subquery.ParentColumnName);
-                                        return val != null;
-                                    });
-
-                                if (parentRow != null)
-                                {
-                                    row.SetValue(col.ColumnName, parentRow.GetValue(subquery.ParentColumnName));
-                                }
-                                else
-                                {
-                                    row.SetValue(col.ColumnName, _valueFactory.GetGenerator(col.TypeCategory).GenerateDefault(col));
-                                }
-                            }
-                            else
-                            {
-                                row.SetValue(col.ColumnName, _valueFactory.GetGenerator(col.TypeCategory).GenerateDefault(col));
-                            }
-                        }
-                    }
-
-                    scenario.AddRow(subTable.TableName, row);
-                }
-                else
-                {
-                    // Create fresh row
-                    var row = new GeneratedRow { TableName = subTable.TableName };
-
-                    foreach (var col in schema.Columns)
-                    {
-                        if (col.IsComputed) continue;
-
-                        if (col.IsPrimaryKey)
-                            row.SetValue(col.ColumnName, baseId);
-                        else
-                            row.SetValue(col.ColumnName, _valueFactory.GetGenerator(col.TypeCategory).GenerateDefault(col));
-                    }
-
-                    scenario.AddRow(subTable.TableName, row);
+                    var value = GenerateSubqueryColumnValue(
+                        scenario,
+                        query,
+                        subquery,
+                        schema,
+                        tableAlias,
+                        col,
+                        tableRowIds,
+                        localAliasMap,
+                        rowId);
+                    row.SetValue(col.ColumnName, value);
                 }
 
-                baseId++;
+                scenario.AddRow(tableName, row);
+                RegisterGeneratedIds(tableRowIds, tableName, rowId, 1);
             }
 
             // Handle nested subqueries recursively
             foreach (var nested in subquery.NestedSubqueries)
             {
-                GenerateSubqueryMatchData(scenario, nested, query, schemas, baseId + 100);
+                GenerateSubqueryMatchData(
+                    scenario,
+                    nested,
+                    query,
+                    schemas,
+                    ref nextId,
+                    tableRowIds,
+                    localAliasMap);
             }
+        }
+
+        private object? GenerateSubqueryColumnValue(
+            BranchScenario scenario,
+            ParsedQuery query,
+            SubqueryInfo subquery,
+            TableSchema schema,
+            string tableAlias,
+            ColumnSchema column,
+            Dictionary<string, List<int>> tableRowIds,
+            Dictionary<string, string> aliasToTableMap,
+            int rowId)
+        {
+            var generator = _valueFactory.GetGenerator(column.TypeCategory);
+
+            if (column.IsIdentity || column.IsPrimaryKey)
+                return rowId;
+
+            var fk = schema.ForeignKeys
+                .FirstOrDefault(f => f.ColumnName.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase));
+            if (fk != null)
+            {
+                if (TryResolveRelatedRowId(tableRowIds, fk.ReferencedTable, 0, out var fkId))
+                    return fkId;
+
+                if (column.IsNullable)
+                    return null;
+            }
+
+            var condition = FindSubqueryCondition(subquery, tableAlias, column.ColumnName);
+            if (condition != null)
+            {
+                if (condition.IsColumnComparison &&
+                    TryResolveSubqueryComparisonValue(
+                        scenario,
+                        query,
+                        condition,
+                        tableRowIds,
+                        aliasToTableMap,
+                        out var comparisonValue))
+                {
+                    return comparisonValue;
+                }
+
+                var opStr = ConditionOpToString(condition.Operator);
+                if (condition.Operator == ComparisonOp.Between)
+                    return GenerateBetweenValue(column, condition.Value, condition.SecondValue, inside: true);
+                if (condition.Operator == ComparisonOp.In && condition.InValues.Any())
+                    return generator.GenerateFromLiteral(condition.InValues[0], column);
+                if (condition.Operator == ComparisonOp.IsNull)
+                    return null;
+                if (condition.Operator == ComparisonOp.IsNotNull)
+                    return generator.GenerateDefault(column);
+                if (condition.Operator == ComparisonOp.Like)
+                    return generator.GenerateSatisfying(column, "LIKE", condition.LikePattern);
+                if (!string.IsNullOrWhiteSpace(condition.Value))
+                    return generator.GenerateSatisfying(column, opStr, condition.Value);
+            }
+
+            if (!string.IsNullOrWhiteSpace(subquery.SelectColumn) &&
+                column.ColumnName.Equals(subquery.SelectColumn, StringComparison.OrdinalIgnoreCase) &&
+                TryResolveScenarioValue(
+                    scenario,
+                    aliasToTableMap,
+                    subquery.ParentTableAlias,
+                    subquery.ParentColumnName,
+                    out var parentValue))
+            {
+                return parentValue;
+            }
+
+            return generator.GenerateDefault(column);
+        }
+
+        private static ConditionInfo? FindSubqueryCondition(
+            SubqueryInfo subquery,
+            string tableAlias,
+            string columnName)
+        {
+            return subquery.Conditions.FirstOrDefault(c =>
+                c.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase) &&
+                (string.IsNullOrEmpty(c.TableAlias) ||
+                 c.TableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase)));
+        }
+
+        private static Dictionary<string, List<int>> InitializeGeneratedIdMapFromScenario(
+            BranchScenario scenario,
+            Dictionary<string, TableSchema> schemas)
+        {
+            var map = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var kvp in scenario.TableRows)
+            {
+                if (!schemas.TryGetValue(kvp.Key, out var schema))
+                    continue;
+                if (schema.PrimaryKey?.Columns.Count != 1)
+                    continue;
+
+                var pkColumn = schema.PrimaryKey.Columns[0];
+                var ids = kvp.Value
+                    .Select(r => r.GetValue(pkColumn))
+                    .Where(v => v != null && int.TryParse(v!.ToString(), out _))
+                    .Select(v => Convert.ToInt32(v))
+                    .Distinct()
+                    .ToList();
+
+                if (ids.Any())
+                {
+                    map[kvp.Key] = ids;
+                }
+            }
+
+            return map;
+        }
+
+        private static Dictionary<string, string> ExtendAliasMap(
+            Dictionary<string, string> source,
+            IEnumerable<TableInfo> tables)
+        {
+            var map = new Dictionary<string, string>(source, StringComparer.OrdinalIgnoreCase);
+            foreach (var table in tables)
+            {
+                if (!string.IsNullOrWhiteSpace(table.Alias))
+                    map[table.Alias] = table.TableName;
+                map[table.TableName] = table.TableName;
+            }
+
+            return map;
+        }
+
+        private static bool TryResolveSubqueryComparisonValue(
+            BranchScenario scenario,
+            ParsedQuery query,
+            ConditionInfo condition,
+            Dictionary<string, List<int>> tableRowIds,
+            Dictionary<string, string> aliasToTableMap,
+            out object? value)
+        {
+            value = null;
+
+            if (string.IsNullOrWhiteSpace(condition.RightColumnName))
+                return false;
+
+            if (!string.IsNullOrWhiteSpace(condition.RightTableAlias))
+            {
+                var tableName = aliasToTableMap.TryGetValue(condition.RightTableAlias, out var resolvedTable)
+                    ? resolvedTable
+                    : query.ResolveAlias(condition.RightTableAlias);
+
+                if (TryResolveScenarioValue(scenario, tableName, condition.RightColumnName, out value))
+                    return true;
+
+                if (TryResolveRelatedRowId(tableRowIds, tableName, 0, out var relatedId))
+                {
+                    value = relatedId;
+                    return true;
+                }
+            }
+
+            return TryResolveScenarioValue(scenario, null, condition.RightColumnName, out value);
+        }
+
+        private static bool TryResolveScenarioValue(
+            BranchScenario scenario,
+            Dictionary<string, string> aliasToTableMap,
+            string? tableAlias,
+            string? columnName,
+            out object? value)
+        {
+            value = null;
+            if (string.IsNullOrWhiteSpace(columnName))
+                return false;
+
+            string? tableName = null;
+            if (!string.IsNullOrWhiteSpace(tableAlias))
+            {
+                tableName = aliasToTableMap.TryGetValue(tableAlias, out var resolved)
+                    ? resolved
+                    : tableAlias;
+            }
+
+            return TryResolveScenarioValue(scenario, tableName, columnName, out value);
+        }
+
+        private static bool TryResolveScenarioValue(
+            BranchScenario scenario,
+            string? tableName,
+            string columnName,
+            out object? value)
+        {
+            value = null;
+
+            if (!string.IsNullOrWhiteSpace(tableName) &&
+                scenario.TableRows.TryGetValue(tableName, out var scopedRows))
+            {
+                foreach (var row in scopedRows)
+                {
+                    var rowValue = row.GetValue(columnName);
+                    if (rowValue != null)
+                    {
+                        value = rowValue;
+                        return true;
+                    }
+                }
+            }
+
+            foreach (var rows in scenario.TableRows.Values)
+            {
+                foreach (var row in rows)
+                {
+                    var rowValue = row.GetValue(columnName);
+                    if (rowValue != null)
+                    {
+                        value = rowValue;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
         }
 
         // ═════════════════════════════════════════════════════════════════
@@ -831,6 +1081,26 @@ namespace SqlTestDataGenerator.DataGeneration
             var safeIndex = Math.Abs(rowIndex) % ids.Count;
             resolvedId = ids[safeIndex];
             return true;
+        }
+
+        private static int GetOrCreateReferencedRowId(
+            Dictionary<string, List<int>> referencedTableIdPools,
+            string tableName,
+            int rowIndex,
+            int seedValue)
+        {
+            if (!referencedTableIdPools.TryGetValue(tableName, out var ids))
+            {
+                ids = new List<int>();
+                referencedTableIdPools[tableName] = ids;
+            }
+
+            while (ids.Count <= rowIndex)
+            {
+                ids.Add(seedValue + ids.Count);
+            }
+
+            return ids[rowIndex];
         }
 
         private bool IsAggregateSourceTable(string tableName, string alias, ParsedQuery query)
@@ -888,6 +1158,8 @@ namespace SqlTestDataGenerator.DataGeneration
                         {
                             schema.Columns.Add(new ColumnSchema
                             {
+                                TableName = schema.TableName,
+                                SchemaName = schema.SchemaName,
                                 ColumnName = sel.ColumnName,
                                 DataType = "varchar",
                                 MaxLength = 100,
@@ -907,6 +1179,8 @@ namespace SqlTestDataGenerator.DataGeneration
                         {
                             schema.Columns.Add(new ColumnSchema
                             {
+                                TableName = schema.TableName,
+                                SchemaName = schema.SchemaName,
                                 ColumnName = cond.ColumnName,
                                 DataType = InferDataType(cond),
                                 IsNullable = cond.Operator is ComparisonOp.IsNull or ComparisonOp.IsNotNull
@@ -925,6 +1199,8 @@ namespace SqlTestDataGenerator.DataGeneration
                     {
                         schema.Columns.Add(new ColumnSchema
                         {
+                            TableName = schema.TableName,
+                            SchemaName = schema.SchemaName,
                             ColumnName = col,
                             DataType = "int",
                             IsPrimaryKey = join.LeftTableAlias.Equals(alias, StringComparison.OrdinalIgnoreCase)
@@ -963,5 +1239,18 @@ namespace SqlTestDataGenerator.DataGeneration
             ComparisonOp.Like => "LIKE",
             _ => "="
         };
+
+        private static BranchScenario CloneScenarioDescriptor(BranchScenario source)
+        {
+            return new BranchScenario
+            {
+                Id = source.Id,
+                Name = source.Name,
+                Description = source.Description,
+                Type = source.Type,
+                ExpectedToReturnRows = source.ExpectedToReturnRows,
+                TestedCondition = source.TestedCondition
+            };
+        }
     }
 }

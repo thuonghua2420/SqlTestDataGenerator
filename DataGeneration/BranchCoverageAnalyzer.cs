@@ -59,7 +59,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 }
             }
 
-            return scenarios;
+            return DeduplicateAndRenumber(scenarios);
         }
 
         // ═════════════════════════════════════════════════════════════════
@@ -171,6 +171,42 @@ namespace SqlTestDataGenerator.DataGeneration
                 ComparisonOp.LessThan or
                 ComparisonOp.LessThanOrEqual or
                 ComparisonOp.Between;
+        }
+
+        private List<BranchScenario> DeduplicateAndRenumber(List<BranchScenario> scenarios)
+        {
+            var seenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var uniqueScenarios = new List<BranchScenario>();
+
+            foreach (var scenario in scenarios)
+            {
+                if (!seenKeys.Add(BuildScenarioKey(scenario)))
+                    continue;
+
+                scenario.Id = uniqueScenarios.Count + 1;
+                uniqueScenarios.Add(scenario);
+            }
+
+            _nextId = uniqueScenarios.Count + 1;
+            return uniqueScenarios;
+        }
+
+        private static string BuildScenarioKey(BranchScenario scenario)
+        {
+            return string.Join("|",
+                scenario.Type,
+                scenario.ExpectedToReturnRows ? "1" : "0",
+                NormalizeScenarioText(scenario.Name),
+                NormalizeScenarioText(scenario.TestedCondition));
+        }
+
+        private static string NormalizeScenarioText(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return string.Empty;
+
+            return string.Join(" ",
+                value.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
         }
     }
 }

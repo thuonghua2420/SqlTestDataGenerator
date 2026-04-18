@@ -18,6 +18,8 @@ namespace SqlTestDataGenerator.Schema.Models
 
     public class ColumnSchema
     {
+        public string TableName { get; set; } = string.Empty;
+        public string SchemaName { get; set; } = "dbo";
         public string ColumnName { get; set; } = string.Empty;
         public string DataType { get; set; } = string.Empty;
         public bool IsNullable { get; set; }
@@ -29,6 +31,7 @@ namespace SqlTestDataGenerator.Schema.Models
         public bool IsPrimaryKey { get; set; }
         public bool IsComputed { get; set; }
         public int OrdinalPosition { get; set; }
+        public string ColumnKey => $"{SchemaName}.{TableName}.{ColumnName}";
 
         /// <summary>Determines the C# type category for value generation</summary>
         public DataTypeCategory TypeCategory => DataType.ToLowerInvariant() switch
@@ -47,7 +50,7 @@ namespace SqlTestDataGenerator.Schema.Models
             _ => DataTypeCategory.String
         };
 
-        public override string ToString() => $"{ColumnName} ({DataType}{(IsNullable ? ", NULL" : ", NOT NULL")})";
+        public override string ToString() => $"{ColumnKey} ({DataType}{(IsNullable ? ", NULL" : ", NOT NULL")})";
     }
 
     public class PrimaryKeyInfo

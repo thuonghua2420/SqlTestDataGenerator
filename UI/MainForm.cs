@@ -29,6 +29,7 @@ namespace SqlTestDataGenerator.UI
         private ParsedQuery? _currentQuery;
         private Dictionary<string, TableSchema>? _schemas;
         private DataGeneration.Models.GeneratedDataSet? _currentDataSet;
+        private List<DataGeneration.Models.BranchScenario> _availableScenarios = new();
 
         // ── UI Controls ──
         private Panel _headerPanel = null!;
@@ -512,6 +513,7 @@ namespace SqlTestDataGenerator.UI
                 {
                     _analysisOutput.Text = "❌ PARSE ERRORS:\r\n" +
                         string.Join("\r\n", _currentQuery.Errors);
+                    _availableScenarios.Clear();
                     _generateBtn.Enabled = false;
                     _currentDataSet = null;
                     UpdateDbInsertButtonState();
@@ -523,11 +525,11 @@ namespace SqlTestDataGenerator.UI
                 _analysisOutput.Text = _parser.GenerateSummary(_currentQuery);
 
                 // Generate branch scenarios
-                var scenarios = _branchAnalyzer.AnalyzeBranches(_currentQuery);
+                _availableScenarios = _branchAnalyzer.AnalyzeBranches(_currentQuery);
 
                 // Populate scenario list
                 _scenarioList.Items.Clear();
-                foreach (var s in scenarios)
+                foreach (var s in _availableScenarios)
                 {
                     var shouldCheck = s.Type == DataGeneration.Models.ScenarioType.Positive;
                     _scenarioList.Items.Add($"[{s.Type}] {s.Name}", shouldCheck);
@@ -536,11 +538,12 @@ namespace SqlTestDataGenerator.UI
                 _generateBtn.Enabled = true;
                 SetStatus($"Analysis complete: {_currentQuery.Tables.Count} tables, " +
                           $"{_currentQuery.WhereConditions.Count} conditions, " +
-                          $"{scenarios.Count} scenarios.");
+                          $"{_availableScenarios.Count} scenarios.");
             }
             catch (Exception ex)
             {
                 _analysisOutput.Text = $"❌ Error: {ex.Message}";
+                _availableScenarios.Clear();
                 _generateBtn.Enabled = false;
                 _currentDataSet = null;
                 UpdateDbInsertButtonState();
@@ -574,12 +577,11 @@ namespace SqlTestDataGenerator.UI
                 }
 
                 // Get selected scenarios
-                var allScenarios = _branchAnalyzer.AnalyzeBranches(_currentQuery);
                 var selectedScenarios = new List<DataGeneration.Models.BranchScenario>();
-                for (int i = 0; i < _scenarioList.Items.Count && i < allScenarios.Count; i++)
+                for (int i = 0; i < _scenarioList.Items.Count && i < _availableScenarios.Count; i++)
                 {
                     if (_scenarioList.GetItemChecked(i))
-                        selectedScenarios.Add(allScenarios[i]);
+                        selectedScenarios.Add(_availableScenarios[i]);
                 }
 
                 if (!selectedScenarios.Any())

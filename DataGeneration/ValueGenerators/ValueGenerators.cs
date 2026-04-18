@@ -14,22 +14,34 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
         object GenerateFromLiteral(string literal, ColumnSchema column);
     }
 
+    internal static class ValueGeneratorKeyHelper
+    {
+        public static string GetColumnKey(ColumnSchema column)
+        {
+            if (!string.IsNullOrWhiteSpace(column.ColumnKey))
+                return column.ColumnKey;
+
+            return $"{column.ColumnName}|{column.DataType}|{column.MaxLength}|{column.NumericPrecision}|{column.NumericScale}";
+        }
+    }
+
     /// <summary>
     /// Generates integer values (int, bigint, smallint, tinyint).
     /// </summary>
     public class IntegerValueGenerator : IValueGenerator
     {
-        private int _counter = 90000; // Start high to avoid conflicts
+        private readonly Dictionary<string, int> _counters = new(StringComparer.OrdinalIgnoreCase);
+        private const int StartValue = 90000;
 
         public bool CanHandle(DataTypeCategory category) => category == DataTypeCategory.Integer;
 
         public object GenerateDefault(ColumnSchema column) =>
-            NormalizeIntegerForType(_counter++, column);
+            NormalizeIntegerForType(GetNextId(column), column);
 
         public object GenerateSatisfying(ColumnSchema column, string op, string value)
         {
             if (!long.TryParse(value, out var numValue))
-                return _counter++;
+                return NormalizeIntegerForType(GetNextId(column), column);
 
             var candidate = op switch
             {
@@ -64,11 +76,21 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
 
         public object GenerateFromLiteral(string literal, ColumnSchema column)
         {
-            var value = long.TryParse(literal, out var v) ? v : _counter++;
+            var value = long.TryParse(literal, out var v) ? v : GetNextId(column);
             return NormalizeIntegerForType(value, column);
         }
 
-        public int GetNextId() => _counter++;
+        public int GetNextId(ColumnSchema column)
+        {
+            var key = ValueGeneratorKeyHelper.GetColumnKey(column);
+            if (!_counters.TryGetValue(key, out var next))
+            {
+                next = StartValue;
+            }
+
+            _counters[key] = next + 1;
+            return next;
+        }
 
         private static object NormalizeIntegerForType(long value, ColumnSchema column)
         {
@@ -87,15 +109,14 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
     /// </summary>
     public class DecimalValueGenerator : IValueGenerator
     {
-        private long _sequence;
+        private readonly Dictionary<string, long> _sequences = new(StringComparer.OrdinalIgnoreCase);
 
         public bool CanHandle(DataTypeCategory category) =>
             category == DataTypeCategory.Decimal || category == DataTypeCategory.Float;
 
         public object GenerateDefault(ColumnSchema column)
         {
-            _sequence++;
-            return GenerateSequentialValue(column, _sequence);
+            return GenerateSequentialValue(column, NextSequence(column));
         }
 
         public object GenerateSatisfying(ColumnSchema column, string op, string value)
@@ -251,6 +272,18 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
             var max = wholePartLimit - step;
             return max > 0m ? max : step;
         }
+
+        private long NextSequence(ColumnSchema column)
+        {
+            var key = ValueGeneratorKeyHelper.GetColumnKey(column);
+            if (!_sequences.TryGetValue(key, out var next))
+            {
+                next = 1;
+            }
+
+            _sequences[key] = next + 1;
+            return next;
+        }
     }
 
     /// <summary>
@@ -258,7 +291,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
     /// </summary>
     public class StringValueGenerator : IValueGenerator
     {
-        private int _counter;
+        private readonly Dictionary<string, int> _counters = new(StringComparer.OrdinalIgnoreCase);
         private const string Base36Chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
         public bool CanHandle(DataTypeCategory category) => category == DataTypeCategory.String;
@@ -266,8 +299,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
         public object GenerateDefault(ColumnSchema column)
         {
             var maxLen = NormalizeMaxLength(column.MaxLength);
-            _counter++;
-            return GenerateLengthSafeUniqueString(maxLen, _counter);
+            return GenerateLengthSafeUniqueString(maxLen, NextSequence(column));
         }
 
         public object GenerateSatisfying(ColumnSchema column, string op, string value)
@@ -294,8 +326,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
             if (raw.Length <= maxLen)
                 return raw;
 
-            _counter++;
-            return GenerateLengthSafeUniqueString(maxLen, _counter);
+            return GenerateLengthSafeUniqueString(maxLen, NextSequence(column));
         }
 
         public object GenerateFromLiteral(string literal, ColumnSchema column)
@@ -375,6 +406,18 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
 
             return new string(chars);
         }
+
+        private int NextSequence(ColumnSchema column)
+        {
+            var key = ValueGeneratorKeyHelper.GetColumnKey(column);
+            if (!_counters.TryGetValue(key, out var next))
+            {
+                next = 1;
+            }
+
+            _counters[key] = next + 1;
+            return next;
+        }
     }
 
     /// <summary>
@@ -382,7 +425,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
     /// </summary>
     public class DateTimeValueGenerator : IValueGenerator
     {
-        private int _counter;
+        private readonly Dictionary<string, int> _counters = new(StringComparer.OrdinalIgnoreCase);
         private static readonly DateTime BaseDateTime = new(2024, 1, 1, 8, 0, 0, DateTimeKind.Unspecified);
 
         public bool CanHandle(DataTypeCategory category) =>
@@ -390,10 +433,10 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
 
         public object GenerateDefault(ColumnSchema column)
         {
-            _counter++;
+            var sequence = NextSequence(column);
             var next = column.DataType.Equals("date", StringComparison.OrdinalIgnoreCase)
-                ? BaseDateTime.AddDays(_counter)
-                : BaseDateTime.AddMinutes(_counter);
+                ? BaseDateTime.AddDays(sequence)
+                : BaseDateTime.AddMinutes(sequence);
             return NormalizeDateValue(next, column);
         }
 
@@ -450,6 +493,18 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
                 _ => value
             };
         }
+
+        private int NextSequence(ColumnSchema column)
+        {
+            var key = ValueGeneratorKeyHelper.GetColumnKey(column);
+            if (!_counters.TryGetValue(key, out var next))
+            {
+                next = 1;
+            }
+
+            _counters[key] = next + 1;
+            return next;
+        }
     }
 
     /// <summary>
@@ -457,14 +512,14 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
     /// </summary>
     public class TimeValueGenerator : IValueGenerator
     {
-        private int _counter;
+        private readonly Dictionary<string, int> _counters = new(StringComparer.OrdinalIgnoreCase);
 
         public bool CanHandle(DataTypeCategory category) => category == DataTypeCategory.Time;
 
         public object GenerateDefault(ColumnSchema column)
         {
-            _counter++;
-            return new TimeSpan((_counter % 24), (_counter * 7) % 60, (_counter * 13) % 60);
+            var sequence = NextSequence(column);
+            return new TimeSpan((sequence % 24), (sequence * 7) % 60, (sequence * 13) % 60);
         }
 
         public object GenerateSatisfying(ColumnSchema column, string op, string value)
@@ -498,6 +553,18 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
                 return dt.TimeOfDay;
 
             return GenerateDefault(column);
+        }
+
+        private int NextSequence(ColumnSchema column)
+        {
+            var key = ValueGeneratorKeyHelper.GetColumnKey(column);
+            if (!_counters.TryGetValue(key, out var next))
+            {
+                next = 1;
+            }
+
+            _counters[key] = next + 1;
+            return next;
         }
     }
 

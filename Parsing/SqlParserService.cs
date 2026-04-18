@@ -98,6 +98,9 @@ namespace SqlTestDataGenerator.Parsing
             // Step 10: Extract SELECT columns
             ExtractSelectColumns(querySpec, result);
 
+            // Step 10.5: Merge execution constraints from CTE query bodies.
+            AnalyzeCteQuerySpecifications(fragment, result);
+
             // Step 11: DISTINCT / TOP
             result.HasDistinct = querySpec.UniqueRowFilter == UniqueRowFilter.Distinct;
             if (querySpec.TopRowFilter != null && querySpec.TopRowFilter.Expression is IntegerLiteral topLit)
@@ -315,6 +318,191 @@ namespace SqlTestDataGenerator.Parsing
                     rightTable.Role = role;
                 }
             }
+        }
+
+        private void AnalyzeCteQuerySpecifications(TSqlFragment fragment, ParsedQuery result)
+        {
+            foreach (var cteSpec in ExtractCteQuerySpecifications(fragment))
+            {
+                AnalyzeQuerySpecification(cteSpec, result);
+            }
+
+            DeduplicateAnalysis(result);
+        }
+
+        private void AnalyzeQuerySpecification(QuerySpecification spec, ParsedQuery result)
+        {
+            var joinVisitor = new JoinExtractorVisitor();
+            if (spec.FromClause != null)
+            {
+                spec.FromClause.Accept(joinVisitor);
+                result.Joins.AddRange(joinVisitor.Joins);
+            }
+
+            if (spec.WhereClause != null)
+            {
+                var whereVisitor = new ConditionExtractorVisitor(ConditionSource.Where);
+                spec.WhereClause.Accept(whereVisitor);
+                result.WhereConditions.AddRange(whereVisitor.Conditions);
+
+                var subqueryVisitor = new SubqueryExtractorVisitor();
+                spec.WhereClause.Accept(subqueryVisitor);
+                result.Subqueries.AddRange(subqueryVisitor.Subqueries);
+            }
+
+            if (spec.HavingClause != null)
+            {
+                var havingVisitor = new ConditionExtractorVisitor(ConditionSource.Having);
+                spec.HavingClause.Accept(havingVisitor);
+                result.HavingConditions.AddRange(havingVisitor.Conditions);
+
+                var subqueryVisitor = new SubqueryExtractorVisitor();
+                spec.HavingClause.Accept(subqueryVisitor);
+                result.Subqueries.AddRange(subqueryVisitor.Subqueries);
+            }
+
+            if (spec.GroupByClause != null)
+            {
+                var groupByVisitor = new GroupByExtractorVisitor();
+                spec.GroupByClause.Accept(groupByVisitor);
+                result.GroupByColumns.AddRange(groupByVisitor.GroupByColumns);
+            }
+
+            var aggregateVisitor = new AggregateExtractorVisitor();
+            spec.Accept(aggregateVisitor);
+            result.Aggregates.AddRange(aggregateVisitor.Aggregates);
+        }
+
+        private IEnumerable<QuerySpecification> ExtractCteQuerySpecifications(TSqlFragment fragment)
+        {
+            if (fragment is not TSqlScript script)
+                yield break;
+
+            foreach (var batch in script.Batches)
+            {
+                foreach (var stmt in batch.Statements)
+                {
+                    if (stmt is not SelectStatement selectStmt ||
+                        selectStmt.WithCtesAndXmlNamespaces?.CommonTableExpressions == null)
+                    {
+                        continue;
+                    }
+
+                    foreach (var cte in selectStmt.WithCtesAndXmlNamespaces.CommonTableExpressions)
+                    {
+                        foreach (var spec in EnumerateQuerySpecifications(cte.QueryExpression))
+                        {
+                            yield return spec;
+                        }
+                    }
+                }
+            }
+        }
+
+        private IEnumerable<QuerySpecification> EnumerateQuerySpecifications(QueryExpression? expression)
+        {
+            if (expression == null)
+                yield break;
+
+            switch (expression)
+            {
+                case QuerySpecification spec:
+                    yield return spec;
+                    yield break;
+
+                case QueryParenthesisExpression paren:
+                    foreach (var nested in EnumerateQuerySpecifications(paren.QueryExpression))
+                    {
+                        yield return nested;
+                    }
+                    yield break;
+
+                case BinaryQueryExpression binary:
+                    foreach (var left in EnumerateQuerySpecifications(binary.FirstQueryExpression))
+                    {
+                        yield return left;
+                    }
+
+                    foreach (var right in EnumerateQuerySpecifications(binary.SecondQueryExpression))
+                    {
+                        yield return right;
+                    }
+                    yield break;
+            }
+        }
+
+        private void DeduplicateAnalysis(ParsedQuery result)
+        {
+            result.WhereConditions = result.WhereConditions
+                .DistinctBy(BuildConditionKey)
+                .ToList();
+            result.HavingConditions = result.HavingConditions
+                .DistinctBy(BuildConditionKey)
+                .ToList();
+            result.Joins = result.Joins
+                .DistinctBy(BuildJoinKey)
+                .ToList();
+            result.Subqueries = result.Subqueries
+                .DistinctBy(BuildSubqueryKey)
+                .ToList();
+            result.Aggregates = result.Aggregates
+                .DistinctBy(BuildAggregateKey)
+                .ToList();
+            result.GroupByColumns = result.GroupByColumns
+                .DistinctBy(g => $"{g.TableAlias}.{g.ColumnName}")
+                .ToList();
+
+            UpdateTableRolesFromJoins(result);
+        }
+
+        private static string BuildConditionKey(ConditionInfo condition)
+        {
+            return string.Join("|",
+                condition.Source,
+                condition.TableAlias,
+                condition.ColumnName,
+                condition.Operator,
+                condition.Value,
+                condition.SecondValue,
+                condition.LikePattern,
+                condition.RightTableAlias,
+                condition.RightColumnName,
+                condition.AggregateFunc?.ToString() ?? string.Empty,
+                condition.ExpressionText,
+                condition.HasSubquery ? "1" : "0",
+                condition.IsNegated ? "1" : "0");
+        }
+
+        private static string BuildJoinKey(JoinInfo join)
+        {
+            return string.Join("|",
+                join.Type,
+                join.LeftTableAlias,
+                join.LeftColumn,
+                join.RightTableAlias,
+                join.RightColumn,
+                join.OnConditionText);
+        }
+
+        private static string BuildSubqueryKey(SubqueryInfo subquery)
+        {
+            return string.Join("|",
+                subquery.Operator,
+                subquery.ParentTableAlias,
+                subquery.ParentColumnName,
+                subquery.SelectTableAlias,
+                subquery.SelectColumn,
+                subquery.SubquerySql);
+        }
+
+        private static string BuildAggregateKey(AggregateInfo aggregate)
+        {
+            return string.Join("|",
+                aggregate.Function,
+                aggregate.TableAlias,
+                aggregate.ColumnName,
+                aggregate.Expression,
+                aggregate.IsDistinct ? "1" : "0");
         }
 
         private void ValidateAndWarn(ParsedQuery result)
