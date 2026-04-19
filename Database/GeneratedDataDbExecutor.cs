@@ -150,6 +150,14 @@ namespace SqlTestDataGenerator.Database
                             }
 
                             result.TablesInserted++;
+                            result.InsertedTables.Add(new DirectInsertTableInfo
+                            {
+                                Key = BuildTableKey(schema.SchemaName, schema.TableName),
+                                SchemaName = NormalizeSchema(schema.SchemaName),
+                                TableName = schema.TableName,
+                                DisplayName = $"{NormalizeSchema(schema.SchemaName)}.{schema.TableName}",
+                                InsertedRowCount = rows.Count
+                            });
                         }
                         finally
                         {
@@ -1689,5 +1697,15 @@ JOIN sys.schemas sp ON tp.schema_id = sp.schema_id;";
         public bool UsedConstraintDisableFallback { get; set; }
         public bool UsedInsertConstraintBypass { get; set; }
         public List<string> ClearedTables { get; set; } = new();
+        public List<DirectInsertTableInfo> InsertedTables { get; set; } = new();
+    }
+
+    public class DirectInsertTableInfo
+    {
+        public string Key { get; set; } = string.Empty;
+        public string SchemaName { get; set; } = "dbo";
+        public string TableName { get; set; } = string.Empty;
+        public string DisplayName { get; set; } = string.Empty;
+        public int InsertedRowCount { get; set; }
     }
 }

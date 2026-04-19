@@ -8,6 +8,7 @@ using SqlTestDataGenerator.Schema;
 using SqlTestDataGenerator.Schema.Models;
 using System.Data;
 using System.Drawing.Drawing2D;
+using System.Text;
 
 namespace SqlTestDataGenerator.UI
 {
@@ -22,6 +23,8 @@ namespace SqlTestDataGenerator.UI
         private readonly CleanupScriptGenerator _cleanupGenerator = new();
         private readonly DependencyOrderResolver _orderResolver = new();
         private readonly GeneratedDataDbExecutor _dbExecutor = new();
+        private readonly TableCsvExporter _csvExporter = new();
+        private readonly TableCsvFolderImporter _csvImporter = new();
         private DatabaseConnectionManager? _connectionManager;
         private SchemaIntrospector? _schemaIntrospector;
 
@@ -30,6 +33,7 @@ namespace SqlTestDataGenerator.UI
         private Dictionary<string, TableSchema>? _schemas;
         private DataGeneration.Models.GeneratedDataSet? _currentDataSet;
         private List<DataGeneration.Models.BranchScenario> _availableScenarios = new();
+        private List<DirectInsertTableInfo> _lastInsertedTables = new();
 
         // ── UI Controls ──
         private Panel _headerPanel = null!;
@@ -50,6 +54,9 @@ namespace SqlTestDataGenerator.UI
         private Button _analyzeBtn = null!;
         private Button _generateBtn = null!;
         private Button _insertDbBtn = null!;
+        private Button _exportCsvBtn = null!;
+        private Button _importCsvBtn = null!;
+        private Button _browseExportFolderBtn = null!;
         private Button _copyBtn = null!;
         private Button _saveBtn = null!;
         private Button _copyCleanupBtn = null!;
@@ -59,6 +66,8 @@ namespace SqlTestDataGenerator.UI
 
         private CheckedListBox _scenarioList = null!;
         private Label _statusLabel = null!;
+        private Label _exportFolderLabel = null!;
+        private TextBox _exportFolderInput = null!;
         private NumericUpDown _startIdInput = null!;
         private NumericUpDown _rowsPerTableInput = null!;
 
@@ -79,6 +88,7 @@ namespace SqlTestDataGenerator.UI
         {
             InitializeComponent();
             ApplyTheme();
+            LogInfo("Application started.");
         }
 
         private void InitializeComponent()
@@ -130,7 +140,7 @@ namespace SqlTestDataGenerator.UI
             _toolbarPanel = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 50,
+                Height = 90,
                 Padding = new Padding(16, 8, 16, 8)
             };
 
@@ -232,7 +242,7 @@ namespace SqlTestDataGenerator.UI
                 Dock = DockStyle.Fill,
                 Multiline = true,
                 ScrollBars = ScrollBars.Both,
-                WordWrap = false,
+                WordWrap = true,
                 Font = new Font("Cascadia Code, Consolas", 10F),
                 AcceptsReturn = true,
                 AcceptsTab = true
@@ -289,7 +299,7 @@ namespace SqlTestDataGenerator.UI
             _topSplitter.Panel1.Controls.Add(sqlPanel);
             _topSplitter.Panel2.Controls.Add(analysisPanel);
 
-            // Bottom: Split into Clean INSERT (left) + Full Log (right)
+            // Bottom: Split into executable SQL script (left) + application log (right)
             _bottomSplitter = new SplitContainer
             {
                 Dock = DockStyle.Fill,
@@ -299,11 +309,11 @@ namespace SqlTestDataGenerator.UI
                 SplitterWidth = 3
             };
 
-            // Left: Clean INSERT only
+            // Left: executable SQL script preview
             var cleanPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(8) };
             var cleanLabel = new Label
             {
-                Text = "📜 INSERT Scripts",
+                Text = "📜 Executable SQL Script",
                 Dock = DockStyle.Top,
                 Height = 30,
                 Font = new Font("Segoe UI Semibold", 11F),
@@ -322,7 +332,7 @@ namespace SqlTestDataGenerator.UI
             cleanPanel.Controls.Add(_scriptCleanOutput);
             cleanPanel.Controls.Add(cleanLabel);
 
-            // Right: Full log (with comments, transactions)
+            // Right: application log
             var logPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(8) };
             var logLabel = new Label
             {
@@ -339,7 +349,7 @@ namespace SqlTestDataGenerator.UI
                 Multiline = true,
                 ScrollBars = ScrollBars.Both,
                 ReadOnly = true,
-                WordWrap = false,
+                WordWrap = true,
                 Font = new Font("Cascadia Code, Consolas", 9.5F),
             };
             logPanel.Controls.Add(_scriptOutput);
@@ -355,21 +365,58 @@ namespace SqlTestDataGenerator.UI
             _bottomToolbar = new Panel
             {
                 Dock = DockStyle.Bottom,
-                Height = 50,
+                Height = 90,
                 Padding = new Padding(16, 8, 16, 8)
             };
 
-            _copyBtn = CreateButton("📋 Copy INSERT", _accentBlue, 120);
+            _copyBtn = CreateButton("📋 Copy SQL", _accentBlue, 120);
             _copyBtn.Location = new Point(16, 8);
             _copyBtn.Click += CopyBtn_Click;
 
             _copyCleanupBtn = CreateButton("🧹 Copy Cleanup", _accentOrange, 130);
             _copyCleanupBtn.Location = new Point(150, 8);
             _copyCleanupBtn.Click += CopyCleanupBtn_Click;
+            _copyCleanupBtn.Visible = false;
 
             _saveBtn = CreateButton("💾 Save .sql", _accentGreen, 110);
-            _saveBtn.Location = new Point(294, 8);
+            _saveBtn.Location = new Point(150, 8);
             _saveBtn.Click += SaveBtn_Click;
+
+            _exportFolderLabel = new Label
+            {
+                Text = "CSV Folder:",
+                AutoSize = true,
+                Location = new Point(16, 52),
+                Font = new Font("Segoe UI", 9F),
+                ForeColor = _textPrimary
+            };
+
+            _exportFolderInput = new TextBox
+            {
+                Location = new Point(90, 48),
+                Width = 620,
+                Font = new Font("Segoe UI", 9F),
+                BorderStyle = BorderStyle.FixedSingle,
+                Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right
+            };
+            _exportFolderInput.TextChanged += ExportFolderInput_TextChanged;
+
+            _browseExportFolderBtn = CreateButton("Browse...", _accentBlue, 80);
+            _browseExportFolderBtn.Location = new Point(720, 44);
+            _browseExportFolderBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            _browseExportFolderBtn.Click += BrowseExportFolderBtn_Click;
+
+            _exportCsvBtn = CreateButton("Export CSV", _accentGreen, 110);
+            _exportCsvBtn.Location = new Point(810, 44);
+            _exportCsvBtn.Enabled = false;
+            _exportCsvBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            _exportCsvBtn.Click += ExportCsvBtn_Click;
+
+            _importCsvBtn = CreateButton("Import CSV", _accentOrange, 110);
+            _importCsvBtn.Location = new Point(930, 44);
+            _importCsvBtn.Enabled = false;
+            _importCsvBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            _importCsvBtn.Click += ImportCsvBtn_Click;
 
             _statusLabel = new Label
             {
@@ -380,7 +427,12 @@ namespace SqlTestDataGenerator.UI
                 ForeColor = _textSecondary
             };
 
-            _bottomToolbar.Controls.AddRange(new Control[] { _copyBtn, _copyCleanupBtn, _saveBtn, _statusLabel });
+            _bottomToolbar.Controls.AddRange(new Control[]
+            {
+                _copyBtn, _saveBtn,
+                _exportFolderLabel, _exportFolderInput, _browseExportFolderBtn, _exportCsvBtn, _importCsvBtn,
+                _statusLabel
+            });
             _bottomToolbar.Resize += BottomToolbar_Resize;
 
             // ═══ Add to form ═══
@@ -418,6 +470,10 @@ namespace SqlTestDataGenerator.UI
             _scriptOutput.ForeColor = SystemColors.WindowText;
             _scriptOutput.BorderStyle = BorderStyle.FixedSingle;
 
+            _exportFolderInput.BackColor = SystemColors.Window;
+            _exportFolderInput.ForeColor = SystemColors.WindowText;
+            _exportFolderInput.BorderStyle = BorderStyle.FixedSingle;
+
             _bottomSplitter.Panel1.BackColor = SystemColors.Control;
             _bottomSplitter.Panel2.BackColor = SystemColors.Control;
 
@@ -452,6 +508,15 @@ namespace SqlTestDataGenerator.UI
         private void BottomToolbar_Resize(object? sender, EventArgs e)
         {
             _statusLabel.Location = new Point(_bottomToolbar.Width - _statusLabel.Width - 20, 15);
+
+            var exportButtonTop = 44;
+            _importCsvBtn.Location = new Point(_bottomToolbar.Width - _importCsvBtn.Width - 20, exportButtonTop);
+            _exportCsvBtn.Location = new Point(_importCsvBtn.Left - _exportCsvBtn.Width - 10, exportButtonTop);
+            _browseExportFolderBtn.Location = new Point(_exportCsvBtn.Left - _browseExportFolderBtn.Width - 10, exportButtonTop);
+
+            var inputLeft = _exportFolderLabel.Left + _exportFolderLabel.Width + 8;
+            _exportFolderInput.Location = new Point(inputLeft, 48);
+            _exportFolderInput.Width = Math.Max(220, _browseExportFolderBtn.Left - inputLeft - 10);
         }
 
         private async void ConnectBtn_Click(object? sender, EventArgs e)
@@ -468,15 +533,18 @@ namespace SqlTestDataGenerator.UI
                 if (success)
                 {
                     _schemaIntrospector = new SchemaIntrospector(() => _connectionManager.CreateNewConnection());
+                    ClearLastInsertedTables();
                     _connectionStatusLabel.Text = $"● Connected: {form.ServerName}/{form.DatabaseName}";
                     _connectionStatusLabel.ForeColor = Color.Green;
                     _connectBtn.Visible = false;
                     _disconnectBtn.Visible = true;
                     SetStatus("Database connected successfully.");
+                    LogInfo($"Connected to database {form.ServerName}/{form.DatabaseName}.");
                     UpdateDbInsertButtonState();
                 }
                 else
                 {
+                    LogError(message);
                     MessageBox.Show(message, "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
             }
@@ -487,11 +555,13 @@ namespace SqlTestDataGenerator.UI
             _connectionManager?.Disconnect();
             _connectionManager = null;
             _schemaIntrospector = null;
+            ClearLastInsertedTables();
             _connectionStatusLabel.Text = "● Not Connected";
             _connectionStatusLabel.ForeColor = _accentRed;
             _connectBtn.Visible = true;
             _disconnectBtn.Visible = false;
             SetStatus("Disconnected.");
+            LogInfo("Disconnected from database.");
             UpdateDbInsertButtonState();
         }
 
@@ -500,13 +570,16 @@ namespace SqlTestDataGenerator.UI
             var sql = _sqlInput.Text.Trim();
             if (string.IsNullOrEmpty(sql))
             {
+                LogWarn("Analyze requested without SQL input.");
                 MessageBox.Show("Please enter a SQL query.", "Input Required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
             try
             {
+                ClearLastInsertedTables();
                 SetStatus("Analyzing SQL...");
+                LogInfo("Starting SQL analysis.");
                 _currentQuery = _parser.Parse(sql);
 
                 if (_currentQuery.Errors.Any())
@@ -518,6 +591,11 @@ namespace SqlTestDataGenerator.UI
                     _currentDataSet = null;
                     UpdateDbInsertButtonState();
                     SetStatus("Parse errors found.");
+                    LogWarn($"SQL analysis found {_currentQuery.Errors.Count} parse error(s).");
+                    foreach (var error in _currentQuery.Errors)
+                    {
+                        LogWarn(error);
+                    }
                     return;
                 }
 
@@ -539,6 +617,8 @@ namespace SqlTestDataGenerator.UI
                 SetStatus($"Analysis complete: {_currentQuery.Tables.Count} tables, " +
                           $"{_currentQuery.WhereConditions.Count} conditions, " +
                           $"{_availableScenarios.Count} scenarios.");
+                LogInfo(
+                    $"Analysis complete: {_currentQuery.Tables.Count} table(s), {_currentQuery.WhereConditions.Count} WHERE condition(s), {_availableScenarios.Count} scenario(s).");
             }
             catch (Exception ex)
             {
@@ -548,18 +628,26 @@ namespace SqlTestDataGenerator.UI
                 _currentDataSet = null;
                 UpdateDbInsertButtonState();
                 SetStatus("Analysis failed.");
+                LogError($"SQL analysis failed: {BuildErrorChain(ex)}");
             }
         }
 
         private void GenerateBtn_Click(object? sender, EventArgs e)
         {
-            if (_currentQuery == null) return;
+            if (_currentQuery == null)
+            {
+                LogWarn("Generate requested without a parsed query.");
+                return;
+            }
 
             try
             {
+                ClearLastInsertedTables();
                 SetStatus("Generating test data...");
                 _dataEngine.StartId = (int)_startIdInput.Value;
                 _dataEngine.RowsPerTable = (int)_rowsPerTableInput.Value;
+                LogInfo(
+                    $"Starting data generation with Start ID {_dataEngine.StartId} and {_dataEngine.RowsPerTable} row(s)/table.");
 
                 // Get schemas from database if connected
                 _schemas = null;
@@ -573,6 +661,7 @@ namespace SqlTestDataGenerator.UI
                     catch (Exception ex)
                     {
                         SetStatus($"Schema introspection warning: {ex.Message}. Using inferred schemas.");
+                        LogWarn($"Schema introspection warning: {BuildErrorChain(ex)}");
                     }
                 }
 
@@ -586,6 +675,7 @@ namespace SqlTestDataGenerator.UI
 
                 if (!selectedScenarios.Any())
                 {
+                    LogWarn("Generate requested without any selected scenario.");
                     MessageBox.Show("Please select at least one scenario.", "No Scenarios", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
@@ -608,30 +698,18 @@ namespace SqlTestDataGenerator.UI
                     _dataNormalizer.Normalize(_currentDataSet, _schemas);
                 }
 
-                // Generate full INSERT scripts (with comments + transactions)
-                _insertGenerator.Schemas = _schemas;
-                _insertGenerator.HandleIdentityInsert = _schemas != null;
-                _insertGenerator.IncludeComments = true;
-                _insertGenerator.WrapInTransaction = true;
-                var fullScript = _insertGenerator.GenerateScript(_currentDataSet);
-
-                // Generate clean INSERT scripts (no comments, no transactions)
-                _insertGenerator.IncludeComments = false;
-                _insertGenerator.WrapInTransaction = false;
-                var cleanScript = _insertGenerator.GenerateScript(_currentDataSet);
-
-                _scriptCleanOutput.Text = cleanScript;
-                _scriptOutput.Text = fullScript;
+                RefreshInsertScriptPreview("generated data");
                 UpdateDbInsertButtonState();
                 SetStatus($"Generated {selectedScenarios.Count} scenario(s), {_rowsPerTableInput.Value} row(s)/table.");
+                LogInfo($"Generated {selectedScenarios.Count} scenario(s) with {_rowsPerTableInput.Value} row(s)/table.");
             }
             catch (Exception ex)
             {
                 _currentDataSet = null;
                 UpdateDbInsertButtonState();
                 _scriptCleanOutput.Text = $"-- Error: {ex.Message}";
-                _scriptOutput.Text = $"-- Error generating data: {ex.Message}\r\n-- {ex.StackTrace}";
                 SetStatus("Generation failed.");
+                LogError($"Data generation failed: {BuildErrorChain(ex)}");
             }
         }
 
@@ -639,18 +717,21 @@ namespace SqlTestDataGenerator.UI
         {
             if (_currentDataSet == null)
             {
+                LogWarn("Direct insert requested without generated data.");
                 MessageBox.Show("Please generate data first.", "No Data", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
             if (_connectionManager == null || !_connectionManager.IsConnected)
             {
+                LogWarn("Direct insert requested while database is not connected.");
                 MessageBox.Show("Please connect to database first.", "Not Connected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
             if (_currentQuery == null)
             {
+                LogWarn("Direct insert requested without an analyzed query.");
                 MessageBox.Show("No analyzed query found.", "Missing Query", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
@@ -665,6 +746,7 @@ namespace SqlTestDataGenerator.UI
             }
             catch (Exception ex)
             {
+                LogError($"Schema load failed before direct insert: {BuildErrorChain(ex)}");
                 MessageBox.Show($"Cannot read schema from database:\r\n{ex.Message}",
                     "Schema Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
@@ -672,6 +754,7 @@ namespace SqlTestDataGenerator.UI
 
             if (_schemas == null || !_schemas.Any())
             {
+                LogWarn("Direct insert blocked because schema metadata is missing.");
                 MessageBox.Show("Schema metadata is missing. Please connect database and generate data again.",
                     "Schema Required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
@@ -684,6 +767,7 @@ namespace SqlTestDataGenerator.UI
 
             if (!generatedTables.Any())
             {
+                LogWarn("Direct insert blocked because no generated table rows were found.");
                 MessageBox.Show("No generated table rows found to insert.",
                     "No Rows", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
@@ -698,15 +782,23 @@ namespace SqlTestDataGenerator.UI
                 MessageBoxIcon.Warning);
 
             if (confirm != DialogResult.Yes)
+            {
+                LogInfo("Direct insert was canceled by the user.");
                 return;
+            }
 
             try
             {
+                ClearLastInsertedTables();
                 _insertDbBtn.Enabled = false;
                 SetStatus("Inserting generated data to database...");
+                LogInfo($"Starting direct insert for {generatedTables.Count} generated table(s).");
 
                 using var conn = _connectionManager.CreateNewConnection();
                 var result = await _dbExecutor.ClearAndInsertAsync(conn, _currentDataSet, _schemas);
+                _lastInsertedTables = result.InsertedTables
+                    .OrderBy(t => t.DisplayName, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
                 bool? hasQueryRows = null;
                 try
                 {
@@ -718,6 +810,8 @@ namespace SqlTestDataGenerator.UI
                 }
 
                 SetStatus($"Inserted {result.RowsInserted} row(s) into {result.TablesInserted} table(s).");
+                LogInfo(
+                    $"Direct insert completed: {result.RowsInserted} row(s) into {result.TablesInserted} table(s), {result.RowsDeleted} row(s) deleted, query returns rows = {FormatQueryRowsResult(hasQueryRows)}.");
                 MessageBox.Show(
                     $"Direct insert completed.\r\n\r\n" +
                     $"- Generated tables: {result.GeneratedTables}\r\n" +
@@ -738,6 +832,7 @@ namespace SqlTestDataGenerator.UI
             catch (Exception ex)
             {
                 SetStatus("Direct insert failed.");
+                LogError($"Direct insert failed: {BuildErrorChain(ex)}");
                 MessageBox.Show(
                     $"Direct insert failed:\r\n{BuildErrorChain(ex)}",
                     "Insert Error",
@@ -750,13 +845,184 @@ namespace SqlTestDataGenerator.UI
             }
         }
 
+        private void ExportFolderInput_TextChanged(object? sender, EventArgs e)
+        {
+            UpdateDbInsertButtonState();
+        }
+
+        private void BrowseExportFolderBtn_Click(object? sender, EventArgs e)
+        {
+            using var dialog = new FolderBrowserDialog
+            {
+                Description = "Select folder to save exported CSV files",
+                ShowNewFolderButton = true
+            };
+
+            if (!string.IsNullOrWhiteSpace(_exportFolderInput.Text) && Directory.Exists(_exportFolderInput.Text))
+            {
+                dialog.SelectedPath = _exportFolderInput.Text;
+            }
+
+            if (dialog.ShowDialog(this) == DialogResult.OK)
+            {
+                _exportFolderInput.Text = dialog.SelectedPath;
+            }
+        }
+
+        private async void ExportCsvBtn_Click(object? sender, EventArgs e)
+        {
+            if (_connectionManager == null || !_connectionManager.IsConnected)
+            {
+                LogWarn("CSV export requested while database is not connected.");
+                MessageBox.Show("Please connect to database first.", "Not Connected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (!_lastInsertedTables.Any())
+            {
+                LogWarn("CSV export requested before any successful direct insert.");
+                MessageBox.Show("No successful direct insert found to export yet.", "Nothing To Export", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(_exportFolderInput.Text))
+            {
+                LogWarn("CSV export requested without a target folder.");
+                MessageBox.Show("Please enter a folder path to save CSV files.", "Folder Required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                _exportCsvBtn.Enabled = false;
+                SetStatus("Exporting inserted tables to CSV...");
+
+                var folderPath = Path.GetFullPath(_exportFolderInput.Text.Trim());
+                LogInfo($"Starting CSV export to folder {folderPath}.");
+                using var conn = _connectionManager.CreateNewConnection();
+                var result = await _csvExporter.ExportAsync(conn, _lastInsertedTables, folderPath, _schemas);
+
+                SetStatus($"Exported {result.ExportedTables} CSV file(s).");
+                LogInfo($"CSV export completed: {result.ExportedTables} file(s), {result.ExportedRows} row(s), folder {folderPath}.");
+                MessageBox.Show(
+                    $"CSV export completed.\r\n\r\n" +
+                    $"- Tables exported: {result.ExportedTables}\r\n" +
+                    $"- Rows exported: {result.ExportedRows}\r\n" +
+                    $"- Folder: {folderPath}",
+                    "Export Completed",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                SetStatus("CSV export failed.");
+                LogError($"CSV export failed: {BuildErrorChain(ex)}");
+                MessageBox.Show(
+                    $"CSV export failed:\r\n{BuildErrorChain(ex)}",
+                    "Export Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+            finally
+            {
+                UpdateDbInsertButtonState();
+            }
+        }
+
+        private async void ImportCsvBtn_Click(object? sender, EventArgs e)
+        {
+            if (_connectionManager == null || !_connectionManager.IsConnected)
+            {
+                LogWarn("CSV import requested while database is not connected.");
+                MessageBox.Show("Please connect to database first.", "Not Connected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (_schemaIntrospector == null)
+            {
+                LogWarn("CSV import requested without schema introspector.");
+                MessageBox.Show("Schema introspector is not available. Please reconnect to the database.", "Schema Required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(_exportFolderInput.Text))
+            {
+                LogWarn("CSV import requested without a source folder.");
+                MessageBox.Show("Please enter a folder path that contains CSV files.", "Folder Required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                ClearLastInsertedTables();
+                _importCsvBtn.Enabled = false;
+                SetStatus("Reading CSV files...");
+
+                var folderPath = Path.GetFullPath(_exportFolderInput.Text.Trim());
+                LogInfo($"Starting CSV import from folder {folderPath}.");
+                var csvFiles = _csvImporter.DiscoverTableFiles(folderPath);
+                LogInfo($"Discovered {csvFiles.Count} CSV file(s) for import.");
+                _schemas = LoadSchemaClosure(csvFiles.Select(f => f.TableName));
+
+                var importData = await _csvImporter.LoadFolderAsync(folderPath, _schemas);
+                _currentDataSet = importData.DataSet;
+                _dataNormalizer.Normalize(_currentDataSet, _schemas);
+                RefreshInsertScriptPreview("imported CSV data");
+                LogInfo($"Loaded {importData.CsvFilesRead} CSV file(s) and parsed {importData.ParsedRows} row(s).");
+
+                SetStatus("Importing CSV data to database...");
+                using var conn = _connectionManager.CreateNewConnection();
+                var result = await _dbExecutor.ClearAndInsertAsync(conn, _currentDataSet, _schemas);
+                _lastInsertedTables = result.InsertedTables
+                    .OrderBy(t => t.DisplayName, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                SetStatus($"Imported {importData.ParsedRows} CSV row(s) into {result.TablesInserted} table(s).");
+                LogInfo(
+                    $"CSV import completed: {importData.ParsedRows} parsed row(s), {result.TablesInserted} table(s) inserted, {result.RowsDeleted} row(s) deleted.");
+                MessageBox.Show(
+                    $"CSV import completed.\r\n\r\n" +
+                    $"- CSV files read: {importData.CsvFilesRead}\r\n" +
+                    $"- CSV rows parsed: {importData.ParsedRows}\r\n" +
+                    $"- Planned tables: {result.PlannedTables}\r\n" +
+                    $"- Tables cleared: {result.TablesCleared}\r\n" +
+                    $"- Rows deleted: {result.RowsDeleted}\r\n" +
+                    $"- Tables inserted: {result.TablesInserted}\r\n" +
+                    $"- Rows inserted: {result.RowsInserted}\r\n" +
+                    $"- FK clear fallback used: {(result.UsedConstraintDisableFallback ? "YES" : "NO")}\r\n" +
+                    $"- FK insert bypass used: {(result.UsedInsertConstraintBypass ? "YES" : "NO")}\r\n" +
+                    $"- Folder: {folderPath}",
+                    "Import Completed",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                SetStatus("CSV import failed.");
+                LogError($"CSV import failed: {BuildErrorChain(ex)}");
+                MessageBox.Show(
+                    $"CSV import failed:\r\n{BuildErrorChain(ex)}",
+                    "Import Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+            finally
+            {
+                UpdateDbInsertButtonState();
+            }
+        }
+
         private void CopyBtn_Click(object? sender, EventArgs e)
         {
-            if (!string.IsNullOrEmpty(_scriptCleanOutput.Text))
+            if (string.IsNullOrEmpty(_scriptCleanOutput.Text))
             {
-                Clipboard.SetText(_scriptCleanOutput.Text);
-                SetStatus("Clean INSERT script copied to clipboard!");
+                LogWarn("Copy SQL requested with no script preview available.");
+                return;
             }
+
+            Clipboard.SetText(_scriptCleanOutput.Text);
+            SetStatus("Executable SQL script copied to clipboard.");
+            LogInfo("Copied executable SQL script to clipboard.");
         }
 
         private void CopyCleanupBtn_Click(object? sender, EventArgs e)
@@ -770,7 +1036,11 @@ namespace SqlTestDataGenerator.UI
 
         private void SaveBtn_Click(object? sender, EventArgs e)
         {
-            if (string.IsNullOrEmpty(_scriptOutput.Text)) return;
+            if (string.IsNullOrEmpty(_scriptCleanOutput.Text))
+            {
+                LogWarn("Save SQL requested with no script preview available.");
+                return;
+            }
 
             using var dialog = new SaveFileDialog
             {
@@ -781,16 +1051,22 @@ namespace SqlTestDataGenerator.UI
 
             if (dialog.ShowDialog() == DialogResult.OK)
             {
-                File.WriteAllText(dialog.FileName, _scriptOutput.Text);
-
-                // Also save cleanup script
-                if (_currentDataSet != null)
+                try
                 {
-                    var cleanupPath = Path.ChangeExtension(dialog.FileName, ".cleanup.sql");
-                    File.WriteAllText(cleanupPath, _cleanupGenerator.GenerateCleanupScript(_currentDataSet));
+                    File.WriteAllText(dialog.FileName, _scriptCleanOutput.Text);
+                    SetStatus($"Saved to {dialog.FileName}");
+                    LogInfo($"Saved executable SQL script to {dialog.FileName}.");
                 }
-
-                SetStatus($"Saved to {dialog.FileName}");
+                catch (Exception ex)
+                {
+                    SetStatus("Save failed.");
+                    LogError($"Saving executable SQL script failed: {BuildErrorChain(ex)}");
+                    MessageBox.Show(
+                        $"Saving SQL script failed:\r\n{BuildErrorChain(ex)}",
+                        "Save Error",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
             }
         }
 
@@ -800,10 +1076,94 @@ namespace SqlTestDataGenerator.UI
             _statusLabel.Location = new Point(_bottomToolbar.Width - _statusLabel.Width - 20, 15);
         }
 
+        private void RefreshInsertScriptPreview(string sourceLabel)
+        {
+            if (_currentDataSet == null)
+            {
+                _scriptCleanOutput.Clear();
+                return;
+            }
+
+            _insertGenerator.Schemas = _schemas;
+            _insertGenerator.HandleIdentityInsert = _schemas != null;
+            _insertGenerator.IncludeComments = true;
+            _insertGenerator.WrapInTransaction = false;
+
+            _cleanupGenerator.SchemaName = _insertGenerator.SchemaName;
+
+            var resetScript = _cleanupGenerator.GenerateResetScript(_currentDataSet, includeComments: true).Trim();
+            var insertScript = _insertGenerator.GenerateScript(_currentDataSet).Trim();
+            _scriptCleanOutput.Text = BuildExecutableInsertScript(resetScript, insertScript);
+
+            LogInfo($"Prepared executable reset+insert script from {sourceLabel}.");
+        }
+
+        private static string BuildExecutableInsertScript(string resetScript, string insertScript)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("-- Executable reset + insert script");
+            sb.AppendLine("SET NOCOUNT ON;");
+            sb.AppendLine("BEGIN TRY");
+            sb.AppendLine("BEGIN TRANSACTION;");
+            sb.AppendLine();
+
+            if (!string.IsNullOrWhiteSpace(resetScript))
+            {
+                sb.AppendLine(resetScript);
+                sb.AppendLine();
+            }
+
+            if (!string.IsNullOrWhiteSpace(insertScript))
+            {
+                sb.AppendLine(insertScript);
+                sb.AppendLine();
+            }
+
+            sb.AppendLine("COMMIT TRANSACTION;");
+            sb.AppendLine("END TRY");
+            sb.AppendLine("BEGIN CATCH");
+            sb.AppendLine("    IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;");
+            sb.AppendLine("    THROW;");
+            sb.AppendLine("END CATCH;");
+            return sb.ToString();
+        }
+
+        private void LogInfo(string message) => AppendLog("INFO", message);
+
+        private void LogWarn(string message) => AppendLog("WARN", message);
+
+        private void LogError(string message) => AppendLog("ERROR", message);
+
+        private void AppendLog(string level, string message)
+        {
+            var normalized = message.Replace("\r\n", "\n").Replace('\r', '\n');
+            var lines = normalized.Split('\n');
+
+            foreach (var rawLine in lines)
+            {
+                var line = rawLine.TrimEnd();
+                if (line.Length == 0)
+                    continue;
+
+                _scriptOutput.AppendText($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {level,-5} {line}{Environment.NewLine}");
+            }
+        }
+
+        private void ClearLastInsertedTables()
+        {
+            _lastInsertedTables.Clear();
+            UpdateDbInsertButtonState();
+        }
+
         private void UpdateDbInsertButtonState()
         {
             _insertDbBtn.Enabled = _currentDataSet != null &&
                                    _connectionManager?.IsConnected == true;
+            _importCsvBtn.Enabled = _connectionManager?.IsConnected == true &&
+                                    !string.IsNullOrWhiteSpace(_exportFolderInput.Text);
+            _exportCsvBtn.Enabled = _connectionManager?.IsConnected == true &&
+                                    _lastInsertedTables.Any() &&
+                                    !string.IsNullOrWhiteSpace(_exportFolderInput.Text);
         }
 
         private static HashSet<string> GetAllReferencedTableNames(ParsedQuery query)

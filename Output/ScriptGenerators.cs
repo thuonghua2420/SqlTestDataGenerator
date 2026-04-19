@@ -280,6 +280,27 @@ namespace SqlTestDataGenerator.Output
     {
         public string SchemaName { get; set; } = "dbo";
 
+        public string GenerateResetScript(
+            GeneratedDataSet dataSet,
+            bool includeComments = true)
+        {
+            var sb = new StringBuilder();
+
+            if (includeComments)
+            {
+                sb.AppendLine("-- Reset existing rows from generated tables before re-insert");
+                sb.AppendLine($"-- Generated: {dataSet.GeneratedAt:yyyy-MM-dd HH:mm:ss}");
+                sb.AppendLine();
+            }
+
+            foreach (var tableName in CollectDeleteOrder(dataSet))
+            {
+                sb.AppendLine($"DELETE FROM [{SchemaName}].[{tableName}];");
+            }
+
+            return sb.ToString();
+        }
+
         /// <summary>
         /// Generate DELETE script for all scenarios (reverse dependency order).
         /// </summary>
@@ -366,6 +387,29 @@ namespace SqlTestDataGenerator.Output
                 DateTime dt => $"'{dt:yyyy-MM-dd HH:mm:ss}'",
                 _ => value.ToString() ?? "NULL"
             };
+        }
+
+        private static List<string> CollectDeleteOrder(GeneratedDataSet dataSet)
+        {
+            var insertionOrder = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var scenario in dataSet.Scenarios)
+            {
+                var orderedTables = scenario.InsertOrder
+                    .Concat(scenario.TableRows.Keys.Where(t => !scenario.InsertOrder.Contains(t, StringComparer.OrdinalIgnoreCase)));
+
+                foreach (var tableName in orderedTables)
+                {
+                    if (seen.Add(tableName))
+                    {
+                        insertionOrder.Add(tableName);
+                    }
+                }
+            }
+
+            insertionOrder.Reverse();
+            return insertionOrder;
         }
     }
 }

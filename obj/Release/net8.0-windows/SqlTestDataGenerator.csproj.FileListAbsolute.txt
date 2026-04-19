@@ -104,3 +104,8 @@ D:\project\create-data\artifacts\notexists-scope-fix-app\SqlTestDataGenerator.de
 D:\project\create-data\artifacts\notexists-scope-fix-app\SqlTestDataGenerator.runtimeconfig.json
 D:\project\create-data\artifacts\notexists-scope-fix-app\SqlTestDataGenerator.dll
 D:\project\create-data\artifacts\notexists-scope-fix-app\SqlTestDataGenerator.pdb
+D:\project\create-data\artifacts\ui-log-script-fix\SqlTestDataGenerator.exe
+D:\project\create-data\artifacts\ui-log-script-fix\SqlTestDataGenerator.deps.json
+D:\project\create-data\artifacts\ui-log-script-fix\SqlTestDataGenerator.runtimeconfig.json
+D:\project\create-data\artifacts\ui-log-script-fix\SqlTestDataGenerator.dll
+D:\project\create-data\artifacts\ui-log-script-fix\SqlTestDataGenerator.pdb
