@@ -47,7 +47,6 @@ namespace SqlTestDataGenerator.UI
             this.Font = new Font("Segoe UI", 10F);
 
             int y = 20;
-            int labelWidth = 120;
             int inputX = 140;
             int inputWidth = 270;
 

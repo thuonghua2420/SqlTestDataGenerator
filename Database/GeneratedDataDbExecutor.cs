@@ -178,10 +178,17 @@ namespace SqlTestDataGenerator.Database
                             tx,
                             plannedTables.AsEnumerable().Reverse(),
                             enable: true,
-                            validateExistingRows: false,
+                            validateExistingRows: true,
                             cancellationToken);
                     }
                 }
+
+                await ValidateForeignKeysInDatabaseAsync(
+                    connection,
+                    tx,
+                    plannedRows,
+                    schemas,
+                    cancellationToken);
 
                 await tx.CommitAsync(cancellationToken);
                 return result;
@@ -726,6 +733,51 @@ namespace SqlTestDataGenerator.Database
                     }
 
                     break;
+                }
+            }
+        }
+
+        private async Task ValidateForeignKeysInDatabaseAsync(
+            SqlConnection connection,
+            SqlTransaction transaction,
+            Dictionary<string, List<GeneratedRow>> plannedRows,
+            Dictionary<string, TableSchema> schemas,
+            CancellationToken cancellationToken)
+        {
+            var existsCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var (tableName, rows) in plannedRows)
+            {
+                if (!schemas.TryGetValue(tableName, out var schema))
+                    continue;
+
+                foreach (var row in rows)
+                {
+                    foreach (var fk in schema.ForeignKeys)
+                    {
+                        var value = row.GetValue(fk.ColumnName);
+                        if (IsNullValue(value))
+                            continue;
+
+                        var exists = await ReferencedValueExistsAsync(
+                            connection,
+                            transaction,
+                            NormalizeSchema(fk.ReferencedSchema),
+                            fk.ReferencedTable,
+                            fk.ReferencedColumn,
+                            value!,
+                            existsCache,
+                            cancellationToken);
+
+                        if (!exists)
+                        {
+                            throw new InvalidOperationException(
+                                $"Post-insert FK validation failed for " +
+                                $"[{schema.SchemaName}.{schema.TableName}.{fk.ColumnName}] -> " +
+                                $"[{NormalizeSchema(fk.ReferencedSchema)}.{fk.ReferencedTable}.{fk.ReferencedColumn}] " +
+                                $"with value [{value}].");
+                        }
+                    }
                 }
             }
         }
