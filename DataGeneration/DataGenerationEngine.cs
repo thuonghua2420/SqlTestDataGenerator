@@ -96,6 +96,8 @@ namespace SqlTestDataGenerator.DataGeneration
             Dictionary<string, TableSchema> schemas,
             List<string> insertOrder)
         {
+            var selfReferencePlans = BuildSelfReferencePlans(query, schemas);
+
             // Generate a unique ID set for this scenario
             var scenarioBaseId = _idCounter;
             _idCounter += GetScenarioIdStride();
@@ -103,27 +105,27 @@ namespace SqlTestDataGenerator.DataGeneration
             switch (scenario.Type)
             {
                 case ScenarioType.Positive:
-                    GeneratePositiveData(scenario, query, schemas, insertOrder, scenarioBaseId);
+                    GeneratePositiveData(scenario, query, schemas, insertOrder, scenarioBaseId, selfReferencePlans);
                     break;
 
                 case ScenarioType.WhereNegative:
-                    GenerateWhereNegativeData(scenario, query, schemas, insertOrder, scenarioBaseId);
+                    GenerateWhereNegativeData(scenario, query, schemas, insertOrder, scenarioBaseId, selfReferencePlans);
                     break;
 
                 case ScenarioType.HavingNegative:
-                    GenerateHavingNegativeData(scenario, query, schemas, insertOrder, scenarioBaseId);
+                    GenerateHavingNegativeData(scenario, query, schemas, insertOrder, scenarioBaseId, selfReferencePlans);
                     break;
 
                 case ScenarioType.JoinMiss:
-                    GenerateJoinMissData(scenario, query, schemas, insertOrder, scenarioBaseId);
+                    GenerateJoinMissData(scenario, query, schemas, insertOrder, scenarioBaseId, selfReferencePlans);
                     break;
 
                 case ScenarioType.SubqueryMiss:
-                    GenerateSubqueryMissData(scenario, query, schemas, insertOrder, scenarioBaseId);
+                    GenerateSubqueryMissData(scenario, query, schemas, insertOrder, scenarioBaseId, selfReferencePlans);
                     break;
 
                 case ScenarioType.Boundary:
-                    GenerateBoundaryData(scenario, query, schemas, insertOrder, scenarioBaseId);
+                    GenerateBoundaryData(scenario, query, schemas, insertOrder, scenarioBaseId, selfReferencePlans);
                     break;
             }
         }
@@ -135,9 +137,11 @@ namespace SqlTestDataGenerator.DataGeneration
         // ─── Positive scenario: all conditions satisfied ────────────────
         private void GeneratePositiveData(
             BranchScenario scenario, ParsedQuery query,
-            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId)
+            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId,
+            Dictionary<string, SelfReferencePlan> selfReferencePlans)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+            var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
@@ -159,6 +163,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 int rowCount = isAggregateSource
                     ? Math.Max(rowMultiplier, GetRequestedRowCount())
                     : GetRequestedRowCount();
+                rowCount = ApplySelfReferenceMinimumRowCount(tableName, rowCount, selfReferencePlans);
 
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
@@ -170,7 +175,8 @@ namespace SqlTestDataGenerator.DataGeneration
                         if (col.IsComputed) continue;
 
                         var value = GenerateColumnValue(scenario, col, alias, query, schemas,
-                            tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx, includeSubqueryConditions: true);
+                            tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
+                            rowId, satisfy: true, rowIdx, includeSubqueryConditions: true);
                         row.SetValue(col.ColumnName, value);
                     }
 
@@ -178,6 +184,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 }
 
                 RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
+                RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
                 currentId += rowCount + 1;
             }
 
@@ -188,9 +195,11 @@ namespace SqlTestDataGenerator.DataGeneration
         // ─── WHERE negative: one condition violated ─────────────────────
         private void GenerateWhereNegativeData(
             BranchScenario scenario, ParsedQuery query,
-            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId)
+            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId,
+            Dictionary<string, SelfReferencePlan> selfReferencePlans)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+            var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
@@ -207,7 +216,10 @@ namespace SqlTestDataGenerator.DataGeneration
                     .FirstOrDefault(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase))
                     ?.Alias ?? tableName;
 
-                int rowCount = GetRequestedRowCount();
+                int rowCount = ApplySelfReferenceMinimumRowCount(
+                    tableName,
+                    GetRequestedRowCount(),
+                    selfReferencePlans);
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
                     var row = new GeneratedRow { TableName = tableName };
@@ -224,7 +236,8 @@ namespace SqlTestDataGenerator.DataGeneration
                              alias.Equals(testedCondition.TableAlias, StringComparison.OrdinalIgnoreCase));
 
                         var value = GenerateColumnValue(scenario, col, alias, query, schemas,
-                            tableRowIds, referencedTableIdPools, rowId, satisfy: !isTestedColumn, rowIdx, includeSubqueryConditions: true);
+                            tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
+                            rowId, satisfy: !isTestedColumn, rowIdx, includeSubqueryConditions: true);
                         row.SetValue(col.ColumnName, value);
                     }
 
@@ -232,6 +245,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 }
 
                 RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
+                RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
                 currentId += rowCount + 1;
             }
         }
@@ -239,9 +253,11 @@ namespace SqlTestDataGenerator.DataGeneration
         // ─── HAVING negative: aggregate condition fails ─────────────────
         private void GenerateHavingNegativeData(
             BranchScenario scenario, ParsedQuery query,
-            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId)
+            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId,
+            Dictionary<string, SelfReferencePlan> selfReferencePlans)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+            var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
@@ -263,6 +279,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 // For COUNT fail: create only 1 row (instead of the required minimum)
                 // For SUM fail: create rows with very small values
                 int rowCount = isAggregateSource ? 1 : GetRequestedRowCount();
+                rowCount = ApplySelfReferenceMinimumRowCount(tableName, rowCount, selfReferencePlans);
 
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
@@ -286,7 +303,8 @@ namespace SqlTestDataGenerator.DataGeneration
                         else
                         {
                             value = GenerateColumnValue(scenario, col, alias, query, schemas,
-                                tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx, includeSubqueryConditions: true);
+                                tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
+                                rowId, satisfy: true, rowIdx, includeSubqueryConditions: true);
                         }
 
                         row.SetValue(col.ColumnName, value);
@@ -296,6 +314,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 }
 
                 RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
+                RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
                 currentId += rowCount + 1;
             }
         }
@@ -303,9 +322,11 @@ namespace SqlTestDataGenerator.DataGeneration
         // ─── JOIN miss: LEFT/RIGHT join with no match ───────────────────
         private void GenerateJoinMissData(
             BranchScenario scenario, ParsedQuery query,
-            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId)
+            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId,
+            Dictionary<string, SelfReferencePlan> selfReferencePlans)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+            var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
@@ -329,7 +350,10 @@ namespace SqlTestDataGenerator.DataGeneration
                     .FirstOrDefault(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase))
                     ?.Alias ?? tableName;
 
-                int rowCount = GetRequestedRowCount();
+                int rowCount = ApplySelfReferenceMinimumRowCount(
+                    tableName,
+                    GetRequestedRowCount(),
+                    selfReferencePlans);
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
                     var row = new GeneratedRow { TableName = tableName };
@@ -352,7 +376,8 @@ namespace SqlTestDataGenerator.DataGeneration
                         else
                         {
                             value = GenerateColumnValue(scenario, col, alias, query, schemas,
-                                tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx, includeSubqueryConditions: true);
+                                tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
+                                rowId, satisfy: true, rowIdx, includeSubqueryConditions: true);
                         }
 
                         row.SetValue(col.ColumnName, value);
@@ -362,6 +387,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 }
 
                 RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
+                RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
                 currentId += rowCount + 1;
             }
         }
@@ -369,11 +395,13 @@ namespace SqlTestDataGenerator.DataGeneration
         // ─── Subquery miss: value not in subquery result ────────────────
         private void GenerateSubqueryMissData(
             BranchScenario scenario, ParsedQuery query,
-            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId)
+            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId,
+            Dictionary<string, SelfReferencePlan> selfReferencePlans)
         {
             // Similar to positive but the subquery-referenced column has a value
             // that does NOT appear in the subquery result
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+            var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
@@ -386,7 +414,10 @@ namespace SqlTestDataGenerator.DataGeneration
                     .FirstOrDefault(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase))
                     ?.Alias ?? tableName;
 
-                int rowCount = GetRequestedRowCount();
+                int rowCount = ApplySelfReferenceMinimumRowCount(
+                    tableName,
+                    GetRequestedRowCount(),
+                    selfReferencePlans);
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
                     var row = new GeneratedRow { TableName = tableName };
@@ -397,7 +428,8 @@ namespace SqlTestDataGenerator.DataGeneration
                         if (col.IsComputed) continue;
 
                         var value = GenerateColumnValue(scenario, col, alias, query, schemas,
-                            tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx, includeSubqueryConditions: false);
+                            tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
+                            rowId, satisfy: true, rowIdx, includeSubqueryConditions: false);
                         row.SetValue(col.ColumnName, value);
                     }
 
@@ -405,6 +437,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 }
 
                 RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
+                RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
                 currentId += rowCount + 1;
             }
 
@@ -414,10 +447,12 @@ namespace SqlTestDataGenerator.DataGeneration
         // ─── Boundary: values at exact boundary ────────────────────────
         private void GenerateBoundaryData(
             BranchScenario scenario, ParsedQuery query,
-            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId)
+            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId,
+            Dictionary<string, SelfReferencePlan> selfReferencePlans)
         {
             // Similar to positive, but range conditions use exact boundary values
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+            var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
@@ -439,6 +474,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 int rowCount = isAggSource
                     ? Math.Max(rowMultiplier, GetRequestedRowCount())
                     : GetRequestedRowCount();
+                rowCount = ApplySelfReferenceMinimumRowCount(tableName, rowCount, selfReferencePlans);
 
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
@@ -462,7 +498,8 @@ namespace SqlTestDataGenerator.DataGeneration
                         else
                         {
                             value = GenerateColumnValue(scenario, col, alias, query, schemas,
-                                tableRowIds, referencedTableIdPools, rowId, satisfy: true, rowIdx, includeSubqueryConditions: true);
+                                tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
+                                rowId, satisfy: true, rowIdx, includeSubqueryConditions: true);
                         }
 
                         row.SetValue(col.ColumnName, value);
@@ -472,6 +509,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 }
 
                 RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
+                RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
                 currentId += rowCount + 1;
             }
 
@@ -487,7 +525,9 @@ namespace SqlTestDataGenerator.DataGeneration
             ColumnSchema col, string tableAlias, ParsedQuery query,
             Dictionary<string, TableSchema> schemas,
             Dictionary<string, List<int>> tableRowIds,
+            Dictionary<string, List<int>> referenceableTableIds,
             Dictionary<string, List<int>> referencedTableIdPools,
+            Dictionary<string, SelfReferencePlan> selfReferencePlans,
             int rowId,
             bool satisfy, int rowIndex,
             bool includeSubqueryConditions)
@@ -518,7 +558,19 @@ namespace SqlTestDataGenerator.DataGeneration
                 var fk = currentTableSchema.ForeignKeys
                     .FirstOrDefault(f => f.ColumnName.Equals(col.ColumnName, StringComparison.OrdinalIgnoreCase));
 
-                if (fk != null && TryResolveRelatedRowId(tableRowIds, fk.ReferencedTable, rowIndex, out var fkId))
+                if (fk != null &&
+                    fk.ReferencedTable.Equals(currentTableSchema.TableName, StringComparison.OrdinalIgnoreCase) &&
+                    TryGenerateSelfReferenceValue(currentTableSchema, col, rowId, rowIndex, selfReferencePlans, out var selfReferenceValue))
+                {
+                    return selfReferenceValue;
+                }
+
+                if (fk != null && TryResolveRelatedRowId(referenceableTableIds, fk.ReferencedTable, rowIndex, out var fkId))
+                {
+                    return fkId;
+                }
+
+                if (fk != null && TryResolveRelatedRowId(tableRowIds, fk.ReferencedTable, rowIndex, out fkId))
                 {
                     return fkId;
                 }
@@ -630,7 +682,8 @@ namespace SqlTestDataGenerator.DataGeneration
                     : joinCondition.LeftTableAlias;
 
                 var otherTable = query.ResolveAlias(otherAlias);
-                if (TryResolveRelatedRowId(tableRowIds, otherTable, rowIndex, out var joinId))
+                if (TryResolveRelatedRowId(referenceableTableIds, otherTable, rowIndex, out var joinId) ||
+                    TryResolveRelatedRowId(tableRowIds, otherTable, rowIndex, out joinId))
                 {
                     return joinId;
                 }
@@ -802,6 +855,18 @@ namespace SqlTestDataGenerator.DataGeneration
 
             public ConditionInfo Condition { get; }
             public bool ShouldSatisfy { get; }
+        }
+
+        private sealed class SelfReferencePlan
+        {
+            public SelfReferencePlan(int chainLength, int referenceDepth)
+            {
+                ChainLength = Math.Max(1, chainLength);
+                ReferenceDepth = Math.Max(0, Math.Min(referenceDepth, ChainLength - 1));
+            }
+
+            public int ChainLength { get; }
+            public int ReferenceDepth { get; }
         }
 
         private object? GenerateBoundaryValue(ColumnSchema col, ConditionInfo condition)
@@ -1250,22 +1315,190 @@ namespace SqlTestDataGenerator.DataGeneration
 
             foreach (var having in query.HavingConditions)
             {
-                if (having.AggregateFunc == AggregateFunction.Count)
+                if (having.AggregateFunc == AggregateFunction.Count &&
+                    TryDetermineRequiredCountRows(having, out var requiredRows))
                 {
                     // COUNT(x) >= N → need N rows
-                    if (int.TryParse(having.Value, out var n))
-                    {
-                        multiplier = Math.Max(multiplier, n);
-                    }
-                }
-                else if (having.AggregateFunc is AggregateFunction.Sum or AggregateFunction.Avg)
-                {
-                    // For SUM > N, we need multiple rows
-                    multiplier = Math.Max(multiplier, 3);
+                    multiplier = Math.Max(multiplier, requiredRows);
                 }
             }
 
             return multiplier;
+        }
+
+        private static bool TryDetermineRequiredCountRows(ConditionInfo condition, out int requiredRows)
+        {
+            requiredRows = 1;
+
+            if (condition.Operator == ComparisonOp.Between)
+            {
+                if (int.TryParse(condition.Value, out var lowerBound))
+                {
+                    requiredRows = Math.Max(1, lowerBound);
+                    return true;
+                }
+
+                return false;
+            }
+
+            if (!int.TryParse(condition.Value, out var n))
+                return false;
+
+            requiredRows = condition.Operator switch
+            {
+                ComparisonOp.GreaterThan => Math.Max(1, n + 1),
+                ComparisonOp.GreaterThanOrEqual => Math.Max(1, n),
+                ComparisonOp.Equal => Math.Max(1, n),
+                ComparisonOp.NotEqual => n == 1 ? 2 : 1,
+                ComparisonOp.LessThan => 1,
+                ComparisonOp.LessThanOrEqual => 1,
+                _ => Math.Max(1, n)
+            };
+
+            return true;
+        }
+
+        private static int ApplySelfReferenceMinimumRowCount(
+            string tableName,
+            int rowCount,
+            Dictionary<string, SelfReferencePlan> selfReferencePlans)
+        {
+            return selfReferencePlans.TryGetValue(tableName, out var plan)
+                ? Math.Max(rowCount, plan.ChainLength)
+                : rowCount;
+        }
+
+        private static Dictionary<string, SelfReferencePlan> BuildSelfReferencePlans(
+            ParsedQuery query,
+            Dictionary<string, TableSchema> schemas)
+        {
+            var plans = new Dictionary<string, SelfReferencePlan>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var schema in schemas.Values)
+            {
+                var selfReferenceColumns = schema.ForeignKeys
+                    .Where(fk => fk.ReferencedTable.Equals(schema.TableName, StringComparison.OrdinalIgnoreCase))
+                    .Select(fk => fk.ColumnName)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                if (selfReferenceColumns.Count == 0)
+                    continue;
+
+                var aliases = query.Tables
+                    .Where(t => t.TableName.Equals(schema.TableName, StringComparison.OrdinalIgnoreCase))
+                    .Select(GetEffectiveTableAlias)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                if (aliases.Count <= 1)
+                    continue;
+
+                var pkColumns = (schema.PrimaryKey?.Columns ?? new List<string>())
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                var childToParent = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var join in query.Joins)
+                {
+                    var leftTable = query.ResolveAlias(join.LeftTableAlias);
+                    var rightTable = query.ResolveAlias(join.RightTableAlias);
+
+                    if (!leftTable.Equals(schema.TableName, StringComparison.OrdinalIgnoreCase) ||
+                        !rightTable.Equals(schema.TableName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (pkColumns.Contains(join.LeftColumn) &&
+                        selfReferenceColumns.Contains(join.RightColumn))
+                    {
+                        childToParent[NormalizeAlias(join.RightTableAlias, schema.TableName)] =
+                            NormalizeAlias(join.LeftTableAlias, schema.TableName);
+                    }
+                    else if (pkColumns.Contains(join.RightColumn) &&
+                             selfReferenceColumns.Contains(join.LeftColumn))
+                    {
+                        childToParent[NormalizeAlias(join.LeftTableAlias, schema.TableName)] =
+                            NormalizeAlias(join.RightTableAlias, schema.TableName);
+                    }
+                }
+
+                int maxDepth = 0;
+                foreach (var alias in aliases)
+                {
+                    maxDepth = Math.Max(
+                        maxDepth,
+                        ComputeSelfReferenceDepth(alias, childToParent, new HashSet<string>(StringComparer.OrdinalIgnoreCase)));
+                }
+
+                var chainLength = Math.Max(maxDepth + 1, aliases.Count);
+                var referenceDepth = maxDepth > 0 ? maxDepth : chainLength - 1;
+                if (chainLength > 1)
+                {
+                    plans[schema.TableName] = new SelfReferencePlan(chainLength, referenceDepth);
+                }
+            }
+
+            return plans;
+        }
+
+        private static int ComputeSelfReferenceDepth(
+            string alias,
+            Dictionary<string, string> childToParent,
+            HashSet<string> visiting)
+        {
+            if (!childToParent.TryGetValue(alias, out var parentAlias))
+                return 0;
+
+            if (!visiting.Add(alias))
+                return 0;
+
+            var depth = 1 + ComputeSelfReferenceDepth(parentAlias, childToParent, visiting);
+            visiting.Remove(alias);
+            return depth;
+        }
+
+        private static string GetEffectiveTableAlias(TableInfo table) =>
+            NormalizeAlias(table.Alias, table.TableName);
+
+        private static string NormalizeAlias(string? alias, string tableName) =>
+            string.IsNullOrWhiteSpace(alias) ? tableName : alias;
+
+        private static bool TryGenerateSelfReferenceValue(
+            TableSchema currentTableSchema,
+            ColumnSchema column,
+            int rowId,
+            int rowIndex,
+            Dictionary<string, SelfReferencePlan> selfReferencePlans,
+            out object? value)
+        {
+            value = null;
+
+            if (!selfReferencePlans.TryGetValue(currentTableSchema.TableName, out var plan) ||
+                plan.ChainLength <= 1)
+            {
+                return false;
+            }
+
+            var depth = Math.Abs(rowIndex) % plan.ChainLength;
+            if (depth == 0)
+            {
+                if (column.IsNullable)
+                {
+                    value = null;
+                    return true;
+                }
+
+                if (currentTableSchema.PrimaryKey?.Columns.Count == 1)
+                {
+                    value = rowId;
+                    return true;
+                }
+
+                return false;
+            }
+
+            value = rowId - 1;
+            return true;
         }
 
         private static void RegisterGeneratedIds(
@@ -1277,6 +1510,40 @@ namespace SqlTestDataGenerator.DataGeneration
             tableRowIds[tableName] = Enumerable
                 .Range(startId, Math.Max(0, rowCount))
                 .ToList();
+        }
+
+        private static void RegisterReferenceableIds(
+            Dictionary<string, List<int>> tableRowIds,
+            string tableName,
+            int startId,
+            int rowCount,
+            Dictionary<string, SelfReferencePlan> selfReferencePlans)
+        {
+            var generatedIds = Enumerable
+                .Range(startId, Math.Max(0, rowCount))
+                .ToList();
+
+            if (!selfReferencePlans.TryGetValue(tableName, out var plan) ||
+                plan.ChainLength <= 1)
+            {
+                tableRowIds[tableName] = generatedIds;
+                return;
+            }
+
+            var referenceableIds = generatedIds
+                .Where((_, index) => (index % plan.ChainLength) == plan.ReferenceDepth)
+                .ToList();
+
+            if (referenceableIds.Count == 0)
+            {
+                referenceableIds = generatedIds
+                    .Where((_, index) => (index % plan.ChainLength) == (plan.ChainLength - 1))
+                    .ToList();
+            }
+
+            tableRowIds[tableName] = referenceableIds.Count > 0
+                ? referenceableIds
+                : generatedIds;
         }
 
         private static bool TryResolveRelatedRowId(
