@@ -100,6 +100,10 @@ namespace SqlTestDataGenerator.UI
             this.Font = new Font("Segoe UI", 10F);
             this.DoubleBuffered = true;
 
+#pragma warning disable CS0162
+            BuildHybridLayout();
+            return;
+
             // ═══ Header Panel ═══
             _headerPanel = new Panel
             {
@@ -140,7 +144,7 @@ namespace SqlTestDataGenerator.UI
             _toolbarPanel = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 90,
+                Height = 50,
                 Padding = new Padding(16, 8, 16, 8)
             };
 
@@ -242,7 +246,7 @@ namespace SqlTestDataGenerator.UI
                 Dock = DockStyle.Fill,
                 Multiline = true,
                 ScrollBars = ScrollBars.Both,
-                WordWrap = true,
+                WordWrap = false,
                 Font = new Font("Cascadia Code, Consolas", 10F),
                 AcceptsReturn = true,
                 AcceptsTab = true
@@ -442,56 +446,758 @@ namespace SqlTestDataGenerator.UI
             this.Controls.Add(_headerPanel);
         }
 
+        private void BuildHybridLayout()
+        {
+            SuspendLayout();
+            Controls.Clear();
+
+            _headerPanel = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 60,
+                Padding = new Padding(16, 8, 16, 8),
+                BackColor = SystemColors.Control
+            };
+
+            _titleLabel = new Label
+            {
+                Text = "⚡ SQL Test Data Generator",
+                Font = new Font("Segoe UI", 16F, FontStyle.Bold),
+                ForeColor = _textPrimary,
+                AutoSize = true,
+                Location = new Point(16, 14)
+            };
+
+            _connectionStatusLabel = new Label
+            {
+                Text = "● Not Connected",
+                Font = new Font("Segoe UI", 9F),
+                ForeColor = _accentRed,
+                AutoSize = true
+            };
+
+            _connectBtn = CreateLegacyButton("🔌 Connect", 90);
+            _connectBtn.Click += ConnectBtn_Click;
+
+            _disconnectBtn = CreateLegacyButton("✖ Disconnect", 100);
+            _disconnectBtn.Visible = false;
+            _disconnectBtn.Click += DisconnectBtn_Click;
+
+            _headerPanel.Controls.AddRange(new Control[] { _titleLabel, _connectionStatusLabel, _connectBtn, _disconnectBtn });
+            _headerPanel.Resize += HeaderPanel_Resize;
+
+            _toolbarPanel = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 50,
+                Padding = new Padding(16, 8, 16, 8),
+                BackColor = SystemColors.Control
+            };
+
+            _analyzeBtn = CreateLegacyButton("🔍 Analyze SQL", 126);
+            _analyzeBtn.Location = new Point(16, 8);
+            _analyzeBtn.Click += AnalyzeBtn_Click;
+
+            _generateBtn = CreateLegacyButton("⚡ Generate Data", 138);
+            _generateBtn.Location = new Point(160, 8);
+            _generateBtn.Enabled = false;
+            _generateBtn.Click += GenerateBtn_Click;
+
+            _insertDbBtn = CreateLegacyButton("Insert to DB", 130);
+            _insertDbBtn.Location = new Point(316, 8);
+            _insertDbBtn.Enabled = false;
+            _insertDbBtn.Click += InsertDbBtn_Click;
+
+            var startIdLabel = new Label
+            {
+                Text = "Start ID:",
+                AutoSize = true,
+                Location = new Point(462, 13),
+                ForeColor = _textPrimary,
+                Font = new Font("Segoe UI", 9F)
+            };
+
+            _startIdInput = new NumericUpDown
+            {
+                Minimum = 1,
+                Maximum = 9999999,
+                Value = 90000,
+                Increment = 1000,
+                Location = new Point(527, 9),
+                Width = 92,
+                Font = new Font("Segoe UI", 9F),
+                BackColor = Color.White,
+                ForeColor = _textPrimary,
+                BorderStyle = BorderStyle.FixedSingle
+            };
+
+            var rowsPerTableLabel = new Label
+            {
+                Text = "Rows/Table:",
+                AutoSize = true,
+                Location = new Point(634, 13),
+                ForeColor = _textPrimary,
+                Font = new Font("Segoe UI", 9F)
+            };
+
+            _rowsPerTableInput = new NumericUpDown
+            {
+                Minimum = 1,
+                Maximum = 1000,
+                Value = 1,
+                Increment = 1,
+                Location = new Point(709, 9),
+                Width = 72,
+                Font = new Font("Segoe UI", 9F),
+                BackColor = Color.White,
+                ForeColor = _textPrimary,
+                BorderStyle = BorderStyle.FixedSingle
+            };
+
+            _toolbarPanel.Controls.AddRange(new Control[]
+            {
+                _analyzeBtn, _generateBtn, _insertDbBtn, startIdLabel, _startIdInput, rowsPerTableLabel, _rowsPerTableInput
+            });
+
+            var contentPanel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                Padding = new Padding(16, 0, 16, 0),
+                BackColor = SystemColors.Control
+            };
+
+            var workspaceLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 2,
+                RowCount = 2,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = SystemColors.Control
+            };
+            workspaceLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 71F));
+            workspaceLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 29F));
+            workspaceLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 62F));
+            workspaceLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 38F));
+
+            _sqlInput = new TextBox
+            {
+                Multiline = true,
+                ScrollBars = ScrollBars.Both,
+                WordWrap = false,
+                Font = new Font("Cascadia Code, Consolas", 10F),
+                AcceptsReturn = true,
+                AcceptsTab = true,
+                PlaceholderText = "Paste or type your SQL script here..."
+            };
+
+            _analysisOutput = new TextBox
+            {
+                Multiline = true,
+                ScrollBars = ScrollBars.Both,
+                ReadOnly = true,
+                WordWrap = true,
+                Font = new Font("Cascadia Code, Consolas", 9.5F)
+            };
+
+            _scenarioList = new CheckedListBox
+            {
+                Font = new Font("Segoe UI", 9F),
+                CheckOnClick = true,
+                IntegralHeight = false
+            };
+
+            _scriptCleanOutput = new TextBox
+            {
+                Multiline = true,
+                ScrollBars = ScrollBars.Both,
+                ReadOnly = true,
+                WordWrap = false,
+                Font = new Font("Cascadia Code, Consolas", 9.5F)
+            };
+
+            _scriptOutput = new TextBox
+            {
+                Multiline = true,
+                ScrollBars = ScrollBars.Both,
+                ReadOnly = true,
+                WordWrap = true,
+                Font = new Font("Cascadia Code, Consolas", 9.5F)
+            };
+
+            var sqlCard = CreateCard("SQL Input", _accentBlue, CreateSurface(_sqlInput, new Padding(10)));
+            sqlCard.Margin = new Padding(0, 0, 12, 12);
+
+            var analysisCard = CreateCard("Analysis Result", _accentGreen, CreateSurface(_analysisOutput, new Padding(10)));
+            analysisCard.Margin = new Padding(0, 0, 0, 12);
+
+            var scenarioCard = CreateCard("Scenarios to generate", _accentOrange, CreateSurface(_scenarioList, new Padding(10)));
+            scenarioCard.Margin = new Padding(0, 0, 0, 12);
+
+            var rightTopLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 2,
+                Margin = new Padding(0),
+                Padding = new Padding(0)
+            };
+            rightTopLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 54F));
+            rightTopLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 46F));
+            rightTopLayout.Controls.Add(analysisCard, 0, 0);
+            rightTopLayout.Controls.Add(scenarioCard, 0, 1);
+
+            var scriptCard = CreateCard("Executable SQL Script", Color.FromArgb(111, 84, 214), CreateSurface(_scriptCleanOutput, new Padding(10)));
+            scriptCard.Margin = new Padding(0, 0, 12, 0);
+
+            var logCard = CreateCard("Full Log", _accentBlue, CreateSurface(_scriptOutput, new Padding(10)));
+            logCard.Margin = new Padding(0);
+
+            workspaceLayout.Controls.Add(sqlCard, 0, 0);
+            workspaceLayout.Controls.Add(rightTopLayout, 1, 0);
+            workspaceLayout.Controls.Add(scriptCard, 0, 1);
+            workspaceLayout.Controls.Add(logCard, 1, 1);
+            contentPanel.Controls.Add(workspaceLayout);
+
+            _bottomToolbar = new Panel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 90,
+                Padding = new Padding(16, 8, 16, 8),
+                BackColor = SystemColors.Control
+            };
+
+            _copyBtn = CreateLegacyButton("📋 Copy SQL", 120);
+            _copyBtn.Location = new Point(16, 8);
+            _copyBtn.Click += CopyBtn_Click;
+
+            _saveBtn = CreateLegacyButton("💾 Save .sql", 110);
+            _saveBtn.Location = new Point(150, 8);
+            _saveBtn.Click += SaveBtn_Click;
+
+            _exportFolderLabel = new Label
+            {
+                Text = "CSV Folder:",
+                AutoSize = true,
+                Location = new Point(16, 52),
+                Font = new Font("Segoe UI", 9F),
+                ForeColor = _textPrimary
+            };
+
+            _exportFolderInput = new TextBox
+            {
+                Location = new Point(90, 48),
+                Width = 620,
+                Font = new Font("Segoe UI", 9F),
+                BorderStyle = BorderStyle.FixedSingle,
+                Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right
+            };
+            _exportFolderInput.TextChanged += ExportFolderInput_TextChanged;
+
+            _browseExportFolderBtn = CreateLegacyButton("Browse...", 80);
+            _browseExportFolderBtn.Location = new Point(720, 44);
+            _browseExportFolderBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            _browseExportFolderBtn.Click += BrowseExportFolderBtn_Click;
+
+            _exportCsvBtn = CreateLegacyButton("Export CSV", 110);
+            _exportCsvBtn.Location = new Point(810, 44);
+            _exportCsvBtn.Enabled = false;
+            _exportCsvBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            _exportCsvBtn.Click += ExportCsvBtn_Click;
+
+            _importCsvBtn = CreateLegacyButton("Import CSV", 110);
+            _importCsvBtn.Location = new Point(930, 44);
+            _importCsvBtn.Enabled = false;
+            _importCsvBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            _importCsvBtn.Click += ImportCsvBtn_Click;
+
+            _statusLabel = new Label
+            {
+                Text = "Ready",
+                AutoSize = true,
+                Anchor = AnchorStyles.Top | AnchorStyles.Right,
+                Font = new Font("Segoe UI", 9F),
+                ForeColor = _textSecondary
+            };
+
+            _bottomToolbar.Controls.AddRange(new Control[]
+            {
+                _copyBtn, _saveBtn, _exportFolderLabel, _exportFolderInput, _browseExportFolderBtn, _exportCsvBtn, _importCsvBtn, _statusLabel
+            });
+            _bottomToolbar.Resize += BottomToolbar_Resize;
+
+            Controls.Add(contentPanel);
+            Controls.Add(_bottomToolbar);
+            Controls.Add(_toolbarPanel);
+            Controls.Add(_headerPanel);
+
+            HeaderPanel_Resize(this, EventArgs.Empty);
+            BottomToolbar_Resize(this, EventArgs.Empty);
+            ResumeLayout();
+        }
+
+        private void BuildModernLayout()
+        {
+            SuspendLayout();
+            Controls.Clear();
+
+            _headerPanel = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 120,
+                Padding = new Padding(16, 16, 16, 8),
+                BackColor = Color.White
+            };
+
+            var headerLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 2,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.White
+            };
+            headerLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54F));
+            headerLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
+
+            var heroLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 2,
+                RowCount = 1,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.White
+            };
+            heroLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            heroLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+            var appIconPanel = new Panel
+            {
+                BackColor = _accentBlue,
+                Size = new Size(52, 52),
+                Margin = new Padding(0, 0, 14, 0)
+            };
+            var appIconLabel = new Label
+            {
+                Text = "⚡",
+                Dock = DockStyle.Fill,
+                Font = new Font("Segoe UI Symbol", 18F, FontStyle.Bold),
+                ForeColor = Color.White,
+                TextAlign = ContentAlignment.MiddleCenter
+            };
+            appIconPanel.Controls.Add(appIconLabel);
+
+            _titleLabel = new Label
+            {
+                Text = "SQL Test Data Generator",
+                Font = new Font("Segoe UI Semibold", 18F),
+                ForeColor = _textPrimary,
+                AutoSize = true,
+                Margin = new Padding(0)
+            };
+
+            var subtitleLabel = new Label
+            {
+                Text = "Generate test data from your SQL scripts",
+                Font = new Font("Segoe UI", 10F),
+                ForeColor = _textSecondary,
+                AutoSize = true,
+                Margin = new Padding(0, 4, 0, 0)
+            };
+
+            var titleStack = new FlowLayoutPanel
+            {
+                AutoSize = true,
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.White
+            };
+            titleStack.Controls.Add(_titleLabel);
+            titleStack.Controls.Add(subtitleLabel);
+
+            var brandFlow = new FlowLayoutPanel
+            {
+                AutoSize = true,
+                WrapContents = false,
+                FlowDirection = FlowDirection.LeftToRight,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.White,
+                Anchor = AnchorStyles.Left
+            };
+            brandFlow.Controls.Add(appIconPanel);
+            brandFlow.Controls.Add(titleStack);
+
+            _connectionStatusLabel = new Label
+            {
+                Text = "● Not Connected",
+                Font = new Font("Segoe UI", 10F),
+                ForeColor = _accentRed,
+                AutoSize = true,
+                Margin = new Padding(0, 10, 14, 0),
+                BackColor = Color.White
+            };
+
+            _connectBtn = CreateButton("Connect", _accentBlue, 104);
+            _connectBtn.Margin = new Padding(0);
+            _connectBtn.Click += ConnectBtn_Click;
+
+            _disconnectBtn = CreateButton("Disconnect", _accentRed, 112);
+            _disconnectBtn.Margin = new Padding(0);
+            _disconnectBtn.Visible = false;
+            _disconnectBtn.Click += DisconnectBtn_Click;
+
+            var statusFlow = new FlowLayoutPanel
+            {
+                AutoSize = true,
+                WrapContents = false,
+                FlowDirection = FlowDirection.LeftToRight,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.White,
+                Anchor = AnchorStyles.Right
+            };
+            statusFlow.Controls.Add(_connectionStatusLabel);
+            statusFlow.Controls.Add(_connectBtn);
+            statusFlow.Controls.Add(_disconnectBtn);
+
+            heroLayout.Controls.Add(brandFlow, 0, 0);
+            heroLayout.Controls.Add(statusFlow, 1, 0);
+
+            _analyzeBtn = CreateButton("Analyze SQL", _accentBlue, 132);
+            _analyzeBtn.Click += AnalyzeBtn_Click;
+
+            _generateBtn = CreateButton("Generate Data", _accentGreen, 154);
+            _generateBtn.Enabled = false;
+            _generateBtn.Click += GenerateBtn_Click;
+
+            _insertDbBtn = CreateButton("Insert to DB", _accentOrange, 136);
+            _insertDbBtn.Enabled = false;
+            _insertDbBtn.Click += InsertDbBtn_Click;
+
+            _startIdInput = new NumericUpDown
+            {
+                Minimum = 1,
+                Maximum = 9999999,
+                Value = 90000,
+                Increment = 1000,
+                Width = 112,
+                Font = new Font("Segoe UI", 10F),
+                BorderStyle = BorderStyle.FixedSingle,
+                Margin = new Padding(0),
+                BackColor = Color.White
+            };
+
+            _rowsPerTableInput = new NumericUpDown
+            {
+                Minimum = 1,
+                Maximum = 1000,
+                Value = 1,
+                Increment = 1,
+                Width = 92,
+                Font = new Font("Segoe UI", 10F),
+                BorderStyle = BorderStyle.FixedSingle,
+                Margin = new Padding(0),
+                BackColor = Color.White
+            };
+
+            var controlsFlow = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                WrapContents = false,
+                FlowDirection = FlowDirection.LeftToRight,
+                Margin = new Padding(0, 2, 0, 0),
+                Padding = new Padding(0),
+                BackColor = Color.White,
+                Anchor = AnchorStyles.Left
+            };
+            controlsFlow.Controls.Add(_analyzeBtn);
+            controlsFlow.Controls.Add(_generateBtn);
+            controlsFlow.Controls.Add(_insertDbBtn);
+            controlsFlow.Controls.Add(CreateLabeledInputPanel("Start ID:", _startIdInput));
+            controlsFlow.Controls.Add(CreateLabeledInputPanel("Rows/Table:", _rowsPerTableInput));
+
+            headerLayout.Controls.Add(heroLayout, 0, 0);
+            headerLayout.Controls.Add(controlsFlow, 0, 1);
+            _headerPanel.Controls.Add(headerLayout);
+
+            _toolbarPanel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                Padding = new Padding(16, 8, 16, 16),
+                BackColor = Color.FromArgb(248, 250, 252)
+            };
+
+            var workspaceLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 2,
+                RowCount = 2,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.FromArgb(248, 250, 252)
+            };
+            workspaceLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 71F));
+            workspaceLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 29F));
+            workspaceLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 62F));
+            workspaceLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 38F));
+
+            _sqlInput = new TextBox
+            {
+                Multiline = true,
+                ScrollBars = ScrollBars.Both,
+                WordWrap = false,
+                Font = new Font("Cascadia Code, Consolas", 10F),
+                AcceptsReturn = true,
+                AcceptsTab = true,
+                PlaceholderText = "Paste or type your SQL script here..."
+            };
+
+            _analysisOutput = new TextBox
+            {
+                Multiline = true,
+                ScrollBars = ScrollBars.Both,
+                ReadOnly = true,
+                WordWrap = true,
+                Font = new Font("Cascadia Code, Consolas", 9.5F)
+            };
+
+            _scenarioList = new CheckedListBox
+            {
+                Font = new Font("Segoe UI", 9F),
+                CheckOnClick = true,
+                IntegralHeight = false
+            };
+
+            _scriptCleanOutput = new TextBox
+            {
+                Multiline = true,
+                ScrollBars = ScrollBars.Both,
+                ReadOnly = true,
+                WordWrap = false,
+                Font = new Font("Cascadia Code, Consolas", 9.5F)
+            };
+
+            _scriptOutput = new TextBox
+            {
+                Multiline = true,
+                ScrollBars = ScrollBars.Both,
+                ReadOnly = true,
+                WordWrap = true,
+                Font = new Font("Cascadia Code, Consolas", 9.5F)
+            };
+
+            var sqlCard = CreateCard("SQL Input", _accentBlue, CreateSurface(_sqlInput, new Padding(10)));
+            sqlCard.Margin = new Padding(0, 0, 12, 12);
+
+            var analysisCard = CreateCard("Analysis Result", _accentGreen, CreateSurface(_analysisOutput, new Padding(10)));
+            analysisCard.Margin = new Padding(0, 0, 0, 12);
+
+            var scenarioCard = CreateCard("Scenarios to generate", _accentOrange, CreateSurface(_scenarioList, new Padding(10)));
+            scenarioCard.Margin = new Padding(0);
+
+            var rightTopLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 2,
+                Margin = new Padding(0),
+                Padding = new Padding(0)
+            };
+            rightTopLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 54F));
+            rightTopLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 46F));
+            rightTopLayout.Controls.Add(analysisCard, 0, 0);
+            rightTopLayout.Controls.Add(scenarioCard, 0, 1);
+
+            var scriptCard = CreateCard("Executable SQL Script", Color.FromArgb(111, 84, 214), CreateSurface(_scriptCleanOutput, new Padding(10)));
+            scriptCard.Margin = new Padding(0, 0, 12, 0);
+
+            var logCard = CreateCard("Full Log", _accentBlue, CreateSurface(_scriptOutput, new Padding(10)));
+            logCard.Margin = new Padding(0);
+
+            workspaceLayout.Controls.Add(sqlCard, 0, 0);
+            workspaceLayout.Controls.Add(rightTopLayout, 1, 0);
+            workspaceLayout.Controls.Add(scriptCard, 0, 1);
+            workspaceLayout.Controls.Add(logCard, 1, 1);
+
+            _bottomToolbar = new Panel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 100,
+                Padding = new Padding(0, 12, 0, 0),
+                BackColor = Color.FromArgb(248, 250, 252)
+            };
+
+            _copyBtn = CreateButton("Copy SQL", _accentBlue, 106);
+            _copyBtn.Click += CopyBtn_Click;
+
+            _saveBtn = CreateButton("Save .sql", _accentGreen, 106);
+            _saveBtn.Click += SaveBtn_Click;
+
+            _exportFolderLabel = new Label
+            {
+                Text = "CSV Folder:",
+                AutoSize = true,
+                Font = new Font("Segoe UI", 9.5F),
+                ForeColor = _textPrimary,
+                Margin = new Padding(0, 10, 10, 0),
+                BackColor = Color.FromArgb(248, 250, 252)
+            };
+
+            _exportFolderInput = new TextBox
+            {
+                Font = new Font("Segoe UI", 9.5F),
+                BorderStyle = BorderStyle.FixedSingle,
+                PlaceholderText = "Select folder to save CSV files..."
+            };
+            _exportFolderInput.TextChanged += ExportFolderInput_TextChanged;
+
+            _browseExportFolderBtn = CreateButton("Browse...", _accentBlue, 110);
+            _browseExportFolderBtn.Click += BrowseExportFolderBtn_Click;
+
+            _exportCsvBtn = CreateButton("Export CSV", _accentGreen, 118);
+            _exportCsvBtn.Enabled = false;
+            _exportCsvBtn.Click += ExportCsvBtn_Click;
+
+            _importCsvBtn = CreateButton("Import CSV", _accentOrange, 118);
+            _importCsvBtn.Enabled = false;
+            _importCsvBtn.Click += ImportCsvBtn_Click;
+
+            _statusLabel = new Label
+            {
+                Text = "Ready",
+                AutoSize = true,
+                Font = new Font("Segoe UI", 9.5F),
+                ForeColor = _textSecondary,
+                Anchor = AnchorStyles.Right,
+                TextAlign = ContentAlignment.MiddleRight,
+                Margin = new Padding(0, 10, 0, 0),
+                BackColor = Color.FromArgb(248, 250, 252)
+            };
+
+            var footerLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 2,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.FromArgb(248, 250, 252)
+            };
+            footerLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44F));
+            footerLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40F));
+
+            var actionsRow = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 2,
+                RowCount = 1,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.FromArgb(248, 250, 252)
+            };
+            actionsRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            actionsRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+            var actionsLeftFlow = new FlowLayoutPanel
+            {
+                AutoSize = true,
+                WrapContents = false,
+                FlowDirection = FlowDirection.LeftToRight,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.FromArgb(248, 250, 252)
+            };
+            actionsLeftFlow.Controls.Add(_copyBtn);
+            actionsLeftFlow.Controls.Add(_saveBtn);
+
+            actionsRow.Controls.Add(actionsLeftFlow, 0, 0);
+            actionsRow.Controls.Add(_statusLabel, 1, 0);
+
+            var csvRow = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 5,
+                RowCount = 1,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.FromArgb(248, 250, 252)
+            };
+            csvRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            csvRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            csvRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            csvRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            csvRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+            _exportFolderInput.Dock = DockStyle.Fill;
+            _exportFolderInput.Margin = new Padding(0);
+            _browseExportFolderBtn.Margin = new Padding(12, 0, 0, 0);
+            _exportCsvBtn.Margin = new Padding(12, 0, 0, 0);
+            _importCsvBtn.Margin = new Padding(12, 0, 0, 0);
+
+            csvRow.Controls.Add(_exportFolderLabel, 0, 0);
+            csvRow.Controls.Add(_exportFolderInput, 1, 0);
+            csvRow.Controls.Add(_browseExportFolderBtn, 2, 0);
+            csvRow.Controls.Add(_exportCsvBtn, 3, 0);
+            csvRow.Controls.Add(_importCsvBtn, 4, 0);
+
+            footerLayout.Controls.Add(actionsRow, 0, 0);
+            footerLayout.Controls.Add(csvRow, 0, 1);
+            _bottomToolbar.Controls.Add(footerLayout);
+
+            _toolbarPanel.Controls.Add(workspaceLayout);
+            _toolbarPanel.Controls.Add(_bottomToolbar);
+
+            Controls.Add(_toolbarPanel);
+            Controls.Add(_headerPanel);
+            ResumeLayout();
+        }
+
         private void ApplyTheme()
         {
-            this.BackColor = SystemColors.Control;
-            this.ForeColor = SystemColors.ControlText;
+            BackColor = SystemColors.Control;
+            ForeColor = _textPrimary;
 
             _headerPanel.BackColor = SystemColors.Control;
             _toolbarPanel.BackColor = SystemColors.Control;
             _bottomToolbar.BackColor = SystemColors.Control;
 
-            _titleLabel.ForeColor = SystemColors.ControlText;
+            _titleLabel.ForeColor = _textPrimary;
             _connectionStatusLabel.ForeColor = _accentRed;
 
-            _sqlInput.BackColor = SystemColors.Window;
-            _sqlInput.ForeColor = SystemColors.WindowText;
-            _sqlInput.BorderStyle = BorderStyle.FixedSingle;
+            _sqlInput.BackColor = Color.White;
+            _sqlInput.ForeColor = _textPrimary;
+            _sqlInput.BorderStyle = BorderStyle.None;
 
-            _analysisOutput.BackColor = SystemColors.Window;
-            _analysisOutput.ForeColor = SystemColors.WindowText;
-            _analysisOutput.BorderStyle = BorderStyle.FixedSingle;
+            _analysisOutput.BackColor = Color.White;
+            _analysisOutput.ForeColor = _textPrimary;
+            _analysisOutput.BorderStyle = BorderStyle.None;
 
-            _scriptCleanOutput.BackColor = SystemColors.Window;
-            _scriptCleanOutput.ForeColor = SystemColors.WindowText;
-            _scriptCleanOutput.BorderStyle = BorderStyle.FixedSingle;
+            _scriptCleanOutput.BackColor = Color.White;
+            _scriptCleanOutput.ForeColor = _textPrimary;
+            _scriptCleanOutput.BorderStyle = BorderStyle.None;
 
-            _scriptOutput.BackColor = SystemColors.Window;
-            _scriptOutput.ForeColor = SystemColors.WindowText;
-            _scriptOutput.BorderStyle = BorderStyle.FixedSingle;
+            _scriptOutput.BackColor = Color.White;
+            _scriptOutput.ForeColor = _textPrimary;
+            _scriptOutput.BorderStyle = BorderStyle.None;
 
             _exportFolderInput.BackColor = SystemColors.Window;
-            _exportFolderInput.ForeColor = SystemColors.WindowText;
+            _exportFolderInput.ForeColor = _textPrimary;
             _exportFolderInput.BorderStyle = BorderStyle.FixedSingle;
 
-            _bottomSplitter.Panel1.BackColor = SystemColors.Control;
-            _bottomSplitter.Panel2.BackColor = SystemColors.Control;
+            _scenarioList.BackColor = Color.White;
+            _scenarioList.ForeColor = _textPrimary;
+            _scenarioList.BorderStyle = BorderStyle.None;
 
-            _scenarioList.BackColor = SystemColors.Window;
-            _scenarioList.ForeColor = SystemColors.WindowText;
-            _scenarioList.BorderStyle = BorderStyle.FixedSingle;
-
-            _mainSplitter.BackColor = SystemColors.ControlDark;
-            _mainSplitter.Panel1.BackColor = SystemColors.Control;
-            _mainSplitter.Panel2.BackColor = SystemColors.Control;
-            _topSplitter.BackColor = SystemColors.ControlDark;
-            _topSplitter.Panel1.BackColor = SystemColors.Control;
-            _topSplitter.Panel2.BackColor = SystemColors.Control;
-
-            _startIdInput.BackColor = SystemColors.Window;
-            _startIdInput.ForeColor = SystemColors.WindowText;
-            _rowsPerTableInput.BackColor = SystemColors.Window;
-            _rowsPerTableInput.ForeColor = SystemColors.WindowText;
+            _startIdInput.BackColor = Color.White;
+            _startIdInput.ForeColor = _textPrimary;
+            _rowsPerTableInput.BackColor = Color.White;
+            _rowsPerTableInput.ForeColor = _textPrimary;
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -1073,7 +1779,6 @@ namespace SqlTestDataGenerator.UI
         private void SetStatus(string text)
         {
             _statusLabel.Text = text;
-            _statusLabel.Location = new Point(_bottomToolbar.Width - _statusLabel.Width - 20, 15);
         }
 
         private void RefreshInsertScriptPreview(string sourceLabel)
@@ -1261,9 +1966,103 @@ namespace SqlTestDataGenerator.UI
         // Helper: Create styled button
         // ═══════════════════════════════════════════════════════════════
 
-        private Button CreateButton(string text, Color accentColor, int width)
+        private Control CreateLabeledInputPanel(string labelText, Control input)
         {
-            var btn = new Button
+            var panel = new TableLayoutPanel
+            {
+                AutoSize = true,
+                ColumnCount = 2,
+                RowCount = 1,
+                Margin = new Padding(12, 2, 0, 0),
+                Padding = new Padding(0),
+                BackColor = Color.White
+            };
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+            var label = new Label
+            {
+                Text = labelText,
+                AutoSize = true,
+                Font = new Font("Segoe UI", 9.5F),
+                ForeColor = _textPrimary,
+                Margin = new Padding(0, 8, 8, 0),
+                BackColor = Color.White
+            };
+
+            input.Margin = new Padding(0);
+            panel.Controls.Add(label, 0, 0);
+            panel.Controls.Add(input, 1, 0);
+            return panel;
+        }
+
+        private Panel CreateCard(string title, Color accentColor, Control content)
+        {
+            var borderPanel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.FromArgb(222, 226, 234),
+                Padding = new Padding(1),
+                Margin = new Padding(0)
+            };
+
+            var innerPanel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.White,
+                Padding = new Padding(12),
+                Margin = new Padding(0)
+            };
+
+            var headerLabel = new Label
+            {
+                Text = title,
+                Dock = DockStyle.Top,
+                Height = 30,
+                Font = new Font("Segoe UI Semibold", 11F),
+                ForeColor = _textPrimary,
+                Padding = new Padding(0, 2, 0, 0),
+                BackColor = Color.White
+            };
+
+            content.Dock = DockStyle.Fill;
+            content.Margin = new Padding(0);
+
+            innerPanel.Controls.Add(content);
+            innerPanel.Controls.Add(headerLabel);
+            borderPanel.Controls.Add(innerPanel);
+            return borderPanel;
+        }
+
+        private Panel CreateSurface(Control content, Padding padding)
+        {
+            var borderPanel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.FromArgb(228, 232, 240),
+                Padding = new Padding(1),
+                Margin = new Padding(0)
+            };
+
+            var innerPanel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.White,
+                Padding = padding,
+                Margin = new Padding(0)
+            };
+
+            content.Dock = DockStyle.Fill;
+            content.Margin = new Padding(0);
+
+            innerPanel.Controls.Add(content);
+            borderPanel.Controls.Add(innerPanel);
+            return borderPanel;
+        }
+
+        private Button CreateLegacyButton(string text, int width)
+        {
+            return new Button
             {
                 Text = text,
                 Size = new Size(width, 32),
@@ -1274,6 +2073,42 @@ namespace SqlTestDataGenerator.UI
                 Cursor = Cursors.Hand,
                 TextAlign = ContentAlignment.MiddleCenter,
                 UseVisualStyleBackColor = true
+            };
+        }
+
+        private Button CreateButton(string text, Color accentColor, int width)
+        {
+            var btn = new Button
+            {
+                Text = text,
+                Size = new Size(width, 40),
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI Semibold", 9.5F),
+                ForeColor = Color.White,
+                BackColor = accentColor,
+                Cursor = Cursors.Hand,
+                TextAlign = ContentAlignment.MiddleCenter,
+                UseVisualStyleBackColor = false,
+                Margin = new Padding(0, 0, 12, 0)
+            };
+            btn.FlatAppearance.BorderColor = accentColor;
+            btn.FlatAppearance.BorderSize = 1;
+            btn.FlatAppearance.MouseDownBackColor = ControlPaint.Dark(accentColor, 0.12f);
+            btn.FlatAppearance.MouseOverBackColor = ControlPaint.Light(accentColor, 0.08f);
+            btn.EnabledChanged += (_, _) =>
+            {
+                if (btn.Enabled)
+                {
+                    btn.ForeColor = Color.White;
+                    btn.BackColor = accentColor;
+                    btn.FlatAppearance.BorderColor = accentColor;
+                }
+                else
+                {
+                    btn.ForeColor = Color.FromArgb(168, 174, 186);
+                    btn.BackColor = Color.FromArgb(249, 250, 251);
+                    btn.FlatAppearance.BorderColor = Color.FromArgb(214, 220, 230);
+                }
             };
 
             return btn;
