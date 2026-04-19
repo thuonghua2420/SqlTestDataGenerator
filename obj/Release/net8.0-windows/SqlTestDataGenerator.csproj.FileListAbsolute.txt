@@ -94,3 +94,13 @@ D:\project\create-data\artifacts\exists-correlation-fix-app\SqlTestDataGenerator
 D:\project\create-data\artifacts\exists-correlation-fix-app\SqlTestDataGenerator.runtimeconfig.json
 D:\project\create-data\artifacts\exists-correlation-fix-app\SqlTestDataGenerator.dll
 D:\project\create-data\artifacts\exists-correlation-fix-app\SqlTestDataGenerator.pdb
+D:\project\create-data\artifacts\notexists-scope-fix-harness\SqlTestDataGenerator.exe
+D:\project\create-data\artifacts\notexists-scope-fix-harness\SqlTestDataGenerator.deps.json
+D:\project\create-data\artifacts\notexists-scope-fix-harness\SqlTestDataGenerator.runtimeconfig.json
+D:\project\create-data\artifacts\notexists-scope-fix-harness\SqlTestDataGenerator.dll
+D:\project\create-data\artifacts\notexists-scope-fix-harness\SqlTestDataGenerator.pdb
+D:\project\create-data\artifacts\notexists-scope-fix-app\SqlTestDataGenerator.exe
+D:\project\create-data\artifacts\notexists-scope-fix-app\SqlTestDataGenerator.deps.json
+D:\project\create-data\artifacts\notexists-scope-fix-app\SqlTestDataGenerator.runtimeconfig.json
+D:\project\create-data\artifacts\notexists-scope-fix-app\SqlTestDataGenerator.dll
+D:\project\create-data\artifacts\notexists-scope-fix-app\SqlTestDataGenerator.pdb

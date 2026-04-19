@@ -567,23 +567,22 @@ namespace SqlTestDataGenerator.DataGeneration
             // 3.25. Check table-local conditions that live inside EXISTS/IN subqueries
             if (includeSubqueryConditions)
             {
-                var subqueryCondition = FindApplicableSubqueryCondition(
-                    query.Subqueries,
+                var subqueryConditionMatch = FindApplicableSubqueryConditionMatch(
                     query,
                     currentTableName,
                     tableAlias,
                     col.ColumnName);
 
-                if (subqueryCondition != null)
+                if (subqueryConditionMatch != null)
                 {
                     return GenerateConditionValue(
                         scenario,
                         query,
                         col,
                         generator,
-                        subqueryCondition,
+                        subqueryConditionMatch.Condition,
                         tableRowIds,
-                        satisfy: true);
+                        satisfy: subqueryConditionMatch.ShouldSatisfy);
                 }
             }
 
@@ -651,7 +650,6 @@ namespace SqlTestDataGenerator.DataGeneration
             bool satisfy)
         {
             if (condition.IsColumnComparison &&
-                satisfy &&
                 TryResolveSubqueryComparisonValue(
                     scenario,
                     query,
@@ -660,7 +658,15 @@ namespace SqlTestDataGenerator.DataGeneration
                     query.AliasToTableMap,
                     out var comparisonValue))
             {
-                return comparisonValue;
+                if (satisfy)
+                {
+                    return comparisonValue;
+                }
+
+                return generator.GenerateViolating(
+                    col,
+                    ConditionOpToString(condition.Operator),
+                    comparisonValue?.ToString() ?? string.Empty);
             }
 
             var opStr = ConditionOpToString(condition.Operator);
@@ -693,7 +699,6 @@ namespace SqlTestDataGenerator.DataGeneration
                     ? generator.GenerateSatisfying(col, "LIKE", condition.LikePattern)
                     : generator.GenerateViolating(col, "LIKE", condition.LikePattern);
             }
-
             return satisfy
                 ? generator.GenerateSatisfying(col, opStr, condition.Value)
                 : generator.GenerateViolating(col, opStr, condition.Value);
@@ -713,35 +718,63 @@ namespace SqlTestDataGenerator.DataGeneration
                 MatchesConditionTarget(query, c.TableAlias, tableName, tableAlias));
         }
 
-        private static ConditionInfo? FindApplicableSubqueryCondition(
-            IEnumerable<SubqueryInfo> subqueries,
+        private SubqueryConditionMatch? FindApplicableSubqueryConditionMatch(
             ParsedQuery query,
             string tableName,
             string tableAlias,
             string columnName)
         {
+            var matches = new List<SubqueryConditionMatch>();
+            CollectSubqueryConditionMatches(
+                query.Subqueries,
+                query,
+                tableName,
+                tableAlias,
+                columnName,
+                desiredPredicateTruth: true,
+                matches);
+
+            return matches
+                .FirstOrDefault(m => m.ShouldSatisfy) ??
+                   matches.FirstOrDefault(m => !m.Condition.IsColumnComparison) ??
+                   matches.FirstOrDefault();
+        }
+
+        private static void CollectSubqueryConditionMatches(
+            IEnumerable<SubqueryInfo> subqueries,
+            ParsedQuery query,
+            string tableName,
+            string tableAlias,
+            string columnName,
+            bool desiredPredicateTruth,
+            List<SubqueryConditionMatch> matches)
+        {
             foreach (var subquery in subqueries)
             {
-                var condition = subquery.Conditions.FirstOrDefault(c =>
-                    c.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase) &&
-                    MatchesConditionTarget(query, c.TableAlias, tableName, tableAlias));
+                bool internalRowShouldMatch = desiredPredicateTruth ^ IsNegativeSubqueryOperator(subquery.Operator);
 
-                if (condition != null)
-                    return condition;
+                foreach (var condition in subquery.Conditions)
+                {
+                    if (condition.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase) &&
+                        MatchesConditionTarget(query, condition.TableAlias, tableName, tableAlias))
+                    {
+                        matches.Add(new SubqueryConditionMatch(condition, internalRowShouldMatch));
+                    }
+                }
 
-                var nested = FindApplicableSubqueryCondition(
+                CollectSubqueryConditionMatches(
                     subquery.NestedSubqueries,
                     query,
                     tableName,
                     tableAlias,
-                    columnName);
-
-                if (nested != null)
-                    return nested;
+                    columnName,
+                    internalRowShouldMatch,
+                    matches);
             }
-
-            return null;
         }
+
+        private static bool IsNegativeSubqueryOperator(SubqueryOperator op) =>
+            op is SubqueryOperator.NotExists or SubqueryOperator.NotIn;
 
         private static bool MatchesConditionTarget(
             ParsedQuery query,
@@ -757,6 +790,18 @@ namespace SqlTestDataGenerator.DataGeneration
 
             var resolved = query.ResolveAlias(conditionTableAlias);
             return resolved.Equals(tableName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private sealed class SubqueryConditionMatch
+        {
+            public SubqueryConditionMatch(ConditionInfo condition, bool shouldSatisfy)
+            {
+                Condition = condition;
+                ShouldSatisfy = shouldSatisfy;
+            }
+
+            public ConditionInfo Condition { get; }
+            public bool ShouldSatisfy { get; }
         }
 
         private object? GenerateBoundaryValue(ColumnSchema col, ConditionInfo condition)

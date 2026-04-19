@@ -212,6 +212,13 @@ namespace SqlTestDataGenerator.Parsing.Visitors
             _depth--;
         }
 
+        // ─── Never descend into nested SELECT bodies here.
+        // SubqueryExtractorVisitor is responsible for those predicates.
+        public override void Visit(ScalarSubquery node)
+        {
+            // Intentionally do nothing.
+        }
+
         // ═════════════════════════════════════════════════════════════════
         // Helper methods
         // ═════════════════════════════════════════════════════════════════

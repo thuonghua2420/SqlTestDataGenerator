@@ -57,13 +57,14 @@ namespace SqlTestDataGenerator.Parsing
             }
             result.Joins = joinVisitor.Joins;
             UpdateTableRolesFromJoins(result);
+            var outerScopeAliasMap = BuildScopeAliasMap(querySpec.FromClause);
 
             // Step 5: Extract WHERE conditions
             if (querySpec.WhereClause != null)
             {
                 var whereVisitor = new ConditionExtractorVisitor(ConditionSource.Where);
                 querySpec.WhereClause.Accept(whereVisitor);
-                result.WhereConditions = whereVisitor.Conditions;
+                result.WhereConditions = FilterConditionsToScope(whereVisitor.Conditions, outerScopeAliasMap);
             }
 
             // Step 6: Extract HAVING conditions
@@ -71,7 +72,7 @@ namespace SqlTestDataGenerator.Parsing
             {
                 var havingVisitor = new ConditionExtractorVisitor(ConditionSource.Having);
                 querySpec.HavingClause.Accept(havingVisitor);
-                result.HavingConditions = havingVisitor.Conditions;
+                result.HavingConditions = FilterConditionsToScope(havingVisitor.Conditions, outerScopeAliasMap);
             }
 
             // Step 7: Extract GROUP BY
@@ -332,6 +333,7 @@ namespace SqlTestDataGenerator.Parsing
 
         private void AnalyzeQuerySpecification(QuerySpecification spec, ParsedQuery result)
         {
+            var scopeAliasMap = BuildScopeAliasMap(spec.FromClause);
             var joinVisitor = new JoinExtractorVisitor();
             if (spec.FromClause != null)
             {
@@ -343,7 +345,7 @@ namespace SqlTestDataGenerator.Parsing
             {
                 var whereVisitor = new ConditionExtractorVisitor(ConditionSource.Where);
                 spec.WhereClause.Accept(whereVisitor);
-                result.WhereConditions.AddRange(whereVisitor.Conditions);
+                result.WhereConditions.AddRange(FilterConditionsToScope(whereVisitor.Conditions, scopeAliasMap));
 
                 var subqueryVisitor = new SubqueryExtractorVisitor();
                 spec.WhereClause.Accept(subqueryVisitor);
@@ -354,7 +356,7 @@ namespace SqlTestDataGenerator.Parsing
             {
                 var havingVisitor = new ConditionExtractorVisitor(ConditionSource.Having);
                 spec.HavingClause.Accept(havingVisitor);
-                result.HavingConditions.AddRange(havingVisitor.Conditions);
+                result.HavingConditions.AddRange(FilterConditionsToScope(havingVisitor.Conditions, scopeAliasMap));
 
                 var subqueryVisitor = new SubqueryExtractorVisitor();
                 spec.HavingClause.Accept(subqueryVisitor);
@@ -442,9 +444,7 @@ namespace SqlTestDataGenerator.Parsing
             result.Joins = result.Joins
                 .DistinctBy(BuildJoinKey)
                 .ToList();
-            result.Subqueries = result.Subqueries
-                .DistinctBy(BuildSubqueryKey)
-                .ToList();
+            result.Subqueries = NormalizeSubqueries(result.Subqueries);
             result.Aggregates = result.Aggregates
                 .DistinctBy(BuildAggregateKey)
                 .ToList();
@@ -453,6 +453,30 @@ namespace SqlTestDataGenerator.Parsing
                 .ToList();
 
             UpdateTableRolesFromJoins(result);
+        }
+
+        private List<SubqueryInfo> NormalizeSubqueries(IEnumerable<SubqueryInfo> subqueries)
+        {
+            return subqueries
+                .GroupBy(BuildSubqueryIdentityKey)
+                .Select(group =>
+                {
+                    var canonical = group.First();
+                    canonical.Operator = SelectPreferredSubqueryOperator(group.Select(s => s.Operator));
+                    canonical.Tables = group
+                        .SelectMany(s => s.Tables)
+                        .DistinctBy(BuildTableIdentityKey)
+                        .ToList();
+                    canonical.Conditions = group
+                        .SelectMany(s => s.Conditions)
+                        .DistinctBy(BuildConditionKey)
+                        .ToList();
+                    canonical.NestedSubqueries = NormalizeSubqueries(group.SelectMany(s => s.NestedSubqueries));
+                    canonical.IsCorrelated = group.Any(s => s.IsCorrelated);
+                    canonical.NestingLevel = group.Min(s => s.NestingLevel);
+                    return canonical;
+                })
+                .ToList();
         }
 
         private static string BuildConditionKey(ConditionInfo condition)
@@ -471,6 +495,56 @@ namespace SqlTestDataGenerator.Parsing
                 condition.ExpressionText,
                 condition.HasSubquery ? "1" : "0",
                 condition.IsNegated ? "1" : "0");
+        }
+
+        private Dictionary<string, string> BuildScopeAliasMap(FromClause? fromClause)
+        {
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (fromClause == null)
+                return map;
+
+            var visitor = new TableExtractorVisitor();
+            fromClause.Accept(visitor);
+
+            foreach (var table in visitor.Tables)
+            {
+                if (!string.IsNullOrWhiteSpace(table.Alias))
+                {
+                    map[table.Alias] = table.TableName;
+                }
+
+                if (!string.IsNullOrWhiteSpace(table.TableName))
+                {
+                    map[table.TableName] = table.TableName;
+                }
+            }
+
+            return map;
+        }
+
+        private List<ConditionInfo> FilterConditionsToScope(
+            IEnumerable<ConditionInfo> conditions,
+            IReadOnlyDictionary<string, string> scopeAliasMap)
+        {
+            return conditions
+                .Where(c => ConditionBelongsToScope(c, scopeAliasMap))
+                .ToList();
+        }
+
+        private static bool ConditionBelongsToScope(
+            ConditionInfo condition,
+            IReadOnlyDictionary<string, string> scopeAliasMap)
+        {
+            if (condition.HasSubquery ||
+                condition.Operator is ComparisonOp.Exists or ComparisonOp.NotExists)
+            {
+                return true;
+            }
+
+            if (string.IsNullOrWhiteSpace(condition.TableAlias))
+                return true;
+
+            return scopeAliasMap.ContainsKey(condition.TableAlias);
         }
 
         private static string BuildJoinKey(JoinInfo join)
@@ -493,6 +567,41 @@ namespace SqlTestDataGenerator.Parsing
                 subquery.SelectTableAlias,
                 subquery.SelectColumn,
                 subquery.SubquerySql);
+        }
+
+        private static string BuildSubqueryIdentityKey(SubqueryInfo subquery)
+        {
+            return string.Join("|",
+                subquery.ParentTableAlias,
+                subquery.ParentColumnName,
+                subquery.SelectTableAlias,
+                subquery.SelectColumn,
+                subquery.SubquerySql);
+        }
+
+        private static string BuildTableIdentityKey(TableInfo table)
+        {
+            return string.Join("|", table.SchemaName, table.TableName, table.Alias, table.Role);
+        }
+
+        private static SubqueryOperator SelectPreferredSubqueryOperator(IEnumerable<SubqueryOperator> operators)
+        {
+            var operatorSet = operators.ToHashSet();
+
+            if (operatorSet.Contains(SubqueryOperator.NotExists))
+                return SubqueryOperator.NotExists;
+            if (operatorSet.Contains(SubqueryOperator.NotIn))
+                return SubqueryOperator.NotIn;
+            if (operatorSet.Contains(SubqueryOperator.Exists))
+                return SubqueryOperator.Exists;
+            if (operatorSet.Contains(SubqueryOperator.In))
+                return SubqueryOperator.In;
+            if (operatorSet.Contains(SubqueryOperator.Any))
+                return SubqueryOperator.Any;
+            if (operatorSet.Contains(SubqueryOperator.All))
+                return SubqueryOperator.All;
+
+            return SubqueryOperator.ScalarComparison;
         }
 
         private static string BuildAggregateKey(AggregateInfo aggregate)
