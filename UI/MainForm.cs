@@ -1,6 +1,7 @@
 using Microsoft.Data.SqlClient;
 using SqlTestDataGenerator.Database;
 using SqlTestDataGenerator.DataGeneration;
+using SqlTestDataGenerator.DataGeneration.Models;
 using SqlTestDataGenerator.Output;
 using SqlTestDataGenerator.Parsing;
 using SqlTestDataGenerator.Parsing.Models;
@@ -1316,7 +1317,7 @@ namespace SqlTestDataGenerator.UI
                 foreach (var s in _availableScenarios)
                 {
                     var shouldCheck = s.Type == DataGeneration.Models.ScenarioType.Positive;
-                    _scenarioList.Items.Add($"[{s.Type}] {s.Name}", shouldCheck);
+                    _scenarioList.Items.Add(FormatScenarioListItem(s), shouldCheck);
                 }
 
                 _generateBtn.Enabled = true;
@@ -1336,6 +1337,11 @@ namespace SqlTestDataGenerator.UI
                 SetStatus("Analysis failed.");
                 LogError($"SQL analysis failed: {BuildErrorChain(ex)}");
             }
+        }
+
+        private static string FormatScenarioListItem(BranchScenario scenario)
+        {
+            return scenario.Name;
         }
 
         private void GenerateBtn_Click(object? sender, EventArgs e)

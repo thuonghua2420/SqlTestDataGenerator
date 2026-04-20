@@ -44,6 +44,21 @@ namespace SqlTestDataGenerator.DataGeneration.Models
         /// <summary>Which condition is being tested (null for positive scenario)</summary>
         public string? TestedCondition { get; set; }
 
+        /// <summary>Exact predicate truth map that this scenario requires.</summary>
+        public Dictionary<string, bool> PredicateTruthMap { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Readable list of predicate texts that define this scenario.</summary>
+        public List<string> TestedConditions { get; set; } = new();
+
+        /// <summary>Scope label used for UI descriptions (for example "Main WHERE" or "CTE Orders HAVING").</summary>
+        public string ScopeLabel { get; set; } = string.Empty;
+
+        /// <summary>Boundary predicate key when this is a boundary scenario.</summary>
+        public string? BoundaryConditionKey { get; set; }
+
+        /// <summary>Join key when this is a join-miss scenario.</summary>
+        public string? JoinKey { get; set; }
+
         /// <summary>The rows to insert, keyed by table name, ordered by dependency</summary>
         public Dictionary<string, List<GeneratedRow>> TableRows { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 

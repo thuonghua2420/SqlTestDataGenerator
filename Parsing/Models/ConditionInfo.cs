@@ -5,6 +5,15 @@ namespace SqlTestDataGenerator.Parsing.Models
     /// </summary>
     public class ConditionInfo
     {
+        /// <summary>Stable key for this predicate occurrence.</summary>
+        public string Key { get; set; } = string.Empty;
+
+        /// <summary>Logical scope identifier where this condition was found.</summary>
+        public string ScopeId { get; set; } = string.Empty;
+
+        /// <summary>Human-friendly scope label (for UI scenario descriptions).</summary>
+        public string ScopeLabel { get; set; } = string.Empty;
+
         /// <summary>Table alias or name (e.g., "o" for orders)</summary>
         public string TableAlias { get; set; } = string.Empty;
 
@@ -22,6 +31,9 @@ namespace SqlTestDataGenerator.Parsing.Models
 
         /// <summary>If this condition references a subquery</summary>
         public bool HasSubquery { get; set; }
+
+        /// <summary>Raw subquery SQL for EXISTS / IN (subquery) predicates.</summary>
+        public string SubquerySql { get; set; } = string.Empty;
 
         /// <summary>The source clause: WHERE, HAVING, JOIN_ON</summary>
         public ConditionSource Source { get; set; }
@@ -55,6 +67,10 @@ namespace SqlTestDataGenerator.Parsing.Models
 
         /// <summary>Nesting depth for parenthesized conditions</summary>
         public int NestingDepth { get; set; }
+
+        /// <summary>Whether this leaf predicate is driven by an outer subquery operator.</summary>
+        public bool IsSubqueryPredicate =>
+            HasSubquery || Operator is ComparisonOp.Exists or ComparisonOp.NotExists;
 
         public override string ToString()
         {

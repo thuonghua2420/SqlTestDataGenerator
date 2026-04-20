@@ -16,6 +16,7 @@ namespace SqlTestDataGenerator.Parsing
         public ParsedQuery Parse(string sql)
         {
             var result = new ParsedQuery { OriginalSql = sql };
+            var predicateBuilder = new PredicateTreeBuilder();
 
             // Step 1: Parse SQL into AST
             var parser = new TSql160Parser(initialQuotedIdentifiers: true);
@@ -59,21 +60,8 @@ namespace SqlTestDataGenerator.Parsing
             UpdateTableRolesFromJoins(result);
             var outerScopeAliasMap = BuildScopeAliasMap(querySpec.FromClause);
 
-            // Step 5: Extract WHERE conditions
-            if (querySpec.WhereClause != null)
-            {
-                var whereVisitor = new ConditionExtractorVisitor(ConditionSource.Where);
-                querySpec.WhereClause.Accept(whereVisitor);
-                result.WhereConditions = FilterConditionsToScope(whereVisitor.Conditions, outerScopeAliasMap);
-            }
-
-            // Step 6: Extract HAVING conditions
-            if (querySpec.HavingClause != null)
-            {
-                var havingVisitor = new ConditionExtractorVisitor(ConditionSource.Having);
-                querySpec.HavingClause.Accept(havingVisitor);
-                result.HavingConditions = FilterConditionsToScope(havingVisitor.Conditions, outerScopeAliasMap);
-            }
+            // Step 5/6: Extract exact WHERE/HAVING predicate scopes
+            AnalyzePredicateScopes(querySpec, result, predicateBuilder, outerScopeAliasMap, "Main");
 
             // Step 7: Extract GROUP BY
             if (querySpec.GroupByClause != null)
@@ -100,7 +88,10 @@ namespace SqlTestDataGenerator.Parsing
             ExtractSelectColumns(querySpec, result);
 
             // Step 10.5: Merge execution constraints from CTE query bodies.
-            AnalyzeCteQuerySpecifications(fragment, result);
+            AnalyzeCteQuerySpecifications(fragment, result, predicateBuilder);
+
+            // Step 10.6: Link outer EXISTS/IN predicate leaves back to extracted subqueries.
+            AttachSubqueryPredicateKeys(result);
 
             // Step 11: DISTINCT / TOP
             result.HasDistinct = querySpec.UniqueRowFilter == UniqueRowFilter.Distinct;
@@ -321,17 +312,24 @@ namespace SqlTestDataGenerator.Parsing
             }
         }
 
-        private void AnalyzeCteQuerySpecifications(TSqlFragment fragment, ParsedQuery result)
+        private void AnalyzeCteQuerySpecifications(
+            TSqlFragment fragment,
+            ParsedQuery result,
+            PredicateTreeBuilder predicateBuilder)
         {
-            foreach (var cteSpec in ExtractCteQuerySpecifications(fragment))
+            foreach (var cte in ExtractCteQuerySpecifications(fragment))
             {
-                AnalyzeQuerySpecification(cteSpec, result);
+                AnalyzeQuerySpecification(cte.Name, cte.Spec, result, predicateBuilder);
             }
 
             DeduplicateAnalysis(result);
         }
 
-        private void AnalyzeQuerySpecification(QuerySpecification spec, ParsedQuery result)
+        private void AnalyzeQuerySpecification(
+            string scopeLabel,
+            QuerySpecification spec,
+            ParsedQuery result,
+            PredicateTreeBuilder predicateBuilder)
         {
             var scopeAliasMap = BuildScopeAliasMap(spec.FromClause);
             var joinVisitor = new JoinExtractorVisitor();
@@ -343,21 +341,15 @@ namespace SqlTestDataGenerator.Parsing
 
             if (spec.WhereClause != null)
             {
-                var whereVisitor = new ConditionExtractorVisitor(ConditionSource.Where);
-                spec.WhereClause.Accept(whereVisitor);
-                result.WhereConditions.AddRange(FilterConditionsToScope(whereVisitor.Conditions, scopeAliasMap));
-
                 var subqueryVisitor = new SubqueryExtractorVisitor();
                 spec.WhereClause.Accept(subqueryVisitor);
                 result.Subqueries.AddRange(subqueryVisitor.Subqueries);
             }
 
+            AnalyzePredicateScopes(spec, result, predicateBuilder, scopeAliasMap, scopeLabel);
+
             if (spec.HavingClause != null)
             {
-                var havingVisitor = new ConditionExtractorVisitor(ConditionSource.Having);
-                spec.HavingClause.Accept(havingVisitor);
-                result.HavingConditions.AddRange(FilterConditionsToScope(havingVisitor.Conditions, scopeAliasMap));
-
                 var subqueryVisitor = new SubqueryExtractorVisitor();
                 spec.HavingClause.Accept(subqueryVisitor);
                 result.Subqueries.AddRange(subqueryVisitor.Subqueries);
@@ -375,7 +367,7 @@ namespace SqlTestDataGenerator.Parsing
             result.Aggregates.AddRange(aggregateVisitor.Aggregates);
         }
 
-        private IEnumerable<QuerySpecification> ExtractCteQuerySpecifications(TSqlFragment fragment)
+        private IEnumerable<(string Name, QuerySpecification Spec)> ExtractCteQuerySpecifications(TSqlFragment fragment)
         {
             if (fragment is not TSqlScript script)
                 yield break;
@@ -392,9 +384,10 @@ namespace SqlTestDataGenerator.Parsing
 
                     foreach (var cte in selectStmt.WithCtesAndXmlNamespaces.CommonTableExpressions)
                     {
+                        var cteName = cte.ExpressionName?.Value ?? "CTE";
                         foreach (var spec in EnumerateQuerySpecifications(cte.QueryExpression))
                         {
-                            yield return spec;
+                            yield return ($"CTE {cteName}", spec);
                         }
                     }
                 }
@@ -453,6 +446,38 @@ namespace SqlTestDataGenerator.Parsing
                 .ToList();
 
             UpdateTableRolesFromJoins(result);
+        }
+
+        private void AnalyzePredicateScopes(
+            QuerySpecification spec,
+            ParsedQuery result,
+            PredicateTreeBuilder predicateBuilder,
+            IReadOnlyDictionary<string, string> scopeAliasMap,
+            string scopeLabel)
+        {
+            if (spec.WhereClause != null)
+            {
+                var whereScope = predicateBuilder.BuildScope(
+                    spec.WhereClause.SearchCondition,
+                    ConditionSource.Where,
+                    $"{NormalizeScopeLabel(scopeLabel)}:where",
+                    $"{scopeLabel} WHERE");
+                whereScope.Conditions = FilterConditionsToScope(whereScope.Conditions, scopeAliasMap);
+                result.PredicateScopes.Add(whereScope);
+                result.WhereConditions.AddRange(whereScope.Conditions);
+            }
+
+            if (spec.HavingClause != null)
+            {
+                var havingScope = predicateBuilder.BuildScope(
+                    spec.HavingClause.SearchCondition,
+                    ConditionSource.Having,
+                    $"{NormalizeScopeLabel(scopeLabel)}:having",
+                    $"{scopeLabel} HAVING");
+                havingScope.Conditions = FilterConditionsToScope(havingScope.Conditions, scopeAliasMap);
+                result.PredicateScopes.Add(havingScope);
+                result.HavingConditions.AddRange(havingScope.Conditions);
+            }
         }
 
         private List<SubqueryInfo> NormalizeSubqueries(IEnumerable<SubqueryInfo> subqueries)
@@ -547,6 +572,75 @@ namespace SqlTestDataGenerator.Parsing
             return scopeAliasMap.ContainsKey(condition.TableAlias);
         }
 
+        private void AttachSubqueryPredicateKeys(ParsedQuery result)
+        {
+            var rootConditionLookup = result.PredicateScopes
+                .SelectMany(s => s.Conditions)
+                .Where(c => c.IsSubqueryPredicate)
+                .ToList();
+
+            AttachSubqueryPredicateKeys(result.Subqueries, rootConditionLookup);
+        }
+
+        private void AttachSubqueryPredicateKeys(
+            IEnumerable<SubqueryInfo> subqueries,
+            IReadOnlyList<ConditionInfo> candidateConditions)
+        {
+            foreach (var subquery in subqueries)
+            {
+                var match = candidateConditions.FirstOrDefault(c =>
+                    IsMatchingSubqueryPredicate(c, subquery));
+
+                if (match != null)
+                {
+                    subquery.PredicateConditionKey = match.Key;
+                }
+
+                var nestedConditions = subquery.WherePredicateScope?.Conditions
+                    .Where(c => c.IsSubqueryPredicate)
+                    .ToList() ?? new List<ConditionInfo>();
+
+                AttachSubqueryPredicateKeys(subquery.NestedSubqueries, nestedConditions);
+            }
+        }
+
+        private static bool IsMatchingSubqueryPredicate(ConditionInfo condition, SubqueryInfo subquery)
+        {
+            if (!string.Equals(condition.SubquerySql, subquery.SubquerySql, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (!IsMatchingSubqueryOperator(condition.Operator, subquery.Operator))
+                return false;
+
+            if (subquery.Operator is SubqueryOperator.In or SubqueryOperator.NotIn)
+            {
+                return string.Equals(condition.TableAlias, subquery.ParentTableAlias, StringComparison.OrdinalIgnoreCase) &&
+                       string.Equals(condition.ColumnName, subquery.ParentColumnName, StringComparison.OrdinalIgnoreCase);
+            }
+
+            return true;
+        }
+
+        private static bool IsMatchingSubqueryOperator(ComparisonOp conditionOperator, SubqueryOperator subqueryOperator)
+        {
+            return (conditionOperator, subqueryOperator) switch
+            {
+                (ComparisonOp.In, SubqueryOperator.In) => true,
+                (ComparisonOp.NotIn, SubqueryOperator.NotIn) => true,
+                (ComparisonOp.Exists, SubqueryOperator.Exists) => true,
+                (ComparisonOp.NotExists, SubqueryOperator.NotExists) => true,
+                _ => false
+            };
+        }
+
+        private static string NormalizeScopeLabel(string value)
+        {
+            return new string(value
+                .Where(ch => char.IsLetterOrDigit(ch))
+                .ToArray())
+                .ToLowerInvariant();
+        }
+
         private static string BuildJoinKey(JoinInfo join)
         {
             return string.Join("|",
@@ -617,7 +711,7 @@ namespace SqlTestDataGenerator.Parsing
         private void ValidateAndWarn(ParsedQuery result)
         {
             // Check for OR conditions (harder to generate data for)
-            if (result.WhereConditions.Any(c => c.LogicalOperator == LogicalOp.Or))
+            if (result.PredicateScopes.Any(s => ContainsOperator(s.Root, LogicalOp.Or)))
             {
                 result.Warnings.Add("Query contains OR conditions — multiple data paths may be needed.");
             }
@@ -639,6 +733,17 @@ namespace SqlTestDataGenerator.Parsing
             {
                 result.Warnings.Add("Nested subqueries detected — all levels will be analyzed.");
             }
+        }
+
+        private static bool ContainsOperator(PredicateExpression? expression, LogicalOp op)
+        {
+            return expression switch
+            {
+                PredicateBinaryExpression binary when binary.Operator == op => true,
+                PredicateBinaryExpression binary => ContainsOperator(binary.Left, op) || ContainsOperator(binary.Right, op),
+                PredicateNotExpression notExpr => ContainsOperator(notExpr.Inner, op),
+                _ => false
+            };
         }
 
         private bool IsAggregateFunction(string name) =>

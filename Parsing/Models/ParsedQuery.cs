@@ -21,6 +21,9 @@ namespace SqlTestDataGenerator.Parsing.Models
         /// <summary>HAVING clause conditions</summary>
         public List<ConditionInfo> HavingConditions { get; set; } = new();
 
+        /// <summary>Exact predicate scopes with boolean structure preserved.</summary>
+        public List<PredicateScope> PredicateScopes { get; set; } = new();
+
         /// <summary>GROUP BY columns (alias.column format)</summary>
         public List<GroupByColumn> GroupByColumns { get; set; } = new();
 
@@ -66,6 +69,13 @@ namespace SqlTestDataGenerator.Parsing.Models
         {
             var m = AliasToTableMap;
             return m.TryGetValue(aliasOrName, out var name) ? name : aliasOrName;
+        }
+
+        public IEnumerable<ConditionInfo> EnumerateScopeConditions(ConditionSource source)
+        {
+            return PredicateScopes
+                .Where(s => s.Source == source)
+                .SelectMany(s => s.Conditions);
         }
     }
 

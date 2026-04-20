@@ -1,5 +1,6 @@
 using SqlTestDataGenerator.DataGeneration.Models;
 using SqlTestDataGenerator.DataGeneration.ValueGenerators;
+using SqlTestDataGenerator.Parsing;
 using SqlTestDataGenerator.Parsing.Models;
 using SqlTestDataGenerator.Schema.Models;
 
@@ -188,8 +189,6 @@ namespace SqlTestDataGenerator.DataGeneration
                 currentId += rowCount + 1;
             }
 
-            // Handle subquery support data
-            GenerateSubquerySupportData(scenario, query, schemas, ref currentId, satisfy: true);
         }
 
         // ─── WHERE negative: one condition violated ─────────────────────
@@ -202,10 +201,6 @@ namespace SqlTestDataGenerator.DataGeneration
             var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
-
-            // Find the condition being tested
-            var testedCondition = query.WhereConditions
-                .FirstOrDefault(c => c.ToString() == scenario.TestedCondition);
 
             foreach (var tableName in insertOrder)
             {
@@ -229,15 +224,9 @@ namespace SqlTestDataGenerator.DataGeneration
                     {
                         if (col.IsComputed) continue;
 
-                        // Check if this column is the one being tested
-                        bool isTestedColumn = testedCondition != null &&
-                            col.ColumnName.Equals(testedCondition.ColumnName, StringComparison.OrdinalIgnoreCase) &&
-                            (string.IsNullOrEmpty(testedCondition.TableAlias) ||
-                             alias.Equals(testedCondition.TableAlias, StringComparison.OrdinalIgnoreCase));
-
                         var value = GenerateColumnValue(scenario, col, alias, query, schemas,
                             tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
-                            rowId, satisfy: !isTestedColumn, rowIdx, includeSubqueryConditions: true);
+                            rowId, satisfy: true, rowIdx, includeSubqueryConditions: true);
                         row.SetValue(col.ColumnName, value);
                     }
 
@@ -248,6 +237,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
                 currentId += rowCount + 1;
             }
+
         }
 
         // ─── HAVING negative: aggregate condition fails ─────────────────
@@ -261,8 +251,11 @@ namespace SqlTestDataGenerator.DataGeneration
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
-            var testedCondition = query.HavingConditions
-                .FirstOrDefault(c => c.ToString() == scenario.TestedCondition);
+            var testedConditions = query.EnumerateScopeConditions(ConditionSource.Having)
+                .Where(c => !GetDesiredTruthForCondition(scenario, c, true))
+                .ToList();
+
+            var countRowOverrides = BuildCountNegativeRowOverrides(query, schemas, testedConditions);
 
             // For HAVING failures, we create fewer rows or rows with small values
             foreach (var tableName in insertOrder)
@@ -278,7 +271,15 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 // For COUNT fail: create only 1 row (instead of the required minimum)
                 // For SUM fail: create rows with very small values
-                int rowCount = isAggregateSource ? 1 : GetRequestedRowCount();
+                int rowCount = isAggregateSource && testedConditions.Any(c => c.AggregateFunc == AggregateFunction.Count)
+                    ? 1
+                    : GetRequestedRowCount();
+
+                if (countRowOverrides.TryGetValue(tableName, out var overriddenCount))
+                {
+                    rowCount = overriddenCount;
+                }
+
                 rowCount = ApplySelfReferenceMinimumRowCount(tableName, rowCount, selfReferencePlans);
 
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
@@ -292,8 +293,9 @@ namespace SqlTestDataGenerator.DataGeneration
 
                         // For SUM/AVG failures, use tiny values for the aggregate column
                         bool useSmallValue = isAggregateSource &&
-                            testedCondition?.AggregateFunc is AggregateFunction.Sum or AggregateFunction.Avg &&
-                            IsPartOfAggregateExpression(col.ColumnName, alias, query);
+                            testedConditions.Any(c =>
+                                c.AggregateFunc is AggregateFunction.Sum or AggregateFunction.Avg &&
+                                IsConditionTargetingColumn(query, c, alias, col.ColumnName));
 
                         object? value;
                         if (useSmallValue && col.TypeCategory is DataTypeCategory.Decimal or DataTypeCategory.Integer or DataTypeCategory.Float)
@@ -317,6 +319,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
                 currentId += rowCount + 1;
             }
+
         }
 
         // ─── JOIN miss: LEFT/RIGHT join with no match ───────────────────
@@ -332,7 +335,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
             // Find which join is being tested
             var testedJoin = query.Joins
-                .FirstOrDefault(j => scenario.TestedCondition?.Contains(j.RightTableAlias) == true);
+                .FirstOrDefault(j => BuildJoinScenarioKey(j).Equals(scenario.JoinKey, StringComparison.OrdinalIgnoreCase));
 
             string? missTableAlias = testedJoin?.RightTableAlias;
             string? missTableName = missTableAlias != null ? query.ResolveAlias(missTableAlias) : null;
@@ -398,8 +401,6 @@ namespace SqlTestDataGenerator.DataGeneration
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId,
             Dictionary<string, SelfReferencePlan> selfReferencePlans)
         {
-            // Similar to positive but the subquery-referenced column has a value
-            // that does NOT appear in the subquery result
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
@@ -429,7 +430,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                         var value = GenerateColumnValue(scenario, col, alias, query, schemas,
                             tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
-                            rowId, satisfy: true, rowIdx, includeSubqueryConditions: false);
+                            rowId, satisfy: true, rowIdx, includeSubqueryConditions: true);
                         row.SetValue(col.ColumnName, value);
                     }
 
@@ -441,7 +442,6 @@ namespace SqlTestDataGenerator.DataGeneration
                 currentId += rowCount + 1;
             }
 
-            // DO NOT generate subquery support data → the IN/EXISTS condition will fail
         }
 
         // ─── Boundary: values at exact boundary ────────────────────────
@@ -456,10 +456,20 @@ namespace SqlTestDataGenerator.DataGeneration
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             int currentId = baseId;
 
-            var testedCondition = query.WhereConditions
-                .FirstOrDefault(c => c.ToString() == scenario.TestedCondition);
+            var testedCondition = scenario.BoundaryConditionKey == null
+                ? null
+                : FindConditionByKey(query, scenario.BoundaryConditionKey);
 
             int rowMultiplier = DetermineRowMultiplier(query);
+            int? countBoundaryRows = testedCondition != null &&
+                                     testedCondition.AggregateFunc is AggregateFunction.Count or AggregateFunction.CountDistinct &&
+                                     TryDetermineRequiredCountRows(testedCondition, out var requiredBoundaryRows)
+                ? requiredBoundaryRows
+                : null;
+            var countBoundaryTargetTable = testedCondition != null &&
+                                           testedCondition.AggregateFunc is AggregateFunction.Count or AggregateFunction.CountDistinct
+                ? query.ResolveAlias(testedCondition.TableAlias)
+                : null;
 
             foreach (var tableName in insertOrder)
             {
@@ -474,6 +484,12 @@ namespace SqlTestDataGenerator.DataGeneration
                 int rowCount = isAggSource
                     ? Math.Max(rowMultiplier, GetRequestedRowCount())
                     : GetRequestedRowCount();
+                if (countBoundaryRows.HasValue &&
+                    !string.IsNullOrWhiteSpace(countBoundaryTargetTable) &&
+                    tableName.Equals(countBoundaryTargetTable, StringComparison.OrdinalIgnoreCase))
+                {
+                    rowCount = countBoundaryRows.Value;
+                }
                 rowCount = ApplySelfReferenceMinimumRowCount(tableName, rowCount, selfReferencePlans);
 
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
@@ -486,9 +502,8 @@ namespace SqlTestDataGenerator.DataGeneration
                         if (col.IsComputed) continue;
 
                         bool isBoundaryColumn = testedCondition != null &&
-                            col.ColumnName.Equals(testedCondition.ColumnName, StringComparison.OrdinalIgnoreCase) &&
-                            (string.IsNullOrEmpty(testedCondition.TableAlias) ||
-                             alias.Equals(testedCondition.TableAlias, StringComparison.OrdinalIgnoreCase));
+                            testedCondition.AggregateFunc is not AggregateFunction.Count and not AggregateFunction.CountDistinct &&
+                            IsConditionTargetingColumn(query, testedCondition, alias, col.ColumnName);
 
                         object? value;
                         if (isBoundaryColumn)
@@ -513,7 +528,6 @@ namespace SqlTestDataGenerator.DataGeneration
                 currentId += rowCount + 1;
             }
 
-            GenerateSubquerySupportData(scenario, query, schemas, ref currentId, satisfy: true);
         }
 
         // ═════════════════════════════════════════════════════════════════
@@ -595,73 +609,45 @@ namespace SqlTestDataGenerator.DataGeneration
                 return rowId;
             }
 
-            // 3. Check if this column has a WHERE condition
-            var condition = FindApplicableCondition(
-                query.WhereConditions,
+            // 3. Resolve all direct column predicates together (instead of first match only).
+            var conditionTargets = GetApplicableConditionTargets(
+                scenario,
                 query,
+                query.EnumerateScopeConditions(ConditionSource.Where),
                 currentTableName,
                 tableAlias,
                 col.ColumnName,
                 excludeHasSubquery: true);
 
-            if (condition != null)
+            if (includeSubqueryConditions)
             {
-                return GenerateConditionValue(
+                conditionTargets.AddRange(FindApplicableSubqueryConditionTargets(
+                    scenario,
+                    query,
+                    currentTableName,
+                    tableAlias,
+                    col.ColumnName));
+            }
+
+            conditionTargets.AddRange(GetApplicableAggregateTargets(
+                scenario,
+                query,
+                tableAlias,
+                col.ColumnName));
+
+            if (conditionTargets.Count > 0)
+            {
+                var resolvedValue = ResolveColumnValueFromTargets(
                     scenario,
                     query,
                     col,
                     generator,
-                    condition,
-                    tableRowIds,
-                    satisfy);
-            }
+                    conditionTargets,
+                    tableRowIds);
 
-            // 3.25. Check table-local conditions that live inside EXISTS/IN subqueries
-            if (includeSubqueryConditions)
-            {
-                var subqueryConditionMatch = FindApplicableSubqueryConditionMatch(
-                    query,
-                    currentTableName,
-                    tableAlias,
-                    col.ColumnName);
-
-                if (subqueryConditionMatch != null)
+                if (resolvedValue.Resolved)
                 {
-                    return GenerateConditionValue(
-                        scenario,
-                        query,
-                        col,
-                        generator,
-                        subqueryConditionMatch.Condition,
-                        tableRowIds,
-                        satisfy: subqueryConditionMatch.ShouldSatisfy);
-                }
-            }
-
-            // 3.5 Check HAVING aggregate conditions for positive-path generation
-            if (satisfy)
-            {
-                var aggregateCondition = FindApplicableCondition(
-                    query.HavingConditions.Where(c => c.AggregateFunc.HasValue),
-                    query,
-                    currentTableName,
-                    tableAlias,
-                    col.ColumnName,
-                    excludeHasSubquery: false);
-
-                if (aggregateCondition != null)
-                {
-                    var opStr = ConditionOpToString(aggregateCondition.Operator);
-
-                    if (aggregateCondition.Operator == ComparisonOp.Between)
-                    {
-                        return GenerateBetweenValue(col, aggregateCondition.Value, aggregateCondition.SecondValue, inside: true);
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(aggregateCondition.Value))
-                    {
-                        return generator.GenerateSatisfying(col, opStr, aggregateCondition.Value);
-                    }
+                    return resolvedValue.Value;
                 }
             }
 
@@ -699,17 +685,10 @@ namespace SqlTestDataGenerator.DataGeneration
             ColumnSchema col,
             IValueGenerator generator,
             ConditionInfo condition,
-            Dictionary<string, List<int>> tableRowIds,
-            bool satisfy)
+            bool satisfy,
+            object? comparisonValue = null)
         {
-            if (condition.IsColumnComparison &&
-                TryResolveSubqueryComparisonValue(
-                    scenario,
-                    query,
-                    condition,
-                    tableRowIds,
-                    query.AliasToTableMap,
-                    out var comparisonValue))
+            if (condition.IsColumnComparison && comparisonValue != null)
             {
                 if (satisfy)
                 {
@@ -757,72 +736,124 @@ namespace SqlTestDataGenerator.DataGeneration
                 : generator.GenerateViolating(col, opStr, condition.Value);
         }
 
-        private static ConditionInfo? FindApplicableCondition(
-            IEnumerable<ConditionInfo> conditions,
+        private List<ColumnConditionTarget> GetApplicableConditionTargets(
+            BranchScenario scenario,
             ParsedQuery query,
+            IEnumerable<ConditionInfo> conditions,
             string tableName,
             string tableAlias,
             string columnName,
             bool excludeHasSubquery)
         {
-            return conditions.FirstOrDefault(c =>
-                c.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase) &&
-                (!excludeHasSubquery || !c.HasSubquery) &&
-                MatchesConditionTarget(query, c.TableAlias, tableName, tableAlias));
+            var targets = new List<ColumnConditionTarget>();
+
+            foreach (var condition in conditions)
+            {
+                if (!condition.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (excludeHasSubquery && condition.HasSubquery)
+                    continue;
+                if (!MatchesConditionTarget(query, condition.TableAlias, tableName, tableAlias))
+                    continue;
+
+                targets.Add(new ColumnConditionTarget(
+                    condition,
+                    GetDesiredTruthForCondition(scenario, condition, defaultTruth: true)));
+            }
+
+            return targets;
         }
 
-        private SubqueryConditionMatch? FindApplicableSubqueryConditionMatch(
+        private List<ColumnConditionTarget> GetApplicableAggregateTargets(
+            BranchScenario scenario,
+            ParsedQuery query,
+            string tableAlias,
+            string columnName)
+        {
+            return query.EnumerateScopeConditions(ConditionSource.Having)
+                .Where(c =>
+                    c.AggregateFunc.HasValue &&
+                    c.AggregateFunc is not AggregateFunction.Count and not AggregateFunction.CountDistinct &&
+                    IsConditionTargetingColumn(query, c, tableAlias, columnName))
+                .Select(c => new ColumnConditionTarget(
+                    c,
+                    GetDesiredTruthForCondition(scenario, c, defaultTruth: true)))
+                .ToList();
+        }
+
+        private List<ColumnConditionTarget> FindApplicableSubqueryConditionTargets(
+            BranchScenario scenario,
             ParsedQuery query,
             string tableName,
             string tableAlias,
             string columnName)
         {
-            var matches = new List<SubqueryConditionMatch>();
-            CollectSubqueryConditionMatches(
+            var targets = new List<ColumnConditionTarget>();
+            CollectSubqueryConditionTargets(
                 query.Subqueries,
+                scenario,
                 query,
                 tableName,
                 tableAlias,
                 columnName,
-                desiredPredicateTruth: true,
-                matches);
+                query.AliasToTableMap,
+                parentTruthMap: null,
+                targets);
 
-            return matches
-                .FirstOrDefault(m => m.ShouldSatisfy) ??
-                   matches.FirstOrDefault(m => !m.Condition.IsColumnComparison) ??
-                   matches.FirstOrDefault();
+            return targets;
         }
 
-        private static void CollectSubqueryConditionMatches(
+        private void CollectSubqueryConditionTargets(
             IEnumerable<SubqueryInfo> subqueries,
+            BranchScenario scenario,
             ParsedQuery query,
             string tableName,
             string tableAlias,
             string columnName,
-            bool desiredPredicateTruth,
-            List<SubqueryConditionMatch> matches)
+            IReadOnlyDictionary<string, string> aliasMap,
+            IReadOnlyDictionary<string, bool>? parentTruthMap,
+            List<ColumnConditionTarget> targets)
         {
             foreach (var subquery in subqueries)
             {
-                bool internalRowShouldMatch = desiredPredicateTruth ^ IsNegativeSubqueryOperator(subquery.Operator);
+                var predicateTruth = ResolveSubqueryPredicateTruth(scenario, subquery, parentTruthMap);
+                var internalTruthMap = BuildSubqueryInternalTruthMap(subquery, predicateTruth);
+                var localAliasMap = ExtendAliasMap(
+                    new Dictionary<string, string>(aliasMap, StringComparer.OrdinalIgnoreCase),
+                    subquery.Tables);
 
-                foreach (var condition in subquery.Conditions)
+                foreach (var condition in subquery.Conditions.Where(c =>
+                    c.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase) &&
+                    MatchesConditionTarget(localAliasMap, c.TableAlias, tableName, tableAlias)))
                 {
-                    if (condition.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase) &&
-                        MatchesConditionTarget(query, condition.TableAlias, tableName, tableAlias))
+                    var desiredTruth = internalTruthMap.TryGetValue(condition.Key, out var mappedTruth)
+                        ? mappedTruth
+                        : true;
+                    object? comparisonValue = null;
+                    if (condition.IsColumnComparison)
                     {
-                        matches.Add(new SubqueryConditionMatch(condition, internalRowShouldMatch));
+                        TryResolveSubqueryComparisonValue(
+                            scenario,
+                            query,
+                            condition,
+                            new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase),
+                            localAliasMap,
+                            out comparisonValue);
                     }
+
+                    targets.Add(new ColumnConditionTarget(condition, desiredTruth, comparisonValue));
                 }
 
-                CollectSubqueryConditionMatches(
+                CollectSubqueryConditionTargets(
                     subquery.NestedSubqueries,
+                    scenario,
                     query,
                     tableName,
                     tableAlias,
                     columnName,
-                    internalRowShouldMatch,
-                    matches);
+                    localAliasMap,
+                    internalTruthMap,
+                    targets);
             }
         }
 
@@ -845,16 +876,323 @@ namespace SqlTestDataGenerator.DataGeneration
             return resolved.Equals(tableName, StringComparison.OrdinalIgnoreCase);
         }
 
-        private sealed class SubqueryConditionMatch
+        private static bool MatchesConditionTarget(
+            IReadOnlyDictionary<string, string> aliasMap,
+            string? conditionTableAlias,
+            string tableName,
+            string tableAlias)
         {
-            public SubqueryConditionMatch(ConditionInfo condition, bool shouldSatisfy)
+            if (string.IsNullOrWhiteSpace(conditionTableAlias))
+                return true;
+
+            if (conditionTableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (aliasMap.TryGetValue(conditionTableAlias, out var resolved))
+            {
+                return resolved.Equals(tableName, StringComparison.OrdinalIgnoreCase);
+            }
+
+            return conditionTableAlias.Equals(tableName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private ResolvedColumnValue ResolveColumnValueFromTargets(
+            BranchScenario scenario,
+            ParsedQuery query,
+            ColumnSchema col,
+            IValueGenerator generator,
+            IReadOnlyCollection<ColumnConditionTarget> targets,
+            Dictionary<string, List<int>> tableRowIds)
+        {
+            var candidates = new List<object?>();
+
+            foreach (var target in targets)
+            {
+                var comparisonValue = target.ComparisonValue;
+                if (target.Condition.IsColumnComparison && comparisonValue == null)
+                {
+                    TryResolveSubqueryComparisonValue(
+                        scenario,
+                        query,
+                        target.Condition,
+                        tableRowIds,
+                        query.AliasToTableMap,
+                        out comparisonValue);
+                }
+
+                candidates.Add(GenerateConditionValue(
+                    scenario,
+                    query,
+                    col,
+                    generator,
+                    target.Condition,
+                    target.DesiredTruth,
+                    comparisonValue));
+
+                if (target.Condition.Operator == ComparisonOp.Between)
+                {
+                    candidates.Add(GenerateBetweenValue(col, target.Condition.Value, target.Condition.SecondValue, inside: target.DesiredTruth));
+                }
+            }
+
+            candidates.Add(generator.GenerateDefault(col));
+            if (col.IsNullable)
+            {
+                candidates.Add(null);
+            }
+
+            foreach (var candidate in DeduplicateCandidates(candidates))
+            {
+                if (targets.All(target => EvaluateConditionTarget(candidate, target, col, generator)))
+                {
+                    return new ResolvedColumnValue(true, candidate);
+                }
+            }
+
+            return new ResolvedColumnValue(false, null);
+        }
+
+        private static IEnumerable<object?> DeduplicateCandidates(IEnumerable<object?> values)
+        {
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var value in values)
+            {
+                var key = value switch
+                {
+                    null => "<NULL>",
+                    DateTime dt => dt.ToString("O"),
+                    DateTimeOffset dto => dto.ToString("O"),
+                    TimeSpan ts => ts.ToString("c"),
+                    _ => value.ToString() ?? string.Empty
+                };
+
+                if (seen.Add(key))
+                    yield return value;
+            }
+        }
+
+        private bool EvaluateConditionTarget(
+            object? candidate,
+            ColumnConditionTarget target,
+            ColumnSchema col,
+            IValueGenerator generator)
+        {
+            var actualTruth = EvaluateCondition(candidate, target.Condition, target.ComparisonValue, col, generator);
+            return actualTruth == target.DesiredTruth;
+        }
+
+        private bool EvaluateCondition(
+            object? candidate,
+            ConditionInfo condition,
+            object? comparisonValue,
+            ColumnSchema col,
+            IValueGenerator generator)
+        {
+            switch (condition.Operator)
+            {
+                case ComparisonOp.IsNull:
+                    return candidate == null;
+                case ComparisonOp.IsNotNull:
+                    return candidate != null;
+                case ComparisonOp.In:
+                    return condition.InValues
+                        .Select(v => generator.GenerateFromLiteral(v, col))
+                        .Any(v => CompareScalarValues(candidate, v, col) == 0);
+                case ComparisonOp.NotIn:
+                    return condition.InValues
+                        .Select(v => generator.GenerateFromLiteral(v, col))
+                        .All(v => CompareScalarValues(candidate, v, col) != 0);
+                case ComparisonOp.Between:
+                    var lower = generator.GenerateFromLiteral(condition.Value, col);
+                    var upper = generator.GenerateFromLiteral(condition.SecondValue, col);
+                    return CompareScalarValues(candidate, lower, col) >= 0 &&
+                           CompareScalarValues(candidate, upper, col) <= 0;
+                case ComparisonOp.Like:
+                    return EvaluateLike(candidate?.ToString() ?? string.Empty, condition.LikePattern);
+                default:
+                    var rightValue = condition.IsColumnComparison
+                        ? comparisonValue
+                        : generator.GenerateFromLiteral(condition.Value, col);
+                    var comparison = CompareScalarValues(candidate, rightValue, col);
+                    return condition.Operator switch
+                    {
+                        ComparisonOp.Equal => comparison == 0,
+                        ComparisonOp.NotEqual => comparison != 0,
+                        ComparisonOp.GreaterThan => comparison > 0,
+                        ComparisonOp.GreaterThanOrEqual => comparison >= 0,
+                        ComparisonOp.LessThan => comparison < 0,
+                        ComparisonOp.LessThanOrEqual => comparison <= 0,
+                        _ => false
+                    };
+            }
+        }
+
+        private static bool EvaluateLike(string input, string pattern)
+        {
+            var regexPattern = "^" + System.Text.RegularExpressions.Regex.Escape(pattern)
+                .Replace("%", ".*")
+                .Replace("_", ".") + "$";
+
+            return System.Text.RegularExpressions.Regex.IsMatch(
+                input,
+                regexPattern,
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        }
+
+        private static int CompareScalarValues(object? left, object? right, ColumnSchema col)
+        {
+            if (left == null && right == null)
+                return 0;
+            if (left == null)
+                return -1;
+            if (right == null)
+                return 1;
+
+            return col.TypeCategory switch
+            {
+                DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float =>
+                    Convert.ToDecimal(left).CompareTo(Convert.ToDecimal(right)),
+                DataTypeCategory.Boolean =>
+                    Convert.ToBoolean(left).CompareTo(Convert.ToBoolean(right)),
+                DataTypeCategory.DateTime =>
+                    Convert.ToDateTime(left).CompareTo(Convert.ToDateTime(right)),
+                DataTypeCategory.Time =>
+                    ((TimeSpan)left).CompareTo((TimeSpan)right),
+                DataTypeCategory.DateTimeOffset =>
+                    ((DateTimeOffset)left).CompareTo((DateTimeOffset)right),
+                _ =>
+                    string.Compare(left.ToString(), right.ToString(), StringComparison.OrdinalIgnoreCase)
+            };
+        }
+
+        private static bool GetDesiredTruthForCondition(
+            BranchScenario scenario,
+            ConditionInfo condition,
+            bool defaultTruth)
+        {
+            return scenario.PredicateTruthMap.TryGetValue(condition.Key, out var desiredTruth)
+                ? desiredTruth
+                : defaultTruth;
+        }
+
+        private static ConditionInfo? FindConditionByKey(ParsedQuery query, string key)
+        {
+            return query.PredicateScopes
+                .SelectMany(s => s.Conditions)
+                .FirstOrDefault(c => c.Key.Equals(key, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static bool IsConditionTargetingColumn(
+            ParsedQuery query,
+            ConditionInfo condition,
+            string tableAlias,
+            string columnName)
+        {
+            return condition.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase) &&
+                   MatchesConditionTarget(
+                       query,
+                       condition.TableAlias,
+                       query.ResolveAlias(tableAlias),
+                       tableAlias);
+        }
+
+        private static string BuildJoinScenarioKey(JoinInfo join)
+        {
+            return string.Join("|",
+                join.Type,
+                join.LeftTableAlias,
+                join.LeftColumn,
+                join.RightTableAlias,
+                join.RightColumn);
+        }
+
+        private static bool ResolveSubqueryPredicateTruth(
+            BranchScenario scenario,
+            SubqueryInfo subquery,
+            IReadOnlyDictionary<string, bool>? parentTruthMap)
+        {
+            if (!string.IsNullOrWhiteSpace(subquery.PredicateConditionKey))
+            {
+                if (parentTruthMap != null &&
+                    parentTruthMap.TryGetValue(subquery.PredicateConditionKey, out var nestedTruth))
+                {
+                    return nestedTruth;
+                }
+
+                if (scenario.PredicateTruthMap.TryGetValue(subquery.PredicateConditionKey, out var scenarioTruth))
+                {
+                    return scenarioTruth;
+                }
+            }
+
+            return true;
+        }
+
+        private static Dictionary<string, bool> BuildSubqueryInternalTruthMap(
+            SubqueryInfo subquery,
+            bool predicateTruth)
+        {
+            if (subquery.WherePredicateScope?.Root == null)
+            {
+                return new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            var subqueryShouldReturnRows = predicateTruth ^ IsNegativeSubqueryOperator(subquery.Operator);
+            var assignments = PredicateTruthPlanner.GetMinimalAssignments(
+                subquery.WherePredicateScope.Root,
+                desiredTruth: subqueryShouldReturnRows);
+
+            if (assignments.Count == 0)
+            {
+                return new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            if (subqueryShouldReturnRows)
+            {
+                return new Dictionary<string, bool>(assignments[0], StringComparer.OrdinalIgnoreCase);
+            }
+
+            var conditionsByKey = subquery.WherePredicateScope.Conditions
+                .ToDictionary(c => c.Key, c => c, StringComparer.OrdinalIgnoreCase);
+
+            var best = assignments
+                .OrderBy(a => a.Count(kvp =>
+                    conditionsByKey.TryGetValue(kvp.Key, out var condition) &&
+                    condition.IsColumnComparison))
+                .ThenBy(a => a.Count)
+                .ThenBy(a => string.Join("|", a.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase).Select(k => $"{k.Key}:{k.Value}")), StringComparer.OrdinalIgnoreCase)
+                .First();
+
+            return new Dictionary<string, bool>(best, StringComparer.OrdinalIgnoreCase);
+        }
+
+        private sealed class ColumnConditionTarget
+        {
+            public ColumnConditionTarget(
+                ConditionInfo condition,
+                bool desiredTruth,
+                object? comparisonValue = null)
             {
                 Condition = condition;
-                ShouldSatisfy = shouldSatisfy;
+                DesiredTruth = desiredTruth;
+                ComparisonValue = comparisonValue;
             }
 
             public ConditionInfo Condition { get; }
-            public bool ShouldSatisfy { get; }
+            public bool DesiredTruth { get; }
+            public object? ComparisonValue { get; }
+        }
+
+        private readonly struct ResolvedColumnValue
+        {
+            public ResolvedColumnValue(bool resolved, object? value)
+            {
+                Resolved = resolved;
+                Value = value;
+            }
+
+            public bool Resolved { get; }
+            public object? Value { get; }
         }
 
         private sealed class SelfReferencePlan
@@ -929,10 +1267,12 @@ namespace SqlTestDataGenerator.DataGeneration
 
             foreach (var subquery in query.Subqueries)
             {
-                if (!satisfy) continue; // Don't create matching data if we want a miss
+                if (!satisfy)
+                    continue;
 
-                // For IN subqueries: create data that makes the parent value appear in the subquery result
-                if (subquery.Operator is SubqueryOperator.In or SubqueryOperator.Exists)
+                var predicateTruth = ResolveSubqueryPredicateTruth(scenario, subquery, parentTruthMap: null);
+                var shouldReturnRows = predicateTruth ^ IsNegativeSubqueryOperator(subquery.Operator);
+                if (shouldReturnRows)
                 {
                     GenerateSubqueryMatchData(
                         scenario,
@@ -982,12 +1322,6 @@ namespace SqlTestDataGenerator.DataGeneration
             {
                 if (!schemas.TryGetValue(tableName, out var schema))
                     continue;
-
-                if (scenario.TableRows.TryGetValue(tableName, out var existingRows) &&
-                    existingRows.Count > 0)
-                {
-                    continue;
-                }
 
                 var subTable = subquery.Tables
                     .FirstOrDefault(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase));
@@ -1042,6 +1376,7 @@ namespace SqlTestDataGenerator.DataGeneration
             int rowId)
         {
             var generator = _valueFactory.GetGenerator(column.TypeCategory);
+            var internalTruthMap = BuildSubqueryInternalTruthMap(subquery, predicateTruth: true);
 
             if (column.IsIdentity || column.IsPrimaryKey)
                 return rowId;
@@ -1057,34 +1392,59 @@ namespace SqlTestDataGenerator.DataGeneration
                     return null;
             }
 
-            var condition = FindSubqueryCondition(subquery, tableAlias, column.ColumnName);
-            if (condition != null)
-            {
-                if (condition.IsColumnComparison &&
-                    TryResolveSubqueryComparisonValue(
-                        scenario,
-                        query,
-                        condition,
-                        tableRowIds,
-                        aliasToTableMap,
-                        out var comparisonValue))
+            var conditionTargets = subquery.Conditions
+                .Where(c =>
+                    c.ColumnName.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase) &&
+                    (string.IsNullOrEmpty(c.TableAlias) ||
+                     c.TableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase)))
+                .Select(c =>
                 {
-                    return comparisonValue;
-                }
+                    object? comparisonValue = null;
+                    if (c.IsColumnComparison)
+                    {
+                        TryResolveSubqueryComparisonValue(
+                            scenario,
+                            query,
+                            c,
+                            tableRowIds,
+                            aliasToTableMap,
+                            out comparisonValue);
+                    }
 
-                var opStr = ConditionOpToString(condition.Operator);
-                if (condition.Operator == ComparisonOp.Between)
-                    return GenerateBetweenValue(column, condition.Value, condition.SecondValue, inside: true);
-                if (condition.Operator == ComparisonOp.In && condition.InValues.Any())
-                    return generator.GenerateFromLiteral(condition.InValues[0], column);
-                if (condition.Operator == ComparisonOp.IsNull)
-                    return null;
-                if (condition.Operator == ComparisonOp.IsNotNull)
-                    return generator.GenerateDefault(column);
-                if (condition.Operator == ComparisonOp.Like)
-                    return generator.GenerateSatisfying(column, "LIKE", condition.LikePattern);
-                if (!string.IsNullOrWhiteSpace(condition.Value))
-                    return generator.GenerateSatisfying(column, opStr, condition.Value);
+                    var desiredTruth = internalTruthMap.TryGetValue(c.Key, out var mappedTruth)
+                        ? mappedTruth
+                        : true;
+                    return new ColumnConditionTarget(c, desiredTruth, comparisonValue);
+                })
+                .ToList();
+
+            var globalSubqueryTargets = FindApplicableSubqueryConditionTargets(
+                scenario,
+                query,
+                schema.TableName,
+                tableAlias,
+                column.ColumnName);
+
+            foreach (var extraTarget in globalSubqueryTargets)
+            {
+                if (conditionTargets.All(t => !t.Condition.Key.Equals(extraTarget.Condition.Key, StringComparison.OrdinalIgnoreCase)))
+                {
+                    conditionTargets.Add(extraTarget);
+                }
+            }
+
+            if (conditionTargets.Count > 0)
+            {
+                var resolved = ResolveColumnValueFromTargets(
+                    scenario,
+                    query,
+                    column,
+                    generator,
+                    conditionTargets,
+                    tableRowIds);
+
+                if (resolved.Resolved)
+                    return resolved.Value;
             }
 
             if (!string.IsNullOrWhiteSpace(subquery.SelectColumn) &&
@@ -1101,18 +1461,6 @@ namespace SqlTestDataGenerator.DataGeneration
 
             return generator.GenerateDefault(column);
         }
-
-        private static ConditionInfo? FindSubqueryCondition(
-            SubqueryInfo subquery,
-            string tableAlias,
-            string columnName)
-        {
-            return subquery.Conditions.FirstOrDefault(c =>
-                c.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase) &&
-                (string.IsNullOrEmpty(c.TableAlias) ||
-                 c.TableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase)));
-        }
-
         private static Dictionary<string, List<int>> InitializeGeneratedIdMapFromScenario(
             BranchScenario scenario,
             Dictionary<string, TableSchema> schemas)
@@ -1356,6 +1704,95 @@ namespace SqlTestDataGenerator.DataGeneration
             };
 
             return true;
+        }
+
+        private static bool TryDetermineViolatingCountRows(ConditionInfo condition, out int violatingRows)
+        {
+            violatingRows = 0;
+
+            if (condition.Operator == ComparisonOp.Between)
+            {
+                if (int.TryParse(condition.Value, out var lowerBound))
+                {
+                    violatingRows = Math.Max(0, lowerBound - 1);
+                    return true;
+                }
+
+                return false;
+            }
+
+            if (!int.TryParse(condition.Value, out var n))
+                return false;
+
+            violatingRows = condition.Operator switch
+            {
+                ComparisonOp.GreaterThan => Math.Max(0, n),
+                ComparisonOp.GreaterThanOrEqual => Math.Max(0, n - 1),
+                ComparisonOp.Equal => Math.Max(0, n - 1),
+                ComparisonOp.NotEqual => Math.Max(0, n),
+                ComparisonOp.LessThan => Math.Max(0, n),
+                ComparisonOp.LessThanOrEqual => Math.Max(0, n + 1),
+                _ => Math.Max(0, n - 1)
+            };
+
+            return true;
+        }
+
+        private Dictionary<string, int> BuildCountNegativeRowOverrides(
+            ParsedQuery query,
+            Dictionary<string, TableSchema> schemas,
+            List<ConditionInfo> testedConditions)
+        {
+            var overrides = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var condition in testedConditions.Where(c => c.AggregateFunc is AggregateFunction.Count or AggregateFunction.CountDistinct))
+            {
+                var targetTable = query.ResolveAlias(condition.TableAlias);
+                if (string.IsNullOrWhiteSpace(targetTable))
+                    continue;
+
+                if (!TryDetermineViolatingCountRows(condition, out var violatingRows))
+                    continue;
+
+                overrides[targetTable] = violatingRows;
+
+                if (violatingRows == 0)
+                {
+                    foreach (var descendant in CollectDescendantTables(targetTable, schemas))
+                    {
+                        overrides[descendant] = 0;
+                    }
+                }
+            }
+
+            return overrides;
+        }
+
+        private static HashSet<string> CollectDescendantTables(
+            string rootTable,
+            Dictionary<string, TableSchema> schemas)
+        {
+            var descendants = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var queue = new Queue<string>();
+            queue.Enqueue(rootTable);
+
+            while (queue.Count > 0)
+            {
+                var current = queue.Dequeue();
+                foreach (var schema in schemas.Values)
+                {
+                    if (!schema.ForeignKeys.Any(fk => fk.ReferencedTable.Equals(current, StringComparison.OrdinalIgnoreCase)))
+                        continue;
+
+                    if (descendants.Add(schema.TableName))
+                    {
+                        queue.Enqueue(schema.TableName);
+                    }
+                }
+            }
+
+            descendants.Remove(rootTable);
+            return descendants;
         }
 
         private static int ApplySelfReferenceMinimumRowCount(
@@ -1727,7 +2164,12 @@ namespace SqlTestDataGenerator.DataGeneration
                 Description = source.Description,
                 Type = source.Type,
                 ExpectedToReturnRows = source.ExpectedToReturnRows,
-                TestedCondition = source.TestedCondition
+                TestedCondition = source.TestedCondition,
+                ScopeLabel = source.ScopeLabel,
+                BoundaryConditionKey = source.BoundaryConditionKey,
+                JoinKey = source.JoinKey,
+                PredicateTruthMap = new Dictionary<string, bool>(source.PredicateTruthMap, StringComparer.OrdinalIgnoreCase),
+                TestedConditions = new List<string>(source.TestedConditions)
             };
         }
     }

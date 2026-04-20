@@ -1,169 +1,217 @@
 using SqlTestDataGenerator.DataGeneration.Models;
+using SqlTestDataGenerator.Parsing;
 using SqlTestDataGenerator.Parsing.Models;
 
 namespace SqlTestDataGenerator.DataGeneration
 {
     /// <summary>
-    /// Analyzes a ParsedQuery and determines all branch scenarios that need test data.
-    /// Creates: positive path + negative for each WHERE condition + HAVING failures +
-    /// JOIN misses + subquery misses + boundary values.
+    /// Produces exact user-visible scenarios from the preserved boolean predicate structure.
+    /// Scenarios are derived from minimal truth assignments, so OR/NOT/subquery groups are
+    /// represented without over-generation or under-generation.
     /// </summary>
     public class BranchCoverageAnalyzer
     {
         private int _nextId = 1;
 
-        /// <summary>
-        /// Analyze the query and produce a list of scenarios to generate data for.
-        /// </summary>
         public List<BranchScenario> AnalyzeBranches(ParsedQuery query)
         {
             _nextId = 1;
             var scenarios = new List<BranchScenario>();
+            var conditionByKey = query.PredicateScopes
+                .SelectMany(s => s.Conditions)
+                .GroupBy(c => c.Key, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
 
-            // 1. POSITIVE: All conditions satisfied → query returns rows
-            scenarios.Add(CreatePositiveScenario(query));
+            var positiveTruthMap = BuildGlobalPositiveTruthMap(query.PredicateScopes);
+            scenarios.Add(CreatePositiveScenario(positiveTruthMap));
 
-            // 2. WHERE NEGATIVE: For each WHERE condition, create a scenario where it fails
-            foreach (var condition in query.WhereConditions)
+            foreach (var scope in query.PredicateScopes.Where(s => s.Root != null))
             {
-                // Skip conditions that are part of subqueries (handled separately)
-                if (condition.HasSubquery) continue;
-
-                scenarios.Add(CreateWhereNegativeScenario(condition, query));
-            }
-
-            // 3. JOIN MISS: For non-inner joins, create scenario with no match
-            foreach (var join in query.Joins.Where(j => j.Type != Parsing.Models.JoinType.Inner))
-            {
-                scenarios.Add(CreateJoinMissScenario(join, query));
-            }
-
-            // 4. HAVING NEGATIVE: For each HAVING condition, create a failure scenario
-            foreach (var condition in query.HavingConditions)
-            {
-                scenarios.Add(CreateHavingNegativeScenario(condition, query));
-            }
-
-            // 5. SUBQUERY MISS: For each IN/EXISTS subquery, create a miss scenario
-            foreach (var subquery in query.Subqueries)
-            {
-                scenarios.Add(CreateSubqueryMissScenario(subquery, query));
-            }
-
-            // 6. BOUNDARY: For range conditions, create boundary value scenarios
-            foreach (var condition in query.WhereConditions)
-            {
-                if (IsRangeCondition(condition))
+                var falseAssignments = PredicateTruthPlanner.GetMinimalAssignments(scope.Root, desiredTruth: false);
+                foreach (var assignment in falseAssignments)
                 {
-                    scenarios.Add(CreateBoundaryScenario(condition, query));
+                    var mergedTruthMap = MergeTruthMaps(positiveTruthMap, assignment);
+                    var scenarioType = ClassifyNegativeScenario(scope, assignment, conditionByKey);
+                    scenarios.Add(CreateNegativeScenario(scope, scenarioType, assignment, mergedTruthMap, conditionByKey));
+                }
+
+                foreach (var boundaryScenario in CreateBoundaryScenarios(scope, positiveTruthMap))
+                {
+                    scenarios.Add(boundaryScenario);
+                }
+            }
+
+            foreach (var join in query.Joins.Where(j => j.Type == JoinType.Left))
+            {
+                if (CanCreateJoinMissScenario(join, query))
+                {
+                    scenarios.Add(CreateJoinMissScenario(join, positiveTruthMap));
                 }
             }
 
             return DeduplicateAndRenumber(scenarios);
         }
 
-        // ═════════════════════════════════════════════════════════════════
-
-        private BranchScenario CreatePositiveScenario(ParsedQuery query)
+        private BranchScenario CreatePositiveScenario(Dictionary<string, bool> truthMap)
         {
             return new BranchScenario
             {
                 Id = _nextId++,
-                Name = "Positive - All conditions met",
-                Description = "All WHERE, HAVING, JOIN, and subquery conditions are satisfied. " +
-                              "The query should return data for this scenario.",
+                Name = "Positive: query returns rows",
+                Description = "Canonical positive path. Every required WHERE, HAVING, and subquery predicate is satisfied so the query should return rows.",
                 Type = ScenarioType.Positive,
-                ExpectedToReturnRows = true
-            };
-        }
-
-        private BranchScenario CreateWhereNegativeScenario(ConditionInfo condition, ParsedQuery query)
-        {
-            return new BranchScenario
-            {
-                Id = _nextId++,
-                Name = $"WHERE fail: {condition}",
-                Description = $"Condition [{condition}] is violated. Row should NOT appear in query results.",
-                Type = ScenarioType.WhereNegative,
-                ExpectedToReturnRows = false,
-                TestedCondition = condition.ToString()
-            };
-        }
-
-        private BranchScenario CreateJoinMissScenario(JoinInfo join, ParsedQuery query)
-        {
-            var joinTypeStr = join.Type switch
-            {
-                Parsing.Models.JoinType.Left => "LEFT",
-                Parsing.Models.JoinType.Right => "RIGHT",
-                Parsing.Models.JoinType.Full => "FULL",
-                _ => join.Type.ToString()
-            };
-
-            return new BranchScenario
-            {
-                Id = _nextId++,
-                Name = $"{joinTypeStr} JOIN miss: {join.RightTableAlias}",
-                Description = $"{joinTypeStr} JOIN on {join.RightTableAlias} has no matching row. " +
-                              $"Columns from {join.RightTableAlias} should be NULL.",
-                Type = ScenarioType.JoinMiss,
-                ExpectedToReturnRows = true, // LEFT/RIGHT/FULL joins still return rows
-                TestedCondition = $"{join.LeftTableAlias}.{join.LeftColumn} = {join.RightTableAlias}.{join.RightColumn}"
-            };
-        }
-
-        private BranchScenario CreateHavingNegativeScenario(ConditionInfo condition, ParsedQuery query)
-        {
-            return new BranchScenario
-            {
-                Id = _nextId++,
-                Name = $"HAVING fail: {condition}",
-                Description = $"HAVING condition [{condition}] is not met. " +
-                              "Group should be filtered out of results.",
-                Type = ScenarioType.HavingNegative,
-                ExpectedToReturnRows = false,
-                TestedCondition = condition.ToString()
-            };
-        }
-
-        private BranchScenario CreateSubqueryMissScenario(SubqueryInfo subquery, ParsedQuery query)
-        {
-            var opStr = subquery.Operator switch
-            {
-                SubqueryOperator.In => "IN",
-                SubqueryOperator.NotIn => "NOT IN",
-                SubqueryOperator.Exists => "EXISTS",
-                SubqueryOperator.NotExists => "NOT EXISTS",
-                _ => subquery.Operator.ToString()
-            };
-
-            return new BranchScenario
-            {
-                Id = _nextId++,
-                Name = $"Subquery miss: {subquery.ParentTableAlias}.{subquery.ParentColumnName} {opStr}",
-                Description = $"The value of {subquery.ParentTableAlias}.{subquery.ParentColumnName} " +
-                              $"does NOT match the {opStr} subquery result. Row should be excluded.",
-                Type = ScenarioType.SubqueryMiss,
-                ExpectedToReturnRows = false,
-                TestedCondition = $"{subquery.ParentTableAlias}.{subquery.ParentColumnName} {opStr} (subquery)"
-            };
-        }
-
-        private BranchScenario CreateBoundaryScenario(ConditionInfo condition, ParsedQuery query)
-        {
-            return new BranchScenario
-            {
-                Id = _nextId++,
-                Name = $"Boundary: {condition}",
-                Description = $"Boundary value test for [{condition}]. " +
-                              "Value is at the exact boundary of the condition.",
-                Type = ScenarioType.Boundary,
                 ExpectedToReturnRows = true,
-                TestedCondition = condition.ToString()
+                PredicateTruthMap = truthMap
             };
         }
 
-        private bool IsRangeCondition(ConditionInfo condition)
+        private BranchScenario CreateNegativeScenario(
+            PredicateScope scope,
+            ScenarioType type,
+            IReadOnlyDictionary<string, bool> falsifyingAssignment,
+            Dictionary<string, bool> truthMap,
+            IReadOnlyDictionary<string, ConditionInfo> conditionByKey)
+        {
+            var items = falsifyingAssignment
+                .OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(kvp => new ScenarioAssignment(
+                    kvp.Key,
+                    kvp.Value,
+                    conditionByKey.TryGetValue(kvp.Key, out var condition) ? condition : null))
+                .ToList();
+
+            var testedConditions = items
+                .Select(BuildReadableAssignment)
+                .ToList();
+
+            var shortLabel = items.Count == 1
+                ? BuildReadableAssignment(items[0])
+                : $"{items.Count} exact predicate assignments";
+
+            var scopePrefix = type == ScenarioType.HavingNegative ? "HAVING negative" :
+                type == ScenarioType.SubqueryMiss ? "Subquery negative" :
+                "WHERE negative";
+
+            return new BranchScenario
+            {
+                Id = _nextId++,
+                Name = $"{scopePrefix}: {shortLabel}",
+                Description = $"{scope.ScopeLabel} is forced to FALSE by these exact predicate assignments: {string.Join("; ", testedConditions)}.",
+                Type = type,
+                ScopeLabel = scope.ScopeLabel,
+                ExpectedToReturnRows = false,
+                PredicateTruthMap = truthMap,
+                TestedCondition = string.Join(" | ", testedConditions),
+                TestedConditions = testedConditions
+            };
+        }
+
+        private IEnumerable<BranchScenario> CreateBoundaryScenarios(
+            PredicateScope scope,
+            IReadOnlyDictionary<string, bool> globalPositiveTruthMap)
+        {
+            if (scope.Root == null)
+                yield break;
+
+            var positiveAssignments = PredicateTruthPlanner.GetMinimalAssignments(scope.Root, desiredTruth: true);
+            var rangeLeaves = PredicateTruthPlanner.EnumerateLeaves(scope.Root)
+                .Where(l => IsRangeCondition(l.Condition))
+                .ToList();
+
+            foreach (var leaf in rangeLeaves)
+            {
+                var supportingAssignment = positiveAssignments
+                    .FirstOrDefault(a => a.TryGetValue(leaf.Condition.Key, out var desiredTruth) && desiredTruth);
+
+                if (supportingAssignment == null)
+                    continue;
+
+                var truthMap = MergeTruthMaps(globalPositiveTruthMap, supportingAssignment);
+                var readable = leaf.Condition.ToString();
+
+                yield return new BranchScenario
+                {
+                    Id = _nextId++,
+                    Name = $"Boundary: {readable} at exact limit",
+                    Description = $"{scope.ScopeLabel} stays TRUE while [{readable}] is generated at its exact boundary value.",
+                    Type = ScenarioType.Boundary,
+                    ScopeLabel = scope.ScopeLabel,
+                    ExpectedToReturnRows = true,
+                    PredicateTruthMap = truthMap,
+                    BoundaryConditionKey = leaf.Condition.Key,
+                    TestedCondition = readable,
+                    TestedConditions = new List<string> { readable }
+                };
+            }
+        }
+
+        private BranchScenario CreateJoinMissScenario(
+            JoinInfo join,
+            IReadOnlyDictionary<string, bool> positiveTruthMap)
+        {
+            var readable = $"{join.LeftTableAlias}.{join.LeftColumn} = {join.RightTableAlias}.{join.RightColumn}";
+            return new BranchScenario
+            {
+                Id = _nextId++,
+                Name = $"LEFT JOIN miss: no row for {join.RightTableAlias}",
+                Description = $"The LEFT JOIN row for alias [{join.RightTableAlias}] is intentionally absent while the rest of the query stays on its positive path.",
+                Type = ScenarioType.JoinMiss,
+                ScopeLabel = "Join",
+                ExpectedToReturnRows = true,
+                PredicateTruthMap = new Dictionary<string, bool>(positiveTruthMap, StringComparer.OrdinalIgnoreCase),
+                JoinKey = BuildJoinKey(join),
+                TestedCondition = readable,
+                TestedConditions = new List<string> { readable }
+            };
+        }
+
+        private static ScenarioType ClassifyNegativeScenario(
+            PredicateScope scope,
+            IReadOnlyDictionary<string, bool> assignment,
+            IReadOnlyDictionary<string, ConditionInfo> conditionByKey)
+        {
+            if (scope.Source == ConditionSource.Having)
+                return ScenarioType.HavingNegative;
+
+            if (assignment.Count > 0 &&
+                assignment.Keys.All(key =>
+                    conditionByKey.TryGetValue(key, out var condition) &&
+                    condition.IsSubqueryPredicate))
+            {
+                return ScenarioType.SubqueryMiss;
+            }
+
+            return ScenarioType.WhereNegative;
+        }
+
+        private static Dictionary<string, bool> BuildGlobalPositiveTruthMap(IEnumerable<PredicateScope> scopes)
+        {
+            var map = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            foreach (var scope in scopes.Where(s => s.Root != null))
+            {
+                foreach (var kvp in PredicateTruthPlanner.ChooseCanonicalAssignment(scope.Root, desiredTruth: true))
+                {
+                    map[kvp.Key] = kvp.Value;
+                }
+            }
+
+            return map;
+        }
+
+        private static Dictionary<string, bool> MergeTruthMaps(
+            IReadOnlyDictionary<string, bool> baseline,
+            IReadOnlyDictionary<string, bool> overrideMap)
+        {
+            var merged = new Dictionary<string, bool>(baseline, StringComparer.OrdinalIgnoreCase);
+            foreach (var kvp in overrideMap)
+            {
+                merged[kvp.Key] = kvp.Value;
+            }
+
+            return merged;
+        }
+
+        private static bool IsRangeCondition(ConditionInfo condition)
         {
             return condition.Operator is
                 ComparisonOp.GreaterThan or
@@ -171,6 +219,27 @@ namespace SqlTestDataGenerator.DataGeneration
                 ComparisonOp.LessThan or
                 ComparisonOp.LessThanOrEqual or
                 ComparisonOp.Between;
+        }
+
+        private static bool CanCreateJoinMissScenario(JoinInfo join, ParsedQuery query)
+        {
+            var alias = join.RightTableAlias;
+            if (string.IsNullOrWhiteSpace(alias))
+                return false;
+
+            return !query.PredicateScopes
+                .SelectMany(s => s.Conditions)
+                .Any(c => MatchesAlias(query, c, alias));
+        }
+
+        private static bool MatchesAlias(ParsedQuery query, ConditionInfo condition, string alias)
+        {
+            if (string.Equals(condition.TableAlias, alias, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            var resolvedAlias = query.ResolveAlias(alias);
+            return !string.IsNullOrWhiteSpace(condition.TableAlias) &&
+                   string.Equals(query.ResolveAlias(condition.TableAlias), resolvedAlias, StringComparison.OrdinalIgnoreCase);
         }
 
         private List<BranchScenario> DeduplicateAndRenumber(List<BranchScenario> scenarios)
@@ -193,20 +262,38 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private static string BuildScenarioKey(BranchScenario scenario)
         {
+            var truthMapKey = string.Join("|",
+                scenario.PredicateTruthMap
+                    .OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase)
+                    .Select(kvp => $"{kvp.Key}:{(kvp.Value ? "1" : "0")}"));
+
             return string.Join("|",
                 scenario.Type,
-                scenario.ExpectedToReturnRows ? "1" : "0",
-                NormalizeScenarioText(scenario.Name),
-                NormalizeScenarioText(scenario.TestedCondition));
+                scenario.ScopeLabel,
+                scenario.BoundaryConditionKey ?? string.Empty,
+                scenario.JoinKey ?? string.Empty,
+                truthMapKey);
         }
 
-        private static string NormalizeScenarioText(string? value)
+        private static string BuildJoinKey(JoinInfo join)
         {
-            if (string.IsNullOrWhiteSpace(value))
-                return string.Empty;
-
-            return string.Join(" ",
-                value.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+            return string.Join("|",
+                join.Type,
+                join.LeftTableAlias,
+                join.LeftColumn,
+                join.RightTableAlias,
+                join.RightColumn);
         }
+
+        private static string BuildReadableAssignment(ScenarioAssignment assignment)
+        {
+            var predicateText = assignment.Condition?.ToString() ?? assignment.ConditionKey;
+            return $"force {(assignment.DesiredTruth ? "TRUE" : "FALSE")}: {predicateText}";
+        }
+
+        private sealed record ScenarioAssignment(
+            string ConditionKey,
+            bool DesiredTruth,
+            ConditionInfo? Condition);
     }
 }

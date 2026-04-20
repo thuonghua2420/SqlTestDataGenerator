@@ -29,6 +29,9 @@ namespace SqlTestDataGenerator.Parsing.Models
         /// <summary>Conditions inside the subquery's WHERE clause</summary>
         public List<ConditionInfo> Conditions { get; set; } = new();
 
+        /// <summary>Exact boolean structure of the subquery WHERE clause, if present.</summary>
+        public PredicateScope? WherePredicateScope { get; set; }
+
         /// <summary>The SELECT column from the subquery (for IN/comparison)</summary>
         public string SelectColumn { get; set; } = string.Empty;
 
@@ -43,6 +46,9 @@ namespace SqlTestDataGenerator.Parsing.Models
 
         /// <summary>Nesting level (0 = top-level subquery, 1 = nested, etc.)</summary>
         public int NestingLevel { get; set; }
+
+        /// <summary>Predicate key of the outer EXISTS / IN condition that owns this subquery.</summary>
+        public string PredicateConditionKey { get; set; } = string.Empty;
 
         public override string ToString() =>
             $"{Operator} subquery on {ParentTableAlias}.{ParentColumnName} (Level {NestingLevel})";

@@ -1,4 +1,5 @@
 using Microsoft.SqlServer.TransactSql.ScriptDom;
+using SqlTestDataGenerator.Parsing;
 using SqlTestDataGenerator.Parsing.Models;
 
 namespace SqlTestDataGenerator.Parsing.Visitors
@@ -145,9 +146,14 @@ namespace SqlTestDataGenerator.Parsing.Visitors
             // Extract WHERE conditions from subquery
             if (spec.WhereClause != null)
             {
-                var condVisitor = new ConditionExtractorVisitor(ConditionSource.SubqueryWhere);
-                spec.WhereClause.Accept(condVisitor);
-                subInfo.Conditions.AddRange(condVisitor.Conditions);
+                var predicateBuilder = new PredicateTreeBuilder();
+                var scope = predicateBuilder.BuildScope(
+                    spec.WhereClause.SearchCondition,
+                    ConditionSource.SubqueryWhere,
+                    $"subquery{subInfo.Id}:where",
+                    $"Subquery {subInfo.Id} WHERE");
+                subInfo.WherePredicateScope = scope;
+                subInfo.Conditions.AddRange(scope.Conditions);
             }
 
             // Check for nested subqueries
