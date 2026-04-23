@@ -34,11 +34,6 @@ namespace SqlTestDataGenerator.DataGeneration
                     var scenarioType = ClassifyNegativeScenario(scope, assignment, conditionByKey);
                     scenarios.Add(CreateNegativeScenario(scope, scenarioType, assignment, mergedTruthMap, conditionByKey));
                 }
-
-                foreach (var boundaryScenario in CreateBoundaryScenarios(scope, positiveTruthMap))
-                {
-                    scenarios.Add(boundaryScenario);
-                }
             }
 
             foreach (var join in query.Joins.Where(j => j.Type == JoinType.Left))

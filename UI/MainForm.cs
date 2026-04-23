@@ -70,12 +70,14 @@ namespace SqlTestDataGenerator.UI
         private Panel _bottomToolbar = null!;
 
         private CheckedListBox _scenarioList = null!;
+        private CheckBox _selectAllScenariosCheck = null!;
         private Label _statusLabel = null!;
         private Label _exportFolderLabel = null!;
         private TextBox _exportFolderInput = null!;
         private NumericUpDown _startIdInput = null!;
         private NumericUpDown _rowsPerTableInput = null!;
         private CheckBox _maxLengthMaxValueCheck = null!;
+        private bool _suppressScenarioSelectionSync;
 
         // ── Colors (Standard Light Theme) ──
         private readonly Color _bgDark = SystemColors.Control;
@@ -600,6 +602,19 @@ namespace SqlTestDataGenerator.UI
                 CheckOnClick = true,
                 IntegralHeight = false
             };
+            _scenarioList.ItemCheck += ScenarioList_ItemCheck;
+
+            _selectAllScenariosCheck = new CheckBox
+            {
+                Text = "All",
+                AutoSize = true,
+                Enabled = false,
+                Font = new Font("Segoe UI", 9F),
+                ForeColor = _textPrimary,
+                BackColor = Color.White,
+                Margin = new Padding(0, 4, 0, 0)
+            };
+            _selectAllScenariosCheck.CheckedChanged += SelectAllScenariosCheck_CheckedChanged;
 
             _scriptCleanOutput = new TextBox
             {
@@ -625,7 +640,7 @@ namespace SqlTestDataGenerator.UI
             var analysisCard = CreateCard("Analysis Result", _accentGreen, CreateSurface(_analysisOutput, new Padding(10)));
             analysisCard.Margin = new Padding(0, 0, 0, 12);
 
-            var scenarioCard = CreateCard("Scenarios to generate", _accentOrange, CreateSurface(_scenarioList, new Padding(10)));
+            var scenarioCard = CreateCard("Scenarios to generate", _accentOrange, CreateSurface(_scenarioList, new Padding(10)), _selectAllScenariosCheck);
             scenarioCard.Margin = new Padding(0, 0, 0, 12);
 
             var rightTopLayout = new TableLayoutPanel
@@ -953,6 +968,19 @@ namespace SqlTestDataGenerator.UI
                 CheckOnClick = true,
                 IntegralHeight = false
             };
+            _scenarioList.ItemCheck += ScenarioList_ItemCheck;
+
+            _selectAllScenariosCheck = new CheckBox
+            {
+                Text = "All",
+                AutoSize = true,
+                Enabled = false,
+                Font = new Font("Segoe UI", 9F),
+                ForeColor = _textPrimary,
+                BackColor = Color.White,
+                Margin = new Padding(0, 4, 0, 0)
+            };
+            _selectAllScenariosCheck.CheckedChanged += SelectAllScenariosCheck_CheckedChanged;
 
             _scriptCleanOutput = new TextBox
             {
@@ -978,7 +1006,7 @@ namespace SqlTestDataGenerator.UI
             var analysisCard = CreateCard("Analysis Result", _accentGreen, CreateSurface(_analysisOutput, new Padding(10)));
             analysisCard.Margin = new Padding(0, 0, 0, 12);
 
-            var scenarioCard = CreateCard("Scenarios to generate", _accentOrange, CreateSurface(_scenarioList, new Padding(10)));
+            var scenarioCard = CreateCard("Scenarios to generate", _accentOrange, CreateSurface(_scenarioList, new Padding(10)), _selectAllScenariosCheck);
             scenarioCard.Margin = new Padding(0);
 
             var rightTopLayout = new TableLayoutPanel
@@ -1283,7 +1311,9 @@ namespace SqlTestDataGenerator.UI
                     _analysisOutput.Text = "❌ PARSE ERRORS:\r\n" +
                         string.Join("\r\n", _currentQuery.Errors);
                     _availableScenarios.Clear();
+                    _scenarioList.Items.Clear();
                     _generateBtn.Enabled = false;
+                    ResetScenarioSelectAllCheck();
                     _currentDataSet = null;
                     _currentDataSetIsGenerated = false;
                     UpdateDbInsertButtonState();
@@ -1311,6 +1341,7 @@ namespace SqlTestDataGenerator.UI
                 }
 
                 _generateBtn.Enabled = true;
+                UpdateScenarioSelectAllCheckState();
                 SetStatus($"Analysis complete: {_currentQuery.Tables.Count} tables, " +
                           $"{_currentQuery.WhereConditions.Count} conditions, " +
                           $"{_availableScenarios.Count} scenarios.");
@@ -1321,7 +1352,9 @@ namespace SqlTestDataGenerator.UI
             {
                 _analysisOutput.Text = $"❌ Error: {ex.Message}";
                 _availableScenarios.Clear();
+                _scenarioList.Items.Clear();
                 _generateBtn.Enabled = false;
+                ResetScenarioSelectAllCheck();
                 _currentDataSet = null;
                 _currentDataSetIsGenerated = false;
                 UpdateDbInsertButtonState();
@@ -1925,6 +1958,83 @@ namespace SqlTestDataGenerator.UI
             LogInfo($"Generation mode changed to {modeLabel}; stale generated dataset was cleared.");
         }
 
+        private void SelectAllScenariosCheck_CheckedChanged(object? sender, EventArgs e)
+        {
+            if (_suppressScenarioSelectionSync || _scenarioList.Items.Count == 0)
+                return;
+
+            _suppressScenarioSelectionSync = true;
+            try
+            {
+                for (int i = 0; i < _scenarioList.Items.Count; i++)
+                {
+                    _scenarioList.SetItemChecked(i, _selectAllScenariosCheck.Checked);
+                }
+            }
+            finally
+            {
+                _suppressScenarioSelectionSync = false;
+            }
+
+            UpdateScenarioSelectAllCheckState();
+
+            if (_selectAllScenariosCheck.Checked)
+            {
+                SetStatus($"Selected all {_scenarioList.Items.Count} scenario(s).");
+                LogInfo($"Selected all {_scenarioList.Items.Count} scenario(s) for generation.");
+            }
+            else
+            {
+                SetStatus("Cleared all scenario selections.");
+                LogInfo("Cleared all scenario selections.");
+            }
+        }
+
+        private void ScenarioList_ItemCheck(object? sender, ItemCheckEventArgs e)
+        {
+            if (_suppressScenarioSelectionSync)
+                return;
+
+            BeginInvoke(new Action(UpdateScenarioSelectAllCheckState));
+        }
+
+        private void UpdateScenarioSelectAllCheckState()
+        {
+            if (_selectAllScenariosCheck == null)
+                return;
+
+            var hasItems = _scenarioList.Items.Count > 0;
+            var allChecked = hasItems && Enumerable.Range(0, _scenarioList.Items.Count).All(_scenarioList.GetItemChecked);
+
+            _suppressScenarioSelectionSync = true;
+            try
+            {
+                _selectAllScenariosCheck.Enabled = hasItems;
+                _selectAllScenariosCheck.Checked = allChecked;
+            }
+            finally
+            {
+                _suppressScenarioSelectionSync = false;
+            }
+        }
+
+        private void ResetScenarioSelectAllCheck()
+        {
+            if (_selectAllScenariosCheck == null)
+                return;
+
+            _suppressScenarioSelectionSync = true;
+            try
+            {
+                _selectAllScenariosCheck.Enabled = false;
+                _selectAllScenariosCheck.Checked = false;
+            }
+            finally
+            {
+                _suppressScenarioSelectionSync = false;
+            }
+        }
+
         private Dictionary<string, Dictionary<string, object?>> EnsureBaselineSampleRows(IEnumerable<TableSchema> schemas)
         {
             if (_tableSampleExtractor == null)
@@ -2092,7 +2202,7 @@ namespace SqlTestDataGenerator.UI
             return panel;
         }
 
-        private Panel CreateCard(string title, Color accentColor, Control content)
+        private Panel CreateCard(string title, Color accentColor, Control content, Control? headerAccessory = null)
         {
             var borderPanel = new Panel
             {
@@ -2110,22 +2220,44 @@ namespace SqlTestDataGenerator.UI
                 Margin = new Padding(0)
             };
 
+            var headerPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                Height = 30,
+                ColumnCount = 2,
+                RowCount = 1,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.White
+            };
+            headerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            headerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
             var headerLabel = new Label
             {
                 Text = title,
-                Dock = DockStyle.Top,
-                Height = 30,
+                Dock = DockStyle.Fill,
                 Font = new Font("Segoe UI Semibold", 11F),
                 ForeColor = _textPrimary,
                 Padding = new Padding(0, 2, 0, 0),
-                BackColor = Color.White
+                BackColor = Color.White,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Margin = new Padding(0)
             };
 
             content.Dock = DockStyle.Fill;
             content.Margin = new Padding(0);
 
+            headerPanel.Controls.Add(headerLabel, 0, 0);
+            if (headerAccessory != null)
+            {
+                headerAccessory.Anchor = AnchorStyles.Right;
+                headerAccessory.Margin = new Padding(0);
+                headerPanel.Controls.Add(headerAccessory, 1, 0);
+            }
+
             innerPanel.Controls.Add(content);
-            innerPanel.Controls.Add(headerLabel);
+            innerPanel.Controls.Add(headerPanel);
             borderPanel.Controls.Add(innerPanel);
             return borderPanel;
         }

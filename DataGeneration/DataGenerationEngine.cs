@@ -220,6 +220,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 bool isAggregateSource = IsAggregateSourceTable(tableName, alias, query);
                 int rowCount = DetermineScenarioRowCount(
                     tableName,
+                    alias,
                     schema,
                     query,
                     isAggregateSource,
@@ -544,6 +545,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 bool isAggSource = IsAggregateSourceTable(tableName, alias, query);
                 int rowCount = DetermineScenarioRowCount(
                     tableName,
+                    alias,
                     schema,
                     query,
                     isAggSource,
@@ -709,7 +711,9 @@ namespace SqlTestDataGenerator.DataGeneration
                     col,
                     generator,
                     conditionTargets,
-                    tableRowIds);
+                    tableRowIds,
+                    tableAlias,
+                    rowIndex);
 
                 if (resolvedValue.Resolved)
                 {
@@ -742,17 +746,19 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             // 5. Default value generation
-            return GenerateDefaultColumnValue(col, generator, rowIndex);
+            return GenerateDefaultColumnValue(col, generator, rowIndex, query, tableAlias);
         }
 
         private object GenerateDefaultColumnValue(
             ColumnSchema col,
             IValueGenerator generator,
-            int rowIndex)
+            int rowIndex,
+            ParsedQuery query,
+            string tableAlias)
         {
             if (UseMaxLengthMaxValueMode)
             {
-                var maxModeValue = GenerateMaxLengthMaxValue(col, rowIndex);
+                var maxModeValue = GenerateMaxLengthMaxValue(col, rowIndex, query, tableAlias);
                 if (maxModeValue != null)
                 {
                     return maxModeValue;
@@ -783,14 +789,14 @@ namespace SqlTestDataGenerator.DataGeneration
             return row.TryGetValue(column.ColumnName, out sampleValue);
         }
 
-        private object? GenerateMaxLengthMaxValue(ColumnSchema column, int rowIndex)
+        private object? GenerateMaxLengthMaxValue(ColumnSchema column, int rowIndex, ParsedQuery query, string tableAlias)
         {
             return column.TypeCategory switch
             {
                 DataTypeCategory.String => BuildMaxLengthString(column, rowIndex),
-                DataTypeCategory.Integer => BuildMaxNumericValue(column, rowIndex),
-                DataTypeCategory.Decimal => BuildMaxNumericValue(column, rowIndex),
-                DataTypeCategory.Float => BuildMaxNumericValue(column, rowIndex),
+                DataTypeCategory.Integer => BuildMaxNumericValue(column, rowIndex, query, tableAlias),
+                DataTypeCategory.Decimal => BuildMaxNumericValue(column, rowIndex, query, tableAlias),
+                DataTypeCategory.Float => BuildMaxNumericValue(column, rowIndex, query, tableAlias),
                 _ => null
             };
         }
@@ -822,7 +828,9 @@ namespace SqlTestDataGenerator.DataGeneration
             IValueGenerator generator,
             ConditionInfo condition,
             bool satisfy,
-            object? comparisonValue = null)
+            object? comparisonValue = null,
+            string? tableAlias = null,
+            int rowIndex = 0)
         {
             if (condition.IsColumnComparison && comparisonValue != null)
             {
@@ -867,6 +875,24 @@ namespace SqlTestDataGenerator.DataGeneration
                     ? generator.GenerateSatisfying(col, "LIKE", condition.LikePattern)
                     : generator.GenerateViolating(col, "LIKE", condition.LikePattern);
             }
+
+            if (satisfy &&
+                UseMaxLengthMaxValueMode &&
+                col.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
+                tableAlias != null)
+            {
+                var maxCandidate = GenerateMaxLengthMaxValue(col, rowIndex, query, tableAlias);
+                if (EvaluateCondition(maxCandidate, condition, comparisonValue, col, generator))
+                {
+                    return maxCandidate;
+                }
+            }
+
+            if (satisfy && !UseMaxLengthMaxValueMode && IsRangeCondition(condition))
+            {
+                return GenerateBoundaryValue(col, condition);
+            }
+
             return satisfy
                 ? generator.GenerateSatisfying(col, opStr, condition.Value)
                 : generator.GenerateViolating(col, opStr, condition.Value);
@@ -894,17 +920,22 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private object BuildMaxNumericValue(ColumnSchema column, int rowIndex)
         {
+            return BuildMaxNumericValue(column, rowIndex, query: null, tableAlias: column.TableName);
+        }
+
+        private object BuildMaxNumericValue(ColumnSchema column, int rowIndex, ParsedQuery? query, string tableAlias)
+        {
             var offset = rowIndex + GetColumnVariantOffset(column);
 
             return column.TypeCategory switch
             {
-                DataTypeCategory.Integer => SqlServerValueNormalizer.NormalizeValue(column, GetMaxIntegerValue(column) - offset) ?? 0,
+                DataTypeCategory.Integer => SqlServerValueNormalizer.NormalizeValue(column, GetPracticalMaxIntegerValue(column, query, tableAlias) - offset) ?? 0,
                 DataTypeCategory.Decimal => SqlServerValueNormalizer.NormalizeValue(
                     column,
-                    GetMaxDecimalValue(column) - (offset * GetNumericStep(column))) ?? 0m,
+                    GetPracticalMaxDecimalValue(column, query, tableAlias) - (offset * GetNumericStep(column))) ?? 0m,
                 DataTypeCategory.Float => SqlServerValueNormalizer.NormalizeValue(
                     column,
-                    GetMaxFloatValue(column) - offset) ?? 0d,
+                    GetPracticalMaxFloatValue(column, query, tableAlias) - offset) ?? 0d,
                 _ => 0
             };
         }
@@ -1467,6 +1498,23 @@ namespace SqlTestDataGenerator.DataGeneration
             };
         }
 
+        private long GetPracticalMaxIntegerValue(ColumnSchema column, ParsedQuery? query, string tableAlias)
+        {
+            if (IsRatingLikeNumericColumn(column))
+                return Math.Min(GetMaxIntegerValue(column), 5L);
+
+            var absoluteMax = GetMaxIntegerValue(column);
+            var safeDigits = DeterminePracticalNumericDigits(column, query, tableAlias);
+            long practicalMax = 1;
+            for (int i = 0; i < safeDigits; i++)
+            {
+                practicalMax *= 10;
+            }
+
+            practicalMax -= 1;
+            return Math.Min(absoluteMax, practicalMax);
+        }
+
         private static decimal GetMaxDecimalValue(ColumnSchema column)
         {
             var scale = Math.Max(0, column.NumericScale ?? 0);
@@ -1483,10 +1531,194 @@ namespace SqlTestDataGenerator.DataGeneration
             return max > 0m ? max : step;
         }
 
+        private decimal GetPracticalMaxDecimalValue(ColumnSchema column, ParsedQuery? query, string tableAlias)
+        {
+            var scale = Math.Max(0, column.NumericScale ?? 0);
+            var step = GetNumericStep(column);
+
+            if (IsRatingLikeNumericColumn(column))
+            {
+                var ratingMax = Math.Max(step, 5m);
+                return SqlServerValueNormalizer.NormalizeValue(column, ratingMax) is decimal normalizedRating
+                    ? normalizedRating
+                    : ratingMax;
+            }
+
+            if (IsRateLikeNumericColumn(column))
+            {
+                var unitMax = 1m - step;
+                return unitMax > 0m ? unitMax : step;
+            }
+
+            var availableIntegerDigits = column.NumericPrecision.HasValue
+                ? Math.Max(1, column.NumericPrecision.Value - scale)
+                : 5;
+            var safeDigits = Math.Min(availableIntegerDigits, DeterminePracticalNumericDigits(column, query, tableAlias));
+
+            decimal wholePart = 1m;
+            for (int i = 0; i < safeDigits; i++)
+            {
+                wholePart *= 10m;
+            }
+
+            var practicalMax = wholePart - step;
+            return practicalMax > 0m ? practicalMax : step;
+        }
+
         private static double GetMaxFloatValue(ColumnSchema column)
         {
             var digits = column.DataType.Equals("real", StringComparison.OrdinalIgnoreCase) ? 7 : 15;
             return Math.Pow(10d, digits) - 1d;
+        }
+
+        private double GetPracticalMaxFloatValue(ColumnSchema column, ParsedQuery? query, string tableAlias)
+        {
+            var safeDigits = DeterminePracticalNumericDigits(column, query, tableAlias);
+            return Math.Min(GetMaxFloatValue(column), Math.Pow(10d, safeDigits) - 1d);
+        }
+
+        private int DeterminePracticalNumericDigits(ColumnSchema column, ParsedQuery? query, string tableAlias)
+        {
+            var typeDigits = column.DataType.ToLowerInvariant() switch
+            {
+                "tinyint" => 3,
+                "smallint" => 5,
+                "int" => 9,
+                "bigint" => 15,
+                "real" => 6,
+                "float" => 8,
+                _ => 5
+            };
+
+            var safeDigits = Math.Min(typeDigits, 5);
+
+            if (IsRatingLikeNumericColumn(column))
+                return 1;
+
+            if (IsRateLikeNumericColumn(column))
+                return 1;
+
+            if (IsCountLikeNumericColumn(column))
+                safeDigits = Math.Min(safeDigits, 3);
+
+            if (IsInventoryLikeNumericColumn(column))
+                safeDigits = Math.Min(safeDigits, 3);
+
+            if (IsMeasureLikeNumericColumn(column))
+                safeDigits = Math.Min(safeDigits, 4);
+
+            if (query != null && HasMultiplicativeArithmeticRisk(column, query, tableAlias))
+            {
+                safeDigits = column.TypeCategory switch
+                {
+                    DataTypeCategory.Integer => Math.Min(safeDigits, 2),
+                    DataTypeCategory.Decimal => Math.Min(safeDigits, 2),
+                    DataTypeCategory.Float => Math.Min(safeDigits, 2),
+                    _ => safeDigits
+                };
+            }
+
+            if (query != null && IsArithmeticRiskColumn(column, query, tableAlias))
+            {
+                safeDigits = column.TypeCategory switch
+                {
+                    DataTypeCategory.Integer => Math.Min(safeDigits, 3),
+                    DataTypeCategory.Decimal => Math.Min(safeDigits, 3),
+                    DataTypeCategory.Float => Math.Min(safeDigits, 3),
+                    _ => Math.Min(safeDigits, 4)
+                };
+            }
+
+            return Math.Max(1, safeDigits);
+        }
+
+        private bool IsArithmeticRiskColumn(ColumnSchema column, ParsedQuery query, string tableAlias)
+        {
+            var alias = string.IsNullOrWhiteSpace(tableAlias) ? column.TableName : tableAlias;
+            return IsPartOfAggregateExpression(column.ColumnName, alias, query) ||
+                   query.SelectColumns.Any(c =>
+                       !string.IsNullOrWhiteSpace(c.Expression) &&
+                       ExpressionMentionsColumn(c.Expression, alias, column.ColumnName)) ||
+                   query.HavingConditions.Any(c =>
+                       !string.IsNullOrWhiteSpace(c.ExpressionText) &&
+                       ExpressionMentionsColumn(c.ExpressionText, alias, column.ColumnName));
+        }
+
+        private bool HasMultiplicativeArithmeticRisk(ColumnSchema column, ParsedQuery query, string tableAlias)
+        {
+            var alias = string.IsNullOrWhiteSpace(tableAlias) ? column.TableName : tableAlias;
+            return query.Aggregates.Any(a =>
+                       !string.IsNullOrWhiteSpace(a.Expression) &&
+                       ExpressionMentionsColumn(a.Expression, alias, column.ColumnName) &&
+                       (a.Expression.Contains('*') || a.Expression.Contains('/'))) ||
+                   query.SelectColumns.Any(c =>
+                       !string.IsNullOrWhiteSpace(c.Expression) &&
+                       ExpressionMentionsColumn(c.Expression, alias, column.ColumnName) &&
+                       (c.Expression.Contains('*') || c.Expression.Contains('/'))) ||
+                   query.HavingConditions.Any(c =>
+                       !string.IsNullOrWhiteSpace(c.ExpressionText) &&
+                       ExpressionMentionsColumn(c.ExpressionText, alias, column.ColumnName) &&
+                       (c.ExpressionText.Contains('*') || c.ExpressionText.Contains('/')));
+        }
+
+        private static bool ExpressionMentionsColumn(string expression, string alias, string columnName)
+        {
+            return expression.Contains($"{alias}.{columnName}", StringComparison.OrdinalIgnoreCase) ||
+                   expression.Contains(columnName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsMeasureLikeNumericColumn(ColumnSchema column)
+        {
+            var name = column.ColumnName;
+            return name.Contains("Price", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Cost", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Amount", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Total", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Balance", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Limit", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Salary", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Revenue", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Fee", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsRateLikeNumericColumn(ColumnSchema column)
+        {
+            var name = column.ColumnName;
+            return name.Contains("Rate", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Percent", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Tax", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Discount", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Commission", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsRatingLikeNumericColumn(ColumnSchema column)
+        {
+            var name = column.ColumnName;
+            return name.Contains("Rating", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Stars", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Star", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsInventoryLikeNumericColumn(ColumnSchema column)
+        {
+            var name = column.ColumnName;
+            return name.Contains("Stock", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("OnHand", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Reorder", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Backorder", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsCountLikeNumericColumn(ColumnSchema column)
+        {
+            var name = column.ColumnName;
+            return name.Contains("Count", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Quantity", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Points", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Score", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Level", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Rank", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Capacity", StringComparison.OrdinalIgnoreCase) ||
+                   IsInventoryLikeNumericColumn(column);
         }
 
         private List<ColumnConditionTarget> GetApplicableConditionTargets(
@@ -1655,7 +1887,9 @@ namespace SqlTestDataGenerator.DataGeneration
             ColumnSchema col,
             IValueGenerator generator,
             IReadOnlyCollection<ColumnConditionTarget> targets,
-            Dictionary<string, List<int>> tableRowIds)
+            Dictionary<string, List<int>> tableRowIds,
+            string tableAlias,
+            int rowIndex)
         {
             var candidates = new List<object?>();
 
@@ -1680,7 +1914,9 @@ namespace SqlTestDataGenerator.DataGeneration
                     generator,
                     target.Condition,
                     target.DesiredTruth,
-                    comparisonValue));
+                    comparisonValue,
+                    tableAlias,
+                    rowIndex));
 
                 if (target.Condition.Operator == ComparisonOp.Between)
                 {
@@ -1818,6 +2054,16 @@ namespace SqlTestDataGenerator.DataGeneration
             };
         }
 
+        private static bool IsRangeCondition(ConditionInfo condition)
+        {
+            return condition.Operator is
+                ComparisonOp.GreaterThan or
+                ComparisonOp.GreaterThanOrEqual or
+                ComparisonOp.LessThan or
+                ComparisonOp.LessThanOrEqual or
+                ComparisonOp.Between;
+        }
+
         private static bool GetDesiredTruthForCondition(
             BranchScenario scenario,
             ConditionInfo condition,
@@ -1847,6 +2093,39 @@ namespace SqlTestDataGenerator.DataGeneration
                        condition.TableAlias,
                        query.ResolveAlias(tableAlias),
                        tableAlias);
+        }
+
+        private bool IsPredicatePinnedColumn(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableAlias,
+            string columnName)
+        {
+            return query.PredicateScopes
+                .SelectMany(s => s.Conditions)
+                .Any(condition =>
+                    GetDesiredTruthForCondition(scenario, condition, defaultTruth: true) &&
+                    IsConditionTargetingColumn(query, condition, tableAlias, columnName));
+        }
+
+        private bool HasExactOrUpperBoundPinnedPredicate(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableAlias,
+            string columnName)
+        {
+            return query.PredicateScopes
+                .SelectMany(s => s.Conditions)
+                .Any(condition =>
+                    GetDesiredTruthForCondition(scenario, condition, defaultTruth: true) &&
+                    IsConditionTargetingColumn(query, condition, tableAlias, columnName) &&
+                    condition.Operator is
+                        ComparisonOp.Equal or
+                        ComparisonOp.In or
+                        ComparisonOp.Between or
+                        ComparisonOp.LessThan or
+                        ComparisonOp.LessThanOrEqual or
+                        ComparisonOp.Like);
         }
 
         private static string BuildJoinScenarioKey(JoinInfo join)
@@ -2194,7 +2473,9 @@ namespace SqlTestDataGenerator.DataGeneration
                     column,
                     generator,
                     conditionTargets,
-                    tableRowIds);
+                    tableRowIds,
+                    tableAlias,
+                    0);
 
                 if (resolved.Resolved)
                     return resolved.Value;
@@ -2420,7 +2701,19 @@ namespace SqlTestDataGenerator.DataGeneration
             if (!NeedsAggregateDiversitySupport(query))
                 return;
 
-            if (IsLineLikeTable(schema.TableName, schema))
+            if (IsInventoryLikeTable(schema.TableName, schema))
+            {
+                ApplyInventoryRowAdjustments(query, scenario, schema, row, rowIndex);
+            }
+            else if (IsReviewLikeTable(schema.TableName, schema))
+            {
+                ApplyReviewRowAdjustments(query, scenario, schema, row, rowIndex);
+            }
+            else if (IsProductCostLikeTable(schema.TableName, schema))
+            {
+                ApplyProductRowAdjustments(query, scenario, schema, row, rowIndex);
+            }
+            else if (IsLineLikeTable(schema.TableName, schema))
             {
                 ApplyLineRowAdjustments(query, scenario, schema, row, rowIndex);
             }
@@ -2438,25 +2731,25 @@ namespace SqlTestDataGenerator.DataGeneration
             int rowIndex)
         {
             var quantity = UseMaxLengthMaxValueMode
-                ? BuildSafeHighInteger(schema, "QuantityOrdered", rowIndex, 0, 3, 2 + rowIndex)
+                ? BuildSafeHighInteger(query, schema, "QuantityOrdered", rowIndex, 0, 2, 2 + rowIndex)
                 : 2 + rowIndex;
             var unitPrice = UseMaxLengthMaxValueMode
-                ? BuildSafeHighDecimal(schema, "UnitPrice", rowIndex, 0, 4, 11.25m + (rowIndex * 2.15m))
+                ? BuildSafeHighDecimal(query, schema, "UnitPrice", rowIndex, 0, 2, 11.25m + (rowIndex * 2.15m))
                 : 11.25m + (rowIndex * 2.15m);
             var unitCost = UseMaxLengthMaxValueMode
-                ? BuildSafeHighDecimal(schema, "UnitCost", rowIndex, 3, 4, Math.Max(0.01m, unitPrice - 1.35m))
+                ? BuildSafeHighDecimal(query, schema, "UnitCost", rowIndex, 3, 2, Math.Max(0.01m, unitPrice - 1.35m))
                 : unitPrice - 1.35m;
             var lineTotal = UseMaxLengthMaxValueMode
-                ? BuildSafeHighDecimal(schema, "LineTotal", rowIndex, 7, 5, (quantity * unitPrice) + (rowIndex * 0.5m))
+                ? BuildSafeHighDecimal(query, schema, "LineTotal", rowIndex, 7, 3, (quantity * unitPrice) + (rowIndex * 0.5m))
                 : (quantity * unitPrice) + (rowIndex * 0.5m);
 
             SetNormalizedRowValueIfSafe(query, scenario, schema, row, "QuantityOrdered", quantity);
             SetNormalizedRowValueIfSafe(query, scenario, schema, row, "Quantity", quantity);
             var quantityShipped = UseMaxLengthMaxValueMode
-                ? BuildSafeHighInteger(schema, "QuantityShipped", rowIndex, 2, 3, Math.Max(1, quantity - 1))
+                ? BuildSafeHighInteger(query, schema, "QuantityShipped", rowIndex, 2, 2, Math.Max(1, quantity - 1))
                 : Math.Max(1, quantity - 1);
             var quantityReturned = UseMaxLengthMaxValueMode
-                ? BuildSafeHighInteger(schema, "QuantityReturned", rowIndex, 4, 2, rowIndex % 2)
+                ? BuildSafeHighInteger(query, schema, "QuantityReturned", rowIndex, 4, 2, rowIndex % 2)
                 : rowIndex % 2;
             SetNormalizedRowValueIfSafe(query, scenario, schema, row, "QuantityShipped", quantityShipped);
             SetNormalizedRowValueIfSafe(query, scenario, schema, row, "QuantityReturned", quantityReturned);
@@ -2464,10 +2757,10 @@ namespace SqlTestDataGenerator.DataGeneration
             SetNormalizedRowValueIfSafe(query, scenario, schema, row, "UnitCost", unitCost);
             SetNormalizedRowValueIfSafe(query, scenario, schema, row, "LineTotal", lineTotal);
             var discountPercent = UseMaxLengthMaxValueMode
-                ? BuildSafeHighDecimal(schema, "DiscountPercent", rowIndex, 11, 2, 0.01m + (rowIndex * 0.01m))
+                ? BuildSafeHighDecimal(query, schema, "DiscountPercent", rowIndex, 11, 1, 0.01m + (rowIndex * 0.01m))
                 : 0.01m + (rowIndex * 0.01m);
             var taxRate = UseMaxLengthMaxValueMode
-                ? BuildSafeHighDecimal(schema, "TaxRate", rowIndex, 13, 2, 0.05m + (rowIndex * 0.01m))
+                ? BuildSafeHighDecimal(query, schema, "TaxRate", rowIndex, 13, 1, 0.05m + (rowIndex * 0.01m))
                 : 0.05m + (rowIndex * 0.01m);
             SetNormalizedRowValueIfSafe(query, scenario, schema, row, "DiscountPercent", discountPercent);
             SetNormalizedRowValueIfSafe(query, scenario, schema, row, "TaxRate", taxRate);
@@ -2481,16 +2774,67 @@ namespace SqlTestDataGenerator.DataGeneration
             int rowIndex)
         {
             var amountPaid = UseMaxLengthMaxValueMode
-                ? BuildSafeHighDecimal(schema, "AmountPaid", rowIndex, 0, 5, 35.00m + (rowIndex * 9.75m))
+                ? BuildSafeHighDecimal(query, schema, "AmountPaid", rowIndex, 0, 3, 35.00m + (rowIndex * 9.75m))
                 : 35.00m + (rowIndex * 9.75m);
             SetNormalizedRowValueIfSafe(query, scenario, schema, row, "AmountPaid", amountPaid);
             var gatewayFee = UseMaxLengthMaxValueMode
-                ? BuildSafeHighDecimal(schema, "GatewayFee", rowIndex, 4, 3, 0.50m + (rowIndex * 0.10m))
+                ? BuildSafeHighDecimal(query, schema, "GatewayFee", rowIndex, 4, 2, 0.50m + (rowIndex * 0.10m))
                 : 0.50m + (rowIndex * 0.10m);
             SetNormalizedRowValueIfSafe(query, scenario, schema, row, "GatewayFee", gatewayFee);
         }
 
+        private void ApplyInventoryRowAdjustments(
+            ParsedQuery query,
+            BranchScenario scenario,
+            TableSchema schema,
+            GeneratedRow row,
+            int rowIndex)
+        {
+            var totalStock = UseMaxLengthMaxValueMode
+                ? BuildSafeHighInteger(query, schema, "QuantityOnHand", rowIndex, 0, 2, 90 - (rowIndex * 3))
+                : 90 - (rowIndex * 3);
+            var reorderLevel = UseMaxLengthMaxValueMode
+                ? BuildSafeHighInteger(query, schema, "ReorderLevel", rowIndex, 2, 2, Math.Max(1, totalStock / 3))
+                : Math.Max(1, totalStock / 3);
+
+            if (reorderLevel >= totalStock)
+                reorderLevel = Math.Max(1, totalStock - 1);
+
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "QuantityOnHand", totalStock);
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "TotalStock", totalStock);
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "ReorderLevel", reorderLevel);
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "TotalReorderLevel", reorderLevel);
+        }
+
+        private void ApplyReviewRowAdjustments(
+            ParsedQuery query,
+            BranchScenario scenario,
+            TableSchema schema,
+            GeneratedRow row,
+            int rowIndex)
+        {
+            var fallback = Math.Max(1m, 5m - (rowIndex * 0.5m));
+            var ratingValue = UseMaxLengthMaxValueMode
+                ? BuildSafeHighDecimal(query, schema, "RatingValue", rowIndex, 0, 1, fallback)
+                : fallback;
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "RatingValue", ratingValue);
+        }
+
+        private void ApplyProductRowAdjustments(
+            ParsedQuery query,
+            BranchScenario scenario,
+            TableSchema schema,
+            GeneratedRow row,
+            int rowIndex)
+        {
+            var costPrice = UseMaxLengthMaxValueMode
+                ? BuildSafeHighDecimal(query, schema, "CostPrice", rowIndex, 0, 1, 8.50m + (rowIndex * 1.10m))
+                : 8.50m + (rowIndex * 1.10m);
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "CostPrice", costPrice);
+        }
+
         private int BuildSafeHighInteger(
+            ParsedQuery query,
             TableSchema schema,
             string columnName,
             int rowIndex,
@@ -2498,13 +2842,14 @@ namespace SqlTestDataGenerator.DataGeneration
             int maxDigits,
             int fallback)
         {
-            var raw = BuildAdjustedMaxInteger(schema, columnName, rowIndex, extraOffset, fallback);
+            var raw = BuildAdjustedMaxInteger(query, schema, columnName, rowIndex, extraOffset, fallback);
             var safeCap = (int)Math.Min(raw, Math.Pow(10, Math.Max(1, maxDigits)) - 1);
             var candidate = safeCap - rowIndex;
             return candidate > 0 ? candidate : Math.Max(1, fallback);
         }
 
         private decimal BuildSafeHighDecimal(
+            ParsedQuery query,
             TableSchema schema,
             string columnName,
             int rowIndex,
@@ -2516,6 +2861,7 @@ namespace SqlTestDataGenerator.DataGeneration
             if (column == null)
                 return fallback;
 
+            var queryAwareMax = BuildAdjustedMaxDecimal(query, schema, columnName, rowIndex, extraOffset, fallback);
             var scale = Math.Max(0, column.NumericScale ?? 0);
             var integerDigits = column.NumericPrecision.HasValue
                 ? Math.Max(1, column.NumericPrecision.Value - scale)
@@ -2530,6 +2876,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
             var step = GetNumericStep(column);
             var safeMax = wholePart - step;
+            safeMax = Math.Min(safeMax, queryAwareMax);
             var candidate = safeMax - ((rowIndex + extraOffset) * step);
             if (candidate <= 0m)
                 candidate = step;
@@ -2539,6 +2886,7 @@ namespace SqlTestDataGenerator.DataGeneration
         }
 
         private int BuildAdjustedMaxInteger(
+            ParsedQuery query,
             TableSchema schema,
             string columnName,
             int rowIndex,
@@ -2549,7 +2897,7 @@ namespace SqlTestDataGenerator.DataGeneration
             if (column == null)
                 return fallback;
 
-            var raw = BuildMaxNumericValue(column, rowIndex + extraOffset);
+            var raw = BuildMaxNumericValue(column, rowIndex + extraOffset, query, schema.TableName);
             try
             {
                 return Convert.ToInt32(raw, System.Globalization.CultureInfo.InvariantCulture);
@@ -2561,6 +2909,7 @@ namespace SqlTestDataGenerator.DataGeneration
         }
 
         private decimal BuildAdjustedMaxDecimal(
+            ParsedQuery query,
             TableSchema schema,
             string columnName,
             int rowIndex,
@@ -2571,7 +2920,7 @@ namespace SqlTestDataGenerator.DataGeneration
             if (column == null)
                 return fallback;
 
-            var raw = BuildMaxNumericValue(column, rowIndex + extraOffset);
+            var raw = BuildMaxNumericValue(column, rowIndex + extraOffset, query, schema.TableName);
             try
             {
                 return Convert.ToDecimal(raw, System.Globalization.CultureInfo.InvariantCulture);
@@ -2594,9 +2943,8 @@ namespace SqlTestDataGenerator.DataGeneration
             if (column == null)
                 return;
 
-            if (scenario.BoundaryConditionKey != null &&
-                FindConditionByKey(query, scenario.BoundaryConditionKey) is { } boundaryCondition &&
-                IsConditionTargetingColumn(query, boundaryCondition, schema.TableName, columnName))
+            if ((!UseMaxLengthMaxValueMode && IsPredicatePinnedColumn(query, scenario, schema.TableName, columnName)) ||
+                (UseMaxLengthMaxValueMode && HasExactOrUpperBoundPinnedPredicate(query, scenario, schema.TableName, columnName)))
             {
                 return;
             }
@@ -2610,6 +2958,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private int DetermineScenarioRowCount(
             string tableName,
+            string tableAlias,
             TableSchema schema,
             ParsedQuery query,
             bool isAggregateSource,
@@ -2623,8 +2972,42 @@ namespace SqlTestDataGenerator.DataGeneration
             if (!NeedsAggregateDiversitySupport(query))
                 return rowCount;
 
+            if (requestedRows == 1 && IsResultCardinalityAnchorTable(tableName, tableAlias, query))
+                return rowCount;
+
             var diversityFloor = GetAggregateDiversityMinimumRows(tableName, schema);
             return Math.Max(rowCount, diversityFloor);
+        }
+
+        private bool IsResultCardinalityAnchorTable(string tableName, string tableAlias, ParsedQuery query)
+        {
+            bool MatchesTable(string aliasOrName)
+            {
+                if (string.IsNullOrWhiteSpace(aliasOrName))
+                    return false;
+
+                var resolved = query.ResolveAlias(aliasOrName);
+                return resolved.Equals(tableName, StringComparison.OrdinalIgnoreCase) ||
+                       aliasOrName.Equals(tableAlias, StringComparison.OrdinalIgnoreCase) ||
+                       aliasOrName.Equals(tableName, StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (query.GroupByColumns.Any(g => MatchesTable(g.TableAlias)))
+                return true;
+
+            if (query.SelectColumns.Any(s =>
+                    !s.IsAggregate &&
+                    !string.IsNullOrWhiteSpace(s.ColumnName) &&
+                    MatchesTable(s.TableAlias)))
+            {
+                return true;
+            }
+
+            return query.HasDistinct &&
+                   query.SelectColumns.Any(s =>
+                       !s.IsAggregate &&
+                       !string.IsNullOrWhiteSpace(s.ColumnName) &&
+                       MatchesTable(s.TableAlias));
         }
 
         private int DetermineRowMultiplier(ParsedQuery query)
@@ -2678,6 +3061,9 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private static bool IsLineLikeTable(string tableName, TableSchema schema)
         {
+            if (IsInventoryLikeTable(tableName, schema) || IsReviewLikeTable(tableName, schema))
+                return false;
+
             return tableName.Contains("Line", StringComparison.OrdinalIgnoreCase) ||
                    tableName.Contains("Detail", StringComparison.OrdinalIgnoreCase) ||
                    tableName.Contains("Item", StringComparison.OrdinalIgnoreCase) ||
@@ -2699,6 +3085,28 @@ namespace SqlTestDataGenerator.DataGeneration
                    schema.Columns.Any(c =>
                        c.ColumnName.Contains("AmountPaid", StringComparison.OrdinalIgnoreCase) ||
                        c.ColumnName.Contains("PaymentDate", StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static bool IsInventoryLikeTable(string tableName, TableSchema schema)
+        {
+            return tableName.Contains("Inventory", StringComparison.OrdinalIgnoreCase) ||
+                   schema.Columns.Any(c =>
+                       c.ColumnName.Contains("QuantityOnHand", StringComparison.OrdinalIgnoreCase) ||
+                       c.ColumnName.Contains("ReorderLevel", StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static bool IsReviewLikeTable(string tableName, TableSchema schema)
+        {
+            return tableName.Contains("Review", StringComparison.OrdinalIgnoreCase) ||
+                   schema.Columns.Any(c =>
+                       c.ColumnName.Contains("RatingValue", StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static bool IsProductCostLikeTable(string tableName, TableSchema schema)
+        {
+            return tableName.Contains("Product", StringComparison.OrdinalIgnoreCase) &&
+                   schema.Columns.Any(c =>
+                       c.ColumnName.Contains("CostPrice", StringComparison.OrdinalIgnoreCase));
         }
 
         private static bool TryDetermineRequiredCountRows(ConditionInfo condition, out int requiredRows)

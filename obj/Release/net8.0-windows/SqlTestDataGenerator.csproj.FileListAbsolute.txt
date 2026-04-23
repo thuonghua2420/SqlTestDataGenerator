@@ -136,3 +136,4 @@ D:\project\create-data\artifacts\scenario-count-fix\SqlTestDataGenerator.deps.js
 D:\project\create-data\artifacts\scenario-count-fix\SqlTestDataGenerator.runtimeconfig.json
 D:\project\create-data\artifacts\scenario-count-fix\SqlTestDataGenerator.dll
 D:\project\create-data\artifacts\scenario-count-fix\SqlTestDataGenerator.pdb
+D:\project\create-data\SqlTestDataGenerator\bin\Release\net8.0-windows\SqlTestDataGenerator.exe
