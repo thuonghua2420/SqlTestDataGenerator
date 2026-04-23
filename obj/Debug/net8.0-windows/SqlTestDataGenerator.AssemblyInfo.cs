@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("SqlTestDataGenerator")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+da07abb9039d6e9426af5648deb51c516ae170c0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+3c0527b6b06121b892042b6337e0699d0b74ef70")]
 [assembly: System.Reflection.AssemblyProductAttribute("SqlTestDataGenerator")]
 [assembly: System.Reflection.AssemblyTitleAttribute("SqlTestDataGenerator")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

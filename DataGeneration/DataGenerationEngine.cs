@@ -2,6 +2,7 @@ using SqlTestDataGenerator.DataGeneration.Models;
 using SqlTestDataGenerator.DataGeneration.ValueGenerators;
 using SqlTestDataGenerator.Parsing;
 using SqlTestDataGenerator.Parsing.Models;
+using SqlTestDataGenerator.Schema;
 using SqlTestDataGenerator.Schema.Models;
 
 namespace SqlTestDataGenerator.DataGeneration
@@ -14,12 +15,30 @@ namespace SqlTestDataGenerator.DataGeneration
     {
         private readonly ValueGeneratorFactory _valueFactory = new();
         private readonly DependencyOrderResolver _orderResolver = new();
-        private int _idCounter = 90000;
+        private int _fallbackSeedCounter = 90000;
 
         /// <summary>
-        /// Starting ID for generated data. Set high to avoid conflicts with existing data.
+        /// Fallback starting seed for generated data when database-backed per-table seeds are unavailable.
         /// </summary>
         public int StartId { get; set; } = 90000;
+
+        /// <summary>
+        /// Optional per-table starting IDs resolved from the connected database.
+        /// Keys are table names, values are the next available numeric key for that table.
+        /// </summary>
+        public Dictionary<string, int>? TableSeedStarts { get; set; }
+
+        /// <summary>
+        /// Optional sample rows loaded from the connected database.
+        /// Keys are table names, values are sample row dictionaries keyed by column name.
+        /// </summary>
+        public Dictionary<string, Dictionary<string, object?>>? SampleRowsByTable { get; set; }
+
+        /// <summary>
+        /// When enabled, unconstrained strings are expanded to max length and numerics are pushed toward max value.
+        /// When disabled, unconstrained values are synthesized from database sample rows when available.
+        /// </summary>
+        public bool UseMaxLengthMaxValueMode { get; set; }
 
         /// <summary>
         /// Target number of rows generated per table for each selected scenario.
@@ -34,7 +53,7 @@ namespace SqlTestDataGenerator.DataGeneration
             Dictionary<string, TableSchema> schemas,
             List<BranchScenario> scenarios)
         {
-            _idCounter = StartId;
+            _fallbackSeedCounter = StartId;
             var dataSet = new GeneratedDataSet
             {
                 OriginalSql = query.OriginalSql
@@ -57,6 +76,8 @@ namespace SqlTestDataGenerator.DataGeneration
                 insertOrder = _orderResolver.ResolveFromJoins(query);
             }
 
+            var nextTableIds = InitializeNextTableIds(tableNames);
+
             foreach (var tableName in tableNames)
             {
                 if (!insertOrder.Contains(tableName, StringComparer.OrdinalIgnoreCase))
@@ -69,7 +90,7 @@ namespace SqlTestDataGenerator.DataGeneration
             {
                 var workingScenario = CloneScenarioDescriptor(scenario);
                 workingScenario.InsertOrder = new List<string>(insertOrder);
-                GenerateScenarioData(workingScenario, query, schemas, insertOrder);
+                GenerateScenarioData(workingScenario, query, schemas, insertOrder, nextTableIds);
                 dataSet.Scenarios.Add(workingScenario);
             }
 
@@ -95,56 +116,92 @@ namespace SqlTestDataGenerator.DataGeneration
             BranchScenario scenario,
             ParsedQuery query,
             Dictionary<string, TableSchema> schemas,
-            List<string> insertOrder)
+            List<string> insertOrder,
+            Dictionary<string, int> nextTableIds)
         {
             var selfReferencePlans = BuildSelfReferencePlans(query, schemas);
-
-            // Generate a unique ID set for this scenario
-            var scenarioBaseId = _idCounter;
-            _idCounter += GetScenarioIdStride();
 
             switch (scenario.Type)
             {
                 case ScenarioType.Positive:
-                    GeneratePositiveData(scenario, query, schemas, insertOrder, scenarioBaseId, selfReferencePlans);
+                    GeneratePositiveData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans);
                     break;
 
                 case ScenarioType.WhereNegative:
-                    GenerateWhereNegativeData(scenario, query, schemas, insertOrder, scenarioBaseId, selfReferencePlans);
+                    GenerateWhereNegativeData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans);
                     break;
 
                 case ScenarioType.HavingNegative:
-                    GenerateHavingNegativeData(scenario, query, schemas, insertOrder, scenarioBaseId, selfReferencePlans);
+                    GenerateHavingNegativeData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans);
                     break;
 
                 case ScenarioType.JoinMiss:
-                    GenerateJoinMissData(scenario, query, schemas, insertOrder, scenarioBaseId, selfReferencePlans);
+                    GenerateJoinMissData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans);
                     break;
 
                 case ScenarioType.SubqueryMiss:
-                    GenerateSubqueryMissData(scenario, query, schemas, insertOrder, scenarioBaseId, selfReferencePlans);
+                    GenerateSubqueryMissData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans);
                     break;
 
                 case ScenarioType.Boundary:
-                    GenerateBoundaryData(scenario, query, schemas, insertOrder, scenarioBaseId, selfReferencePlans);
+                    GenerateBoundaryData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans);
                     break;
             }
         }
 
         private int GetRequestedRowCount() => Math.Max(1, RowsPerTable);
 
-        private int GetScenarioIdStride() => Math.Max(1000, GetRequestedRowCount() * 500);
+        private Dictionary<string, int> InitializeNextTableIds(IEnumerable<string> tableNames)
+        {
+            var nextIds = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var fallbackSeed = _fallbackSeedCounter;
+
+            foreach (var tableName in tableNames.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (TableSeedStarts != null &&
+                    TableSeedStarts.TryGetValue(tableName, out var resolvedSeed) &&
+                    resolvedSeed > 0)
+                {
+                    nextIds[tableName] = resolvedSeed;
+                    continue;
+                }
+
+                nextIds[tableName] = fallbackSeed;
+                fallbackSeed += 1000;
+            }
+
+            _fallbackSeedCounter = fallbackSeed;
+            return nextIds;
+        }
+
+        private int AllocateTableIdBlock(
+            Dictionary<string, int> nextTableIds,
+            string tableName,
+            int rowCount)
+        {
+            if (rowCount <= 0)
+                return 0;
+
+            if (!nextTableIds.TryGetValue(tableName, out var nextId) || nextId <= 0)
+            {
+                nextId = _fallbackSeedCounter;
+                nextTableIds[tableName] = nextId;
+                _fallbackSeedCounter += 1000;
+            }
+
+            nextTableIds[tableName] = nextId + rowCount + 1;
+            return nextId;
+        }
 
         // ─── Positive scenario: all conditions satisfied ────────────────
         private void GeneratePositiveData(
             BranchScenario scenario, ParsedQuery query,
-            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId,
+            Dictionary<string, TableSchema> schemas, List<string> insertOrder, Dictionary<string, int> nextTableIds,
             Dictionary<string, SelfReferencePlan> selfReferencePlans)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
-            int currentId = baseId;
 
             // Determine how many rows we need for HAVING conditions
             int rowMultiplier = DetermineRowMultiplier(query);
@@ -161,10 +218,15 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 // For tables that contribute to aggregates, create multiple rows
                 bool isAggregateSource = IsAggregateSourceTable(tableName, alias, query);
-                int rowCount = isAggregateSource
-                    ? Math.Max(rowMultiplier, GetRequestedRowCount())
-                    : GetRequestedRowCount();
+                int rowCount = DetermineScenarioRowCount(
+                    tableName,
+                    schema,
+                    query,
+                    isAggregateSource,
+                    rowMultiplier,
+                    GetRequestedRowCount());
                 rowCount = ApplySelfReferenceMinimumRowCount(tableName, rowCount, selfReferencePlans);
+                int currentId = AllocateTableIdBlock(nextTableIds, tableName, rowCount);
 
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
@@ -181,12 +243,12 @@ namespace SqlTestDataGenerator.DataGeneration
                         row.SetValue(col.ColumnName, value);
                     }
 
+                    ApplySemanticRowAdjustments(query, scenario, schema, row, rowIdx);
                     scenario.AddRow(tableName, row);
                 }
 
                 RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
                 RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
-                currentId += rowCount + 1;
             }
 
         }
@@ -194,13 +256,12 @@ namespace SqlTestDataGenerator.DataGeneration
         // ─── WHERE negative: one condition violated ─────────────────────
         private void GenerateWhereNegativeData(
             BranchScenario scenario, ParsedQuery query,
-            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId,
+            Dictionary<string, TableSchema> schemas, List<string> insertOrder, Dictionary<string, int> nextTableIds,
             Dictionary<string, SelfReferencePlan> selfReferencePlans)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
-            int currentId = baseId;
 
             foreach (var tableName in insertOrder)
             {
@@ -215,6 +276,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     tableName,
                     GetRequestedRowCount(),
                     selfReferencePlans);
+                int currentId = AllocateTableIdBlock(nextTableIds, tableName, rowCount);
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
                     var row = new GeneratedRow { TableName = tableName };
@@ -235,7 +297,6 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
                 RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
-                currentId += rowCount + 1;
             }
 
         }
@@ -243,13 +304,12 @@ namespace SqlTestDataGenerator.DataGeneration
         // ─── HAVING negative: aggregate condition fails ─────────────────
         private void GenerateHavingNegativeData(
             BranchScenario scenario, ParsedQuery query,
-            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId,
+            Dictionary<string, TableSchema> schemas, List<string> insertOrder, Dictionary<string, int> nextTableIds,
             Dictionary<string, SelfReferencePlan> selfReferencePlans)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
-            int currentId = baseId;
 
             var testedConditions = query.EnumerateScopeConditions(ConditionSource.Having)
                 .Where(c => !GetDesiredTruthForCondition(scenario, c, true))
@@ -281,6 +341,11 @@ namespace SqlTestDataGenerator.DataGeneration
                 }
 
                 rowCount = ApplySelfReferenceMinimumRowCount(tableName, rowCount, selfReferencePlans);
+                if (rowCount <= 0)
+                {
+                    continue;
+                }
+                int currentId = AllocateTableIdBlock(nextTableIds, tableName, rowCount);
 
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
@@ -317,7 +382,6 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
                 RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
-                currentId += rowCount + 1;
             }
 
         }
@@ -325,13 +389,12 @@ namespace SqlTestDataGenerator.DataGeneration
         // ─── JOIN miss: LEFT/RIGHT join with no match ───────────────────
         private void GenerateJoinMissData(
             BranchScenario scenario, ParsedQuery query,
-            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId,
+            Dictionary<string, TableSchema> schemas, List<string> insertOrder, Dictionary<string, int> nextTableIds,
             Dictionary<string, SelfReferencePlan> selfReferencePlans)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
-            int currentId = baseId;
 
             // Find which join is being tested
             var testedJoin = query.Joins
@@ -357,6 +420,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     tableName,
                     GetRequestedRowCount(),
                     selfReferencePlans);
+                int currentId = AllocateTableIdBlock(nextTableIds, tableName, rowCount);
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
                     var row = new GeneratedRow { TableName = tableName };
@@ -391,20 +455,18 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
                 RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
-                currentId += rowCount + 1;
             }
         }
 
         // ─── Subquery miss: value not in subquery result ────────────────
         private void GenerateSubqueryMissData(
             BranchScenario scenario, ParsedQuery query,
-            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId,
+            Dictionary<string, TableSchema> schemas, List<string> insertOrder, Dictionary<string, int> nextTableIds,
             Dictionary<string, SelfReferencePlan> selfReferencePlans)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
-            int currentId = baseId;
 
             foreach (var tableName in insertOrder)
             {
@@ -419,6 +481,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     tableName,
                     GetRequestedRowCount(),
                     selfReferencePlans);
+                int currentId = AllocateTableIdBlock(nextTableIds, tableName, rowCount);
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
                     var row = new GeneratedRow { TableName = tableName };
@@ -439,7 +502,6 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
                 RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
-                currentId += rowCount + 1;
             }
 
         }
@@ -447,14 +509,13 @@ namespace SqlTestDataGenerator.DataGeneration
         // ─── Boundary: values at exact boundary ────────────────────────
         private void GenerateBoundaryData(
             BranchScenario scenario, ParsedQuery query,
-            Dictionary<string, TableSchema> schemas, List<string> insertOrder, int baseId,
+            Dictionary<string, TableSchema> schemas, List<string> insertOrder, Dictionary<string, int> nextTableIds,
             Dictionary<string, SelfReferencePlan> selfReferencePlans)
         {
             // Similar to positive, but range conditions use exact boundary values
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
-            int currentId = baseId;
 
             var testedCondition = scenario.BoundaryConditionKey == null
                 ? null
@@ -481,9 +542,13 @@ namespace SqlTestDataGenerator.DataGeneration
                     ?.Alias ?? tableName;
 
                 bool isAggSource = IsAggregateSourceTable(tableName, alias, query);
-                int rowCount = isAggSource
-                    ? Math.Max(rowMultiplier, GetRequestedRowCount())
-                    : GetRequestedRowCount();
+                int rowCount = DetermineScenarioRowCount(
+                    tableName,
+                    schema,
+                    query,
+                    isAggSource,
+                    rowMultiplier,
+                    GetRequestedRowCount());
                 if (countBoundaryRows.HasValue &&
                     !string.IsNullOrWhiteSpace(countBoundaryTargetTable) &&
                     tableName.Equals(countBoundaryTargetTable, StringComparison.OrdinalIgnoreCase))
@@ -491,6 +556,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     rowCount = countBoundaryRows.Value;
                 }
                 rowCount = ApplySelfReferenceMinimumRowCount(tableName, rowCount, selfReferencePlans);
+                int currentId = AllocateTableIdBlock(nextTableIds, tableName, rowCount);
 
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
                 {
@@ -520,12 +586,12 @@ namespace SqlTestDataGenerator.DataGeneration
                         row.SetValue(col.ColumnName, value);
                     }
 
+                    ApplySemanticRowAdjustments(query, scenario, schema, row, rowIdx);
                     scenario.AddRow(tableName, row);
                 }
 
                 RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
                 RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
-                currentId += rowCount + 1;
             }
 
         }
@@ -676,7 +742,77 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             // 5. Default value generation
+            return GenerateDefaultColumnValue(col, generator, rowIndex);
+        }
+
+        private object GenerateDefaultColumnValue(
+            ColumnSchema col,
+            IValueGenerator generator,
+            int rowIndex)
+        {
+            if (UseMaxLengthMaxValueMode)
+            {
+                var maxModeValue = GenerateMaxLengthMaxValue(col, rowIndex);
+                if (maxModeValue != null)
+                {
+                    return maxModeValue;
+                }
+            }
+
+            if (TryGetSampleValue(col, out var sampleValue))
+            {
+                var sampleModeValue = GenerateSampleBasedValue(col, sampleValue, rowIndex);
+                if (sampleModeValue != null)
+                {
+                    return sampleModeValue;
+                }
+            }
+
             return generator.GenerateDefault(col);
+        }
+
+        private bool TryGetSampleValue(ColumnSchema column, out object? sampleValue)
+        {
+            sampleValue = null;
+            if (SampleRowsByTable == null)
+                return false;
+
+            if (!SampleRowsByTable.TryGetValue(column.TableName, out var row))
+                return false;
+
+            return row.TryGetValue(column.ColumnName, out sampleValue);
+        }
+
+        private object? GenerateMaxLengthMaxValue(ColumnSchema column, int rowIndex)
+        {
+            return column.TypeCategory switch
+            {
+                DataTypeCategory.String => BuildMaxLengthString(column, rowIndex),
+                DataTypeCategory.Integer => BuildMaxNumericValue(column, rowIndex),
+                DataTypeCategory.Decimal => BuildMaxNumericValue(column, rowIndex),
+                DataTypeCategory.Float => BuildMaxNumericValue(column, rowIndex),
+                _ => null
+            };
+        }
+
+        private object? GenerateSampleBasedValue(ColumnSchema column, object? sampleValue, int rowIndex)
+        {
+            if (sampleValue == null || sampleValue == DBNull.Value)
+                return null;
+
+            return column.TypeCategory switch
+            {
+                DataTypeCategory.String => MutateSampleString(column, sampleValue, rowIndex),
+                DataTypeCategory.Integer => MutateSampleNumeric(column, sampleValue, rowIndex),
+                DataTypeCategory.Decimal => MutateSampleNumeric(column, sampleValue, rowIndex),
+                DataTypeCategory.Float => MutateSampleNumeric(column, sampleValue, rowIndex),
+                DataTypeCategory.DateTime => MutateSampleDateTime(column, sampleValue, rowIndex),
+                DataTypeCategory.DateTimeOffset => MutateSampleDateTimeOffset(column, sampleValue, rowIndex),
+                DataTypeCategory.Time => MutateSampleTime(column, sampleValue, rowIndex),
+                DataTypeCategory.Boolean => MutateSampleBoolean(column, sampleValue, rowIndex),
+                DataTypeCategory.Guid => Guid.NewGuid(),
+                _ => SqlServerValueNormalizer.NormalizeValue(column, sampleValue)
+            };
         }
 
         private object? GenerateConditionValue(
@@ -734,6 +870,503 @@ namespace SqlTestDataGenerator.DataGeneration
             return satisfy
                 ? generator.GenerateSatisfying(col, opStr, condition.Value)
                 : generator.GenerateViolating(col, opStr, condition.Value);
+        }
+
+        private object BuildMaxLengthString(ColumnSchema column, int rowIndex)
+        {
+            var targetLength = ResolveTargetStringLength(column);
+            if (targetLength <= 0)
+                return string.Empty;
+
+            var rowToken = (rowIndex + 1).ToString("D4");
+            if (targetLength <= rowToken.Length)
+            {
+                return rowToken[^targetLength..];
+            }
+
+            var prefixSeed = $"{Abbreviate(column.TableName, 3)}{Abbreviate(column.ColumnName, 4)}";
+            var prefixLength = targetLength - rowToken.Length;
+            var builder = new System.Text.StringBuilder(prefixSeed);
+            while (builder.Length < prefixLength)
+            {
+                builder.Append(Abbreviate(column.ColumnName, 3));
+            }
+
+            var prefix = builder.ToString();
+            if (prefix.Length > prefixLength)
+            {
+                prefix = prefix[..prefixLength];
+            }
+
+            var value = prefix + rowToken;
+
+            return SqlServerValueNormalizer.NormalizeValue(column, value) ?? string.Empty;
+        }
+
+        private object BuildMaxNumericValue(ColumnSchema column, int rowIndex)
+        {
+            var offset = rowIndex + GetColumnVariantOffset(column);
+
+            return column.TypeCategory switch
+            {
+                DataTypeCategory.Integer => SqlServerValueNormalizer.NormalizeValue(column, GetMaxIntegerValue(column) - offset) ?? 0,
+                DataTypeCategory.Decimal => SqlServerValueNormalizer.NormalizeValue(
+                    column,
+                    GetMaxDecimalValue(column) - (offset * GetNumericStep(column))) ?? 0m,
+                DataTypeCategory.Float => SqlServerValueNormalizer.NormalizeValue(
+                    column,
+                    GetMaxFloatValue(column) - offset) ?? 0d,
+                _ => 0
+            };
+        }
+
+        private object MutateSampleString(ColumnSchema column, object sampleValue, int rowIndex)
+        {
+            var source = Convert.ToString(sampleValue, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+            if (string.IsNullOrEmpty(source) || IsSyntheticSampleString(source))
+            {
+                return BuildSemanticString(column, rowIndex, null);
+            }
+
+            return BuildSourceDerivedString(column, source, rowIndex);
+        }
+
+        private object BuildFallbackSampleString(ColumnSchema column, int rowIndex)
+        {
+            return BuildSemanticString(column, rowIndex, null);
+        }
+
+        private object BuildSemanticString(ColumnSchema column, int rowIndex, string? source)
+        {
+            var targetLength = Math.Min(ResolveTargetStringLength(column), 96);
+            if (targetLength <= 0)
+                return string.Empty;
+
+            var rowToken = (rowIndex + 1).ToString("D3");
+            var tableToken = Abbreviate(column.TableName, 3);
+            var columnToken = Abbreviate(column.ColumnName, 4);
+            var semanticSource = ExtractSemanticSourceFragment(source);
+
+            string candidate;
+            if (IsEmailColumn(column))
+            {
+                var localPart = BuildCompactToken(semanticSource, $"{tableToken}{columnToken}", rowToken, Math.Max(1, targetLength - "@example.test".Length));
+                candidate = $"{localPart}@example.test";
+            }
+            else if (LooksLikeUrl(source ?? string.Empty) || IsUrlColumn(column))
+            {
+                var host = BuildCompactToken(semanticSource, $"{tableToken}{columnToken}", rowToken, Math.Max(1, targetLength - "https://.example.test".Length));
+                candidate = $"https://{host.ToLowerInvariant()}.example.test";
+            }
+            else if (IsPhoneColumn(column))
+            {
+                candidate = BuildPhoneLikeString(column, rowIndex, targetLength);
+            }
+            else if (IsCodeLikeColumn(column))
+            {
+                candidate = BuildCompactToken(semanticSource, $"{tableToken}{columnToken}", rowToken, targetLength);
+            }
+            else if (IsTierLikeColumn(column))
+            {
+                var tiers = new[] { "Bronze", "Silver", "Gold", "Platinum", "Diamond" };
+                var tier = tiers[(rowIndex + GetColumnVariantOffset(column)) % tiers.Length];
+                candidate = ComposeSemanticLabel(tier, tableToken, rowToken, targetLength);
+            }
+            else if (IsStatusLikeColumn(column))
+            {
+                var states = new[] { "Active", "Ready", "Primary", "Enabled", "Current" };
+                var state = states[(rowIndex + GetColumnVariantOffset(column)) % states.Length];
+                candidate = ComposeSemanticLabel(state, tableToken, rowToken, targetLength);
+            }
+            else if (IsNameLikeColumn(column))
+            {
+                var tableLabel = HumanizeToken(column.TableName);
+                var columnLabel = HumanizeToken(column.ColumnName);
+                candidate = $"{tableLabel} {columnLabel} {rowToken}";
+                if (!string.IsNullOrWhiteSpace(semanticSource))
+                {
+                    candidate = $"{tableLabel} {semanticSource} {rowToken}";
+                }
+            }
+            else
+            {
+                var columnLabel = HumanizeToken(column.ColumnName);
+                candidate = $"{tableToken}-{columnLabel}-{rowToken}";
+                if (!string.IsNullOrWhiteSpace(semanticSource))
+                {
+                    candidate = $"{columnLabel} {semanticSource} {rowToken}";
+                }
+            }
+
+            candidate = FitSemanticString(candidate, rowToken, targetLength);
+            return SqlServerValueNormalizer.NormalizeValue(column, candidate) ?? candidate;
+        }
+
+        private object BuildSourceDerivedString(ColumnSchema column, string source, int rowIndex)
+        {
+            var targetLength = Math.Min(ResolveTargetStringLength(column), 96);
+            if (targetLength <= 0)
+                return string.Empty;
+
+            var rowToken = (rowIndex + 1).ToString("D3");
+            var tableToken = Abbreviate(column.TableName, 2);
+            var columnToken = Abbreviate(column.ColumnName, 3);
+            var token = $"{tableToken}{columnToken}{rowToken}";
+            string mutated;
+
+            if (source.Contains('@'))
+            {
+                var atIndex = source.IndexOf('@');
+                var local = source[..atIndex];
+                var domain = source[atIndex..];
+                mutated = $"{local}+{token.ToLowerInvariant()}{domain}";
+            }
+            else if (LooksLikeUrl(source))
+            {
+                mutated = source.TrimEnd('/') + "/" + token.ToLowerInvariant();
+            }
+            else if (source.All(char.IsDigit))
+            {
+                mutated = ReplaceTrailingDigits(source, token);
+            }
+            else if (IsPhoneColumn(column))
+            {
+                mutated = ReplaceTrailingDigits(new string(source.Where(char.IsDigit).ToArray()), token);
+                if (string.IsNullOrEmpty(mutated))
+                {
+                    mutated = BuildPhoneLikeString(column, rowIndex, targetLength);
+                }
+            }
+            else if (IsCodeLikeColumn(column) || source.Any(char.IsDigit) || !source.Contains(' '))
+            {
+                mutated = $"{source}_{token}";
+            }
+            else
+            {
+                mutated = $"{source} ({token})";
+            }
+
+            mutated = FitSemanticString(mutated, rowToken, targetLength);
+            return SqlServerValueNormalizer.NormalizeValue(column, mutated) ?? BuildSemanticString(column, rowIndex, source);
+        }
+
+        private static bool IsSyntheticSampleString(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return true;
+
+            var trimmed = value.Trim();
+            if (trimmed.Contains("TestData", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(trimmed, @"^[A-Z]{2}_[A-Z0-9]{2,6}_\d{2,3}$"))
+                return true;
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(trimmed, @"^TD[0-9A-Z_]+$"))
+                return true;
+
+            return false;
+        }
+
+        private static string? ExtractSemanticSourceFragment(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value) || IsSyntheticSampleString(value))
+                return null;
+
+            var cleaned = HumanizeToken(value);
+            if (string.IsNullOrWhiteSpace(cleaned))
+                return null;
+
+            var parts = cleaned.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            return string.Join(" ", parts.Take(2));
+        }
+
+        private static string HumanizeToken(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return string.Empty;
+
+            var spaced = System.Text.RegularExpressions.Regex.Replace(value, "([a-z0-9])([A-Z])", "$1 $2");
+            spaced = System.Text.RegularExpressions.Regex.Replace(spaced, "[^A-Za-z0-9]+", " ").Trim();
+            if (string.IsNullOrWhiteSpace(spaced))
+                return string.Empty;
+
+            var words = spaced
+                .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                .Select(w => char.ToUpperInvariant(w[0]) + w[1..].ToLowerInvariant());
+            return string.Join(" ", words);
+        }
+
+        private static string BuildCompactToken(string? semanticSource, string prefix, string rowToken, int maxLength)
+        {
+            if (maxLength <= 0)
+                return string.Empty;
+
+            var sourceToken = new string((semanticSource ?? string.Empty)
+                .Where(char.IsLetterOrDigit)
+                .Take(6)
+                .Select(char.ToUpperInvariant)
+                .ToArray());
+
+            var core = $"{prefix}{sourceToken}{rowToken}";
+            if (core.Length <= maxLength)
+                return core;
+
+            if (maxLength <= rowToken.Length)
+                return rowToken[^maxLength..];
+
+            var prefixBudget = maxLength - rowToken.Length;
+            var clippedPrefix = core[..prefixBudget];
+            return clippedPrefix + rowToken;
+        }
+
+        private static string BuildPhoneLikeString(ColumnSchema column, int rowIndex, int targetLength)
+        {
+            var digits = $"{Math.Abs(StringComparer.OrdinalIgnoreCase.GetHashCode(column.ColumnKey)) % 10000:D4}{rowIndex + 1:D4}";
+            if (targetLength <= 0)
+                return string.Empty;
+
+            if (targetLength <= digits.Length)
+                return digits[^targetLength..];
+
+            return ("0" + digits).PadRight(targetLength, '0')[..targetLength];
+        }
+
+        private static string ComposeSemanticLabel(string seed, string tableToken, string rowToken, int targetLength)
+        {
+            var candidate = $"{seed} {tableToken} {rowToken}";
+            return FitSemanticString(candidate, rowToken, targetLength);
+        }
+
+        private static string FitSemanticString(string value, string rowToken, int targetLength)
+        {
+            if (targetLength <= 0)
+                return string.Empty;
+
+            if (value.Length <= targetLength)
+                return value;
+
+            if (targetLength <= rowToken.Length)
+                return rowToken[^targetLength..];
+
+            var prefixLength = Math.Max(0, targetLength - rowToken.Length);
+            var trimmed = value.Length >= prefixLength
+                ? value[..prefixLength].TrimEnd(' ', '-', '_', '(', ')')
+                : value.TrimEnd(' ', '-', '_', '(', ')');
+            var recombined = trimmed + rowToken;
+            if (recombined.Length < targetLength)
+            {
+                recombined = recombined.PadRight(targetLength, rowToken[^1]);
+            }
+
+            return recombined[..targetLength];
+        }
+
+        private static bool IsCodeLikeColumn(ColumnSchema column)
+        {
+            return column.ColumnName.Contains("Code", StringComparison.OrdinalIgnoreCase) ||
+                   column.ColumnName.EndsWith("Number", StringComparison.OrdinalIgnoreCase) ||
+                   column.ColumnName.EndsWith("No", StringComparison.OrdinalIgnoreCase) ||
+                   column.ColumnName.Contains("Sku", StringComparison.OrdinalIgnoreCase) ||
+                   column.ColumnName.Contains("Barcode", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsNameLikeColumn(ColumnSchema column)
+        {
+            return column.ColumnName.Contains("Name", StringComparison.OrdinalIgnoreCase) ||
+                   column.ColumnName.Contains("Title", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsTierLikeColumn(ColumnSchema column)
+        {
+            return column.ColumnName.Contains("Tier", StringComparison.OrdinalIgnoreCase) ||
+                   column.ColumnName.Contains("Level", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsStatusLikeColumn(ColumnSchema column)
+        {
+            return column.ColumnName.Contains("Status", StringComparison.OrdinalIgnoreCase) ||
+                   column.ColumnName.Contains("State", StringComparison.OrdinalIgnoreCase) ||
+                   column.ColumnName.Contains("Type", StringComparison.OrdinalIgnoreCase) ||
+                   column.ColumnName.Contains("Format", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsEmailColumn(ColumnSchema column) =>
+            column.ColumnName.Contains("Email", StringComparison.OrdinalIgnoreCase);
+
+        private static bool IsUrlColumn(ColumnSchema column) =>
+            column.ColumnName.Contains("Url", StringComparison.OrdinalIgnoreCase) ||
+            column.ColumnName.Contains("Website", StringComparison.OrdinalIgnoreCase);
+
+        private static bool IsPhoneColumn(ColumnSchema column) =>
+            column.ColumnName.Contains("Phone", StringComparison.OrdinalIgnoreCase) ||
+            column.ColumnName.Contains("Mobile", StringComparison.OrdinalIgnoreCase) ||
+            column.ColumnName.Contains("Fax", StringComparison.OrdinalIgnoreCase);
+
+        private object MutateSampleNumeric(ColumnSchema column, object sampleValue, int rowIndex)
+        {
+            var offset = rowIndex + GetColumnVariantOffset(column);
+
+            return column.TypeCategory switch
+            {
+                DataTypeCategory.Integer => SqlServerValueNormalizer.NormalizeValue(
+                    column,
+                    Convert.ToInt64(sampleValue, System.Globalization.CultureInfo.InvariantCulture) + offset) ?? 0,
+                DataTypeCategory.Decimal => SqlServerValueNormalizer.NormalizeValue(
+                    column,
+                    Convert.ToDecimal(sampleValue, System.Globalization.CultureInfo.InvariantCulture) + (offset * GetNumericStep(column))) ?? 0m,
+                DataTypeCategory.Float => SqlServerValueNormalizer.NormalizeValue(
+                    column,
+                    Convert.ToDouble(sampleValue, System.Globalization.CultureInfo.InvariantCulture) + offset) ?? 0d,
+                _ => sampleValue
+            };
+        }
+
+        private object MutateSampleDateTime(ColumnSchema column, object sampleValue, int rowIndex)
+        {
+            var normalized = SqlServerValueNormalizer.NormalizeValue(column, sampleValue);
+            var source = normalized is DateTime dt ? dt : DateTime.Now;
+            var offset = rowIndex + GetColumnVariantOffset(column);
+            var mutated = column.DataType.Equals("date", StringComparison.OrdinalIgnoreCase)
+                ? source.AddDays(offset)
+                : source.AddMinutes(offset * 7);
+            return SqlServerValueNormalizer.NormalizeValue(column, mutated) ?? mutated;
+        }
+
+        private object MutateSampleDateTimeOffset(ColumnSchema column, object sampleValue, int rowIndex)
+        {
+            var normalized = SqlServerValueNormalizer.NormalizeValue(column, sampleValue);
+            var source = normalized is DateTimeOffset dto ? dto : DateTimeOffset.Now;
+            var offset = rowIndex + GetColumnVariantOffset(column);
+            var mutated = source.AddMinutes(offset * 7);
+            return SqlServerValueNormalizer.NormalizeValue(column, mutated) ?? mutated;
+        }
+
+        private object MutateSampleTime(ColumnSchema column, object sampleValue, int rowIndex)
+        {
+            var normalized = SqlServerValueNormalizer.NormalizeValue(column, sampleValue);
+            var source = normalized is TimeSpan ts ? ts : TimeSpan.Zero;
+            var offset = rowIndex + GetColumnVariantOffset(column);
+            return SqlServerValueNormalizer.NormalizeValue(column, source.Add(TimeSpan.FromMinutes(offset * 3))) ?? source;
+        }
+
+        private object MutateSampleBoolean(ColumnSchema column, object sampleValue, int rowIndex)
+        {
+            var normalized = SqlServerValueNormalizer.NormalizeValue(column, sampleValue);
+            var source = normalized is bool b && b;
+            return ((rowIndex + GetColumnVariantOffset(column)) % 2 == 0) ? source : !source;
+        }
+
+        private static bool LooksLikeUrl(string value)
+        {
+            return value.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                   value.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ||
+                   value.StartsWith("www.", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string ReplaceTrailingDigits(string source, string token)
+        {
+            if (string.IsNullOrEmpty(source))
+                return token;
+
+            var digits = new string(token.Where(char.IsDigit).ToArray());
+            if (string.IsNullOrEmpty(digits))
+                digits = "01";
+
+            var chars = source.ToCharArray();
+            var replacementIndex = digits.Length - 1;
+            for (int i = chars.Length - 1; i >= 0; i--)
+            {
+                if (!char.IsDigit(chars[i]))
+                    continue;
+
+                chars[i] = digits[replacementIndex >= 0 ? replacementIndex : 0];
+                replacementIndex--;
+            }
+
+            return new string(chars);
+        }
+
+        private int ResolveTargetStringLength(ColumnSchema column)
+        {
+            if (column.MaxLength.HasValue && column.MaxLength.Value > 0)
+                return column.MaxLength.Value;
+
+            if (TryGetSampleValue(column, out var sampleValue) &&
+                sampleValue != null)
+            {
+                var sampleText = Convert.ToString(sampleValue, System.Globalization.CultureInfo.InvariantCulture);
+                if (!string.IsNullOrEmpty(sampleText))
+                    return Math.Max(sampleText.Length, 12);
+            }
+
+            return 64;
+        }
+
+        private int GetColumnVariantOffset(ColumnSchema column)
+        {
+            var hash = Math.Abs(StringComparer.OrdinalIgnoreCase.GetHashCode(column.ColumnKey));
+            return (hash % 17) + 1;
+        }
+
+        private static string Abbreviate(string value, int maxLength)
+        {
+            var filtered = new string(value.Where(char.IsLetterOrDigit).ToArray()).ToUpperInvariant();
+            if (string.IsNullOrEmpty(filtered))
+                filtered = "COL";
+
+            return filtered.Length <= maxLength
+                ? filtered
+                : filtered[..maxLength];
+        }
+
+        private static decimal GetNumericStep(ColumnSchema column)
+        {
+            if (column.NumericScale.HasValue && column.NumericScale.Value > 0)
+            {
+                decimal step = 1m;
+                for (int i = 0; i < column.NumericScale.Value; i++)
+                {
+                    step /= 10m;
+                }
+
+                return step;
+            }
+
+            return 1m;
+        }
+
+        private static long GetMaxIntegerValue(ColumnSchema column)
+        {
+            return column.DataType.ToLowerInvariant() switch
+            {
+                "tinyint" => byte.MaxValue,
+                "smallint" => short.MaxValue,
+                "int" => int.MaxValue,
+                _ => long.MaxValue / 1024
+            };
+        }
+
+        private static decimal GetMaxDecimalValue(ColumnSchema column)
+        {
+            var scale = Math.Max(0, column.NumericScale ?? 0);
+            var precision = Math.Max(1, column.NumericPrecision ?? 18);
+            var integerDigits = Math.Max(0, precision - scale);
+            decimal wholePart = 1m;
+            for (int i = 0; i < integerDigits; i++)
+            {
+                wholePart *= 10m;
+            }
+
+            var step = GetNumericStep(column);
+            var max = wholePart - step;
+            return max > 0m ? max : step;
+        }
+
+        private static double GetMaxFloatValue(ColumnSchema column)
+        {
+            var digits = column.DataType.Equals("real", StringComparison.OrdinalIgnoreCase) ? 7 : 15;
+            return Math.Pow(10d, digits) - 1d;
         }
 
         private List<ColumnConditionTarget> GetApplicableConditionTargets(
@@ -1657,6 +2290,223 @@ namespace SqlTestDataGenerator.DataGeneration
         // Helpers
         // ═════════════════════════════════════════════════════════════════
 
+        private void ApplySemanticRowAdjustments(
+            ParsedQuery query,
+            BranchScenario scenario,
+            TableSchema schema,
+            GeneratedRow row,
+            int rowIndex)
+        {
+            if (!NeedsAggregateDiversitySupport(query))
+                return;
+
+            if (IsLineLikeTable(schema.TableName, schema))
+            {
+                ApplyLineRowAdjustments(query, scenario, schema, row, rowIndex);
+            }
+            else if (IsPaymentLikeTable(schema.TableName, schema))
+            {
+                ApplyPaymentRowAdjustments(query, scenario, schema, row, rowIndex);
+            }
+        }
+
+        private void ApplyLineRowAdjustments(
+            ParsedQuery query,
+            BranchScenario scenario,
+            TableSchema schema,
+            GeneratedRow row,
+            int rowIndex)
+        {
+            var quantity = UseMaxLengthMaxValueMode
+                ? BuildSafeHighInteger(schema, "QuantityOrdered", rowIndex, 0, 3, 2 + rowIndex)
+                : 2 + rowIndex;
+            var unitPrice = UseMaxLengthMaxValueMode
+                ? BuildSafeHighDecimal(schema, "UnitPrice", rowIndex, 0, 4, 11.25m + (rowIndex * 2.15m))
+                : 11.25m + (rowIndex * 2.15m);
+            var unitCost = UseMaxLengthMaxValueMode
+                ? BuildSafeHighDecimal(schema, "UnitCost", rowIndex, 3, 4, Math.Max(0.01m, unitPrice - 1.35m))
+                : unitPrice - 1.35m;
+            var lineTotal = UseMaxLengthMaxValueMode
+                ? BuildSafeHighDecimal(schema, "LineTotal", rowIndex, 7, 5, (quantity * unitPrice) + (rowIndex * 0.5m))
+                : (quantity * unitPrice) + (rowIndex * 0.5m);
+
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "QuantityOrdered", quantity);
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "Quantity", quantity);
+            var quantityShipped = UseMaxLengthMaxValueMode
+                ? BuildSafeHighInteger(schema, "QuantityShipped", rowIndex, 2, 3, Math.Max(1, quantity - 1))
+                : Math.Max(1, quantity - 1);
+            var quantityReturned = UseMaxLengthMaxValueMode
+                ? BuildSafeHighInteger(schema, "QuantityReturned", rowIndex, 4, 2, rowIndex % 2)
+                : rowIndex % 2;
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "QuantityShipped", quantityShipped);
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "QuantityReturned", quantityReturned);
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "UnitPrice", unitPrice);
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "UnitCost", unitCost);
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "LineTotal", lineTotal);
+            var discountPercent = UseMaxLengthMaxValueMode
+                ? BuildSafeHighDecimal(schema, "DiscountPercent", rowIndex, 11, 2, 0.01m + (rowIndex * 0.01m))
+                : 0.01m + (rowIndex * 0.01m);
+            var taxRate = UseMaxLengthMaxValueMode
+                ? BuildSafeHighDecimal(schema, "TaxRate", rowIndex, 13, 2, 0.05m + (rowIndex * 0.01m))
+                : 0.05m + (rowIndex * 0.01m);
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "DiscountPercent", discountPercent);
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "TaxRate", taxRate);
+        }
+
+        private void ApplyPaymentRowAdjustments(
+            ParsedQuery query,
+            BranchScenario scenario,
+            TableSchema schema,
+            GeneratedRow row,
+            int rowIndex)
+        {
+            var amountPaid = UseMaxLengthMaxValueMode
+                ? BuildSafeHighDecimal(schema, "AmountPaid", rowIndex, 0, 5, 35.00m + (rowIndex * 9.75m))
+                : 35.00m + (rowIndex * 9.75m);
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "AmountPaid", amountPaid);
+            var gatewayFee = UseMaxLengthMaxValueMode
+                ? BuildSafeHighDecimal(schema, "GatewayFee", rowIndex, 4, 3, 0.50m + (rowIndex * 0.10m))
+                : 0.50m + (rowIndex * 0.10m);
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, "GatewayFee", gatewayFee);
+        }
+
+        private int BuildSafeHighInteger(
+            TableSchema schema,
+            string columnName,
+            int rowIndex,
+            int extraOffset,
+            int maxDigits,
+            int fallback)
+        {
+            var raw = BuildAdjustedMaxInteger(schema, columnName, rowIndex, extraOffset, fallback);
+            var safeCap = (int)Math.Min(raw, Math.Pow(10, Math.Max(1, maxDigits)) - 1);
+            var candidate = safeCap - rowIndex;
+            return candidate > 0 ? candidate : Math.Max(1, fallback);
+        }
+
+        private decimal BuildSafeHighDecimal(
+            TableSchema schema,
+            string columnName,
+            int rowIndex,
+            int extraOffset,
+            int maxIntegerDigits,
+            decimal fallback)
+        {
+            var column = schema.Columns.FirstOrDefault(c => c.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase));
+            if (column == null)
+                return fallback;
+
+            var scale = Math.Max(0, column.NumericScale ?? 0);
+            var integerDigits = column.NumericPrecision.HasValue
+                ? Math.Max(1, column.NumericPrecision.Value - scale)
+                : Math.Max(1, maxIntegerDigits);
+            var cappedIntegerDigits = Math.Min(integerDigits, Math.Max(1, maxIntegerDigits));
+
+            decimal wholePart = 1m;
+            for (int i = 0; i < cappedIntegerDigits; i++)
+            {
+                wholePart *= 10m;
+            }
+
+            var step = GetNumericStep(column);
+            var safeMax = wholePart - step;
+            var candidate = safeMax - ((rowIndex + extraOffset) * step);
+            if (candidate <= 0m)
+                candidate = step;
+
+            var normalized = SqlServerValueNormalizer.NormalizeValue(column, candidate);
+            return normalized is decimal d ? d : fallback;
+        }
+
+        private int BuildAdjustedMaxInteger(
+            TableSchema schema,
+            string columnName,
+            int rowIndex,
+            int extraOffset,
+            int fallback)
+        {
+            var column = schema.Columns.FirstOrDefault(c => c.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase));
+            if (column == null)
+                return fallback;
+
+            var raw = BuildMaxNumericValue(column, rowIndex + extraOffset);
+            try
+            {
+                return Convert.ToInt32(raw, System.Globalization.CultureInfo.InvariantCulture);
+            }
+            catch
+            {
+                return fallback;
+            }
+        }
+
+        private decimal BuildAdjustedMaxDecimal(
+            TableSchema schema,
+            string columnName,
+            int rowIndex,
+            int extraOffset,
+            decimal fallback)
+        {
+            var column = schema.Columns.FirstOrDefault(c => c.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase));
+            if (column == null)
+                return fallback;
+
+            var raw = BuildMaxNumericValue(column, rowIndex + extraOffset);
+            try
+            {
+                return Convert.ToDecimal(raw, System.Globalization.CultureInfo.InvariantCulture);
+            }
+            catch
+            {
+                return fallback;
+            }
+        }
+
+        private void SetNormalizedRowValueIfSafe(
+            ParsedQuery query,
+            BranchScenario scenario,
+            TableSchema schema,
+            GeneratedRow row,
+            string columnName,
+            object rawValue)
+        {
+            var column = schema.Columns.FirstOrDefault(c => c.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase));
+            if (column == null)
+                return;
+
+            if (scenario.BoundaryConditionKey != null &&
+                FindConditionByKey(query, scenario.BoundaryConditionKey) is { } boundaryCondition &&
+                IsConditionTargetingColumn(query, boundaryCondition, schema.TableName, columnName))
+            {
+                return;
+            }
+
+            var normalized = SqlServerValueNormalizer.NormalizeValue(column, rawValue);
+            if (normalized != null)
+            {
+                row.SetValue(columnName, normalized);
+            }
+        }
+
+        private int DetermineScenarioRowCount(
+            string tableName,
+            TableSchema schema,
+            ParsedQuery query,
+            bool isAggregateSource,
+            int rowMultiplier,
+            int requestedRows)
+        {
+            var rowCount = isAggregateSource
+                ? Math.Max(rowMultiplier, requestedRows)
+                : requestedRows;
+
+            if (!NeedsAggregateDiversitySupport(query))
+                return rowCount;
+
+            var diversityFloor = GetAggregateDiversityMinimumRows(tableName, schema);
+            return Math.Max(rowCount, diversityFloor);
+        }
+
         private int DetermineRowMultiplier(ParsedQuery query)
         {
             int multiplier = 1;
@@ -1672,6 +2522,63 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             return multiplier;
+        }
+
+        private bool NeedsAggregateDiversitySupport(ParsedQuery query)
+        {
+            if (!query.GroupByColumns.Any() || !query.Aggregates.Any())
+                return false;
+
+            var aggregateKinds = query.Aggregates
+                .Select(a => a.Function)
+                .Distinct()
+                .Count();
+
+            var hasMixedCountAndValueAggregates =
+                query.Aggregates.Any(a => a.Function is AggregateFunction.Count or AggregateFunction.CountDistinct) &&
+                query.Aggregates.Any(a => a.Function is AggregateFunction.Sum or AggregateFunction.Avg);
+
+            var hasArithmeticProjection = query.SelectColumns.Any(c =>
+                !string.IsNullOrWhiteSpace(c.Expression) &&
+                c.Expression.IndexOfAny(new[] { '/', '*', '+', '-' }) >= 0);
+
+            return aggregateKinds >= 2 || hasMixedCountAndValueAggregates || hasArithmeticProjection;
+        }
+
+        private static int GetAggregateDiversityMinimumRows(string tableName, TableSchema schema)
+        {
+            if (IsLineLikeTable(tableName, schema))
+                return 3;
+
+            if (IsOrderLikeTable(tableName, schema) || IsPaymentLikeTable(tableName, schema))
+                return 2;
+
+            return 1;
+        }
+
+        private static bool IsLineLikeTable(string tableName, TableSchema schema)
+        {
+            return tableName.Contains("Line", StringComparison.OrdinalIgnoreCase) ||
+                   tableName.Contains("Detail", StringComparison.OrdinalIgnoreCase) ||
+                   tableName.Contains("Item", StringComparison.OrdinalIgnoreCase) ||
+                   schema.Columns.Any(c =>
+                       c.ColumnName.Contains("Quantity", StringComparison.OrdinalIgnoreCase) ||
+                       c.ColumnName.Contains("UnitPrice", StringComparison.OrdinalIgnoreCase) ||
+                       c.ColumnName.Contains("LineTotal", StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static bool IsOrderLikeTable(string tableName, TableSchema schema)
+        {
+            return tableName.Contains("Order", StringComparison.OrdinalIgnoreCase) &&
+                   !IsLineLikeTable(tableName, schema);
+        }
+
+        private static bool IsPaymentLikeTable(string tableName, TableSchema schema)
+        {
+            return tableName.Contains("Payment", StringComparison.OrdinalIgnoreCase) ||
+                   schema.Columns.Any(c =>
+                       c.ColumnName.Contains("AmountPaid", StringComparison.OrdinalIgnoreCase) ||
+                       c.ColumnName.Contains("PaymentDate", StringComparison.OrdinalIgnoreCase));
         }
 
         private static bool TryDetermineRequiredCountRows(ConditionInfo condition, out int requiredRows)

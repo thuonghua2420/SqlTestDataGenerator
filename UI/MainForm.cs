@@ -26,6 +26,8 @@ namespace SqlTestDataGenerator.UI
         private readonly GeneratedDataDbExecutor _dbExecutor = new();
         private readonly TableCsvExporter _csvExporter = new();
         private readonly TableCsvFolderImporter _csvImporter = new();
+        private TableKeySeedResolver? _tableKeySeedResolver;
+        private TableSampleExtractor? _tableSampleExtractor;
         private DatabaseConnectionManager? _connectionManager;
         private SchemaIntrospector? _schemaIntrospector;
 
@@ -71,6 +73,7 @@ namespace SqlTestDataGenerator.UI
         private TextBox _exportFolderInput = null!;
         private NumericUpDown _startIdInput = null!;
         private NumericUpDown _rowsPerTableInput = null!;
+        private CheckBox _maxLengthMaxValueCheck = null!;
 
         // ── Colors (Standard Light Theme) ──
         private readonly Color _bgDark = SystemColors.Control;
@@ -509,34 +512,11 @@ namespace SqlTestDataGenerator.UI
             _insertDbBtn.Enabled = false;
             _insertDbBtn.Click += InsertDbBtn_Click;
 
-            var startIdLabel = new Label
-            {
-                Text = "Start ID:",
-                AutoSize = true,
-                Location = new Point(462, 13),
-                ForeColor = _textPrimary,
-                Font = new Font("Segoe UI", 9F)
-            };
-
-            _startIdInput = new NumericUpDown
-            {
-                Minimum = 1,
-                Maximum = 9999999,
-                Value = 90000,
-                Increment = 1000,
-                Location = new Point(527, 9),
-                Width = 92,
-                Font = new Font("Segoe UI", 9F),
-                BackColor = Color.White,
-                ForeColor = _textPrimary,
-                BorderStyle = BorderStyle.FixedSingle
-            };
-
             var rowsPerTableLabel = new Label
             {
                 Text = "Rows/Table:",
                 AutoSize = true,
-                Location = new Point(634, 13),
+                Location = new Point(462, 13),
                 ForeColor = _textPrimary,
                 Font = new Font("Segoe UI", 9F)
             };
@@ -547,7 +527,7 @@ namespace SqlTestDataGenerator.UI
                 Maximum = 1000,
                 Value = 1,
                 Increment = 1,
-                Location = new Point(709, 9),
+                Location = new Point(537, 9),
                 Width = 72,
                 Font = new Font("Segoe UI", 9F),
                 BackColor = Color.White,
@@ -555,9 +535,19 @@ namespace SqlTestDataGenerator.UI
                 BorderStyle = BorderStyle.FixedSingle
             };
 
+            _maxLengthMaxValueCheck = new CheckBox
+            {
+                Text = "Maxlength/MaxValue",
+                AutoSize = true,
+                Location = new Point(628, 12),
+                Font = new Font("Segoe UI", 9F),
+                ForeColor = _textPrimary,
+                BackColor = SystemColors.Control
+            };
+
             _toolbarPanel.Controls.AddRange(new Control[]
             {
-                _analyzeBtn, _generateBtn, _insertDbBtn, startIdLabel, _startIdInput, rowsPerTableLabel, _rowsPerTableInput
+                _analyzeBtn, _generateBtn, _insertDbBtn, rowsPerTableLabel, _rowsPerTableInput, _maxLengthMaxValueCheck
             });
 
             var contentPanel = new Panel
@@ -880,19 +870,6 @@ namespace SqlTestDataGenerator.UI
             _insertDbBtn.Enabled = false;
             _insertDbBtn.Click += InsertDbBtn_Click;
 
-            _startIdInput = new NumericUpDown
-            {
-                Minimum = 1,
-                Maximum = 9999999,
-                Value = 90000,
-                Increment = 1000,
-                Width = 112,
-                Font = new Font("Segoe UI", 10F),
-                BorderStyle = BorderStyle.FixedSingle,
-                Margin = new Padding(0),
-                BackColor = Color.White
-            };
-
             _rowsPerTableInput = new NumericUpDown
             {
                 Minimum = 1,
@@ -920,7 +897,6 @@ namespace SqlTestDataGenerator.UI
             controlsFlow.Controls.Add(_analyzeBtn);
             controlsFlow.Controls.Add(_generateBtn);
             controlsFlow.Controls.Add(_insertDbBtn);
-            controlsFlow.Controls.Add(CreateLabeledInputPanel("Start ID:", _startIdInput));
             controlsFlow.Controls.Add(CreateLabeledInputPanel("Rows/Table:", _rowsPerTableInput));
 
             headerLayout.Controls.Add(heroLayout, 0, 0);
@@ -1195,10 +1171,13 @@ namespace SqlTestDataGenerator.UI
             _scenarioList.ForeColor = _textPrimary;
             _scenarioList.BorderStyle = BorderStyle.None;
 
-            _startIdInput.BackColor = Color.White;
-            _startIdInput.ForeColor = _textPrimary;
             _rowsPerTableInput.BackColor = Color.White;
             _rowsPerTableInput.ForeColor = _textPrimary;
+            if (_maxLengthMaxValueCheck != null)
+            {
+                _maxLengthMaxValueCheck.ForeColor = _textPrimary;
+                _maxLengthMaxValueCheck.BackColor = SystemColors.Control;
+            }
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -1240,6 +1219,8 @@ namespace SqlTestDataGenerator.UI
                 if (success)
                 {
                     _schemaIntrospector = new SchemaIntrospector(() => _connectionManager.CreateNewConnection());
+                    _tableKeySeedResolver = new TableKeySeedResolver(() => _connectionManager.CreateNewConnection());
+                    _tableSampleExtractor = new TableSampleExtractor(() => _connectionManager.CreateNewConnection());
                     ClearLastInsertedTables();
                     _connectionStatusLabel.Text = $"● Connected: {form.ServerName}/{form.DatabaseName}";
                     _connectionStatusLabel.ForeColor = Color.Green;
@@ -1262,6 +1243,8 @@ namespace SqlTestDataGenerator.UI
             _connectionManager?.Disconnect();
             _connectionManager = null;
             _schemaIntrospector = null;
+            _tableKeySeedResolver = null;
+            _tableSampleExtractor = null;
             ClearLastInsertedTables();
             _connectionStatusLabel.Text = "● Not Connected";
             _connectionStatusLabel.ForeColor = _accentRed;
@@ -1356,10 +1339,11 @@ namespace SqlTestDataGenerator.UI
             {
                 ClearLastInsertedTables();
                 SetStatus("Generating test data...");
-                _dataEngine.StartId = (int)_startIdInput.Value;
                 _dataEngine.RowsPerTable = (int)_rowsPerTableInput.Value;
-                LogInfo(
-                    $"Starting data generation with Start ID {_dataEngine.StartId} and {_dataEngine.RowsPerTable} row(s)/table.");
+                _dataEngine.TableSeedStarts = null;
+                _dataEngine.SampleRowsByTable = null;
+                _dataEngine.UseMaxLengthMaxValueMode = _maxLengthMaxValueCheck.Checked;
+                LogInfo($"Starting data generation with {_dataEngine.RowsPerTable} row(s)/table.");
 
                 // Get schemas from database if connected
                 _schemas = null;
@@ -1375,6 +1359,46 @@ namespace SqlTestDataGenerator.UI
                         SetStatus($"Schema introspection warning: {ex.Message}. Using inferred schemas.");
                         LogWarn($"Schema introspection warning: {BuildErrorChain(ex)}");
                     }
+                }
+
+                if (_schemas != null &&
+                    _schemas.Any() &&
+                    _tableKeySeedResolver != null)
+                {
+                    try
+                    {
+                        _dataEngine.TableSeedStarts = _tableKeySeedResolver.ResolveNextIds(_schemas.Values);
+                        LogInfo($"Resolved database-backed next IDs for {_dataEngine.TableSeedStarts.Count} table(s).");
+                    }
+                    catch (Exception ex)
+                    {
+                        _dataEngine.TableSeedStarts = null;
+                        LogWarn($"Failed to resolve database-backed next IDs. Falling back to internal seeds. {BuildErrorChain(ex)}");
+                    }
+                }
+                else
+                {
+                    LogInfo("Database-backed next IDs unavailable. Using internal fallback seeds.");
+                }
+
+                if (_schemas != null &&
+                    _schemas.Any() &&
+                    _tableSampleExtractor != null)
+                {
+                    try
+                    {
+                        _dataEngine.SampleRowsByTable = _tableSampleExtractor.LoadSamples(_schemas.Values);
+                        LogInfo($"Loaded sample row(s) for {_dataEngine.SampleRowsByTable.Count} table(s).");
+                    }
+                    catch (Exception ex)
+                    {
+                        _dataEngine.SampleRowsByTable = null;
+                        LogWarn($"Failed to load sample rows from database. Falling back to synthetic defaults. {BuildErrorChain(ex)}");
+                    }
+                }
+                else if (!_maxLengthMaxValueCheck.Checked)
+                {
+                    LogWarn("Sample-based generation requested without a connected database. Falling back to synthetic defaults.");
                 }
 
                 // Get selected scenarios

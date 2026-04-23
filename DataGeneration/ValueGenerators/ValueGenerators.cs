@@ -23,6 +23,16 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
 
             return $"{column.ColumnName}|{column.DataType}|{column.MaxLength}|{column.NumericPrecision}|{column.NumericScale}";
         }
+
+        public static int GetColumnVariantOffset(ColumnSchema column, int modulus)
+        {
+            if (modulus <= 0)
+                return 0;
+
+            var key = GetColumnKey(column);
+            var hash = StringComparer.OrdinalIgnoreCase.GetHashCode(key);
+            return Math.Abs(hash % modulus);
+        }
     }
 
     /// <summary>
@@ -36,7 +46,9 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
         public bool CanHandle(DataTypeCategory category) => category == DataTypeCategory.Integer;
 
         public object GenerateDefault(ColumnSchema column) =>
-            NormalizeIntegerForType(GetNextId(column), column);
+            NormalizeIntegerForType(
+                GetNextId(column) + ValueGeneratorKeyHelper.GetColumnVariantOffset(column, 1000),
+                column);
 
         public object GenerateSatisfying(ColumnSchema column, string op, string value)
         {
@@ -116,7 +128,9 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
 
         public object GenerateDefault(ColumnSchema column)
         {
-            return GenerateSequentialValue(column, NextSequence(column));
+            return GenerateSequentialValue(
+                column,
+                NextSequence(column) + ValueGeneratorKeyHelper.GetColumnVariantOffset(column, 1000));
         }
 
         public object GenerateSatisfying(ColumnSchema column, string op, string value)
@@ -299,7 +313,9 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
         public object GenerateDefault(ColumnSchema column)
         {
             var maxLen = NormalizeMaxLength(column.MaxLength);
-            return GenerateLengthSafeUniqueString(maxLen, NextSequence(column));
+            return GenerateLengthSafeUniqueString(
+                maxLen,
+                NextSequence(column) + ValueGeneratorKeyHelper.GetColumnVariantOffset(column, 100000));
         }
 
         public object GenerateSatisfying(ColumnSchema column, string op, string value)
@@ -433,7 +449,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
 
         public object GenerateDefault(ColumnSchema column)
         {
-            var sequence = NextSequence(column);
+            var sequence = NextSequence(column) + ValueGeneratorKeyHelper.GetColumnVariantOffset(column, 365);
             var next = column.DataType.Equals("date", StringComparison.OrdinalIgnoreCase)
                 ? BaseDateTime.AddDays(sequence)
                 : BaseDateTime.AddMinutes(sequence);
@@ -518,7 +534,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
 
         public object GenerateDefault(ColumnSchema column)
         {
-            var sequence = NextSequence(column);
+            var sequence = NextSequence(column) + ValueGeneratorKeyHelper.GetColumnVariantOffset(column, 240);
             return new TimeSpan((sequence % 24), (sequence * 7) % 60, (sequence * 13) % 60);
         }
 
@@ -575,7 +591,8 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
     {
         public bool CanHandle(DataTypeCategory category) => category == DataTypeCategory.Boolean;
 
-        public object GenerateDefault(ColumnSchema column) => true;
+        public object GenerateDefault(ColumnSchema column) =>
+            (ValueGeneratorKeyHelper.GetColumnVariantOffset(column, 2) % 2) == 0;
 
         public object GenerateSatisfying(ColumnSchema column, string op, string value)
         {
