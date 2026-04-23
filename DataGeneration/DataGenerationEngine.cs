@@ -879,26 +879,15 @@ namespace SqlTestDataGenerator.DataGeneration
                 return string.Empty;
 
             var rowToken = (rowIndex + 1).ToString("D4");
-            if (targetLength <= rowToken.Length)
-            {
-                return rowToken[^targetLength..];
-            }
-
-            var prefixSeed = $"{Abbreviate(column.TableName, 3)}{Abbreviate(column.ColumnName, 4)}";
-            var prefixLength = targetLength - rowToken.Length;
-            var builder = new System.Text.StringBuilder(prefixSeed);
-            while (builder.Length < prefixLength)
-            {
-                builder.Append(Abbreviate(column.ColumnName, 3));
-            }
-
-            var prefix = builder.ToString();
-            if (prefix.Length > prefixLength)
-            {
-                prefix = prefix[..prefixLength];
-            }
-
-            var value = prefix + rowToken;
+            object value = IsPhoneColumn(column)
+                ? BuildPhoneLikeString(column, rowIndex, targetLength)
+                : IsEmailColumn(column)
+                    ? $"{BuildCompactToken(null, $"{GetAsciiTableLabel(column)}{GetAsciiColumnLabel(column)}", rowToken, Math.Max(1, targetLength - "@sample.jp".Length)).ToLowerInvariant()}@sample.jp"
+                    : IsUrlColumn(column)
+                        ? $"https://{BuildCompactToken(null, $"{GetAsciiTableLabel(column)}{GetAsciiColumnLabel(column)}", rowToken, Math.Max(1, targetLength - "https://.sample.jp".Length)).ToLowerInvariant()}.sample.jp"
+                        : IsCodeLikeColumn(column)
+                            ? BuildCompactToken(null, $"{GetAsciiTableLabel(column)}{GetAsciiColumnLabel(column)}", rowToken, targetLength)
+                            : RepeatPhraseToLength(BuildLocalizedPhrase(column, rowIndex, null), rowToken, targetLength);
 
             return SqlServerValueNormalizer.NormalizeValue(column, value) ?? string.Empty;
         }
@@ -943,20 +932,20 @@ namespace SqlTestDataGenerator.DataGeneration
                 return string.Empty;
 
             var rowToken = (rowIndex + 1).ToString("D3");
-            var tableToken = Abbreviate(column.TableName, 3);
-            var columnToken = Abbreviate(column.ColumnName, 4);
             var semanticSource = ExtractSemanticSourceFragment(source);
+            var asciiSeed = $"{GetAsciiTableLabel(column)}{GetAsciiColumnLabel(column)}";
+            var useJapanese = SupportsJapaneseText(column);
 
             string candidate;
             if (IsEmailColumn(column))
             {
-                var localPart = BuildCompactToken(semanticSource, $"{tableToken}{columnToken}", rowToken, Math.Max(1, targetLength - "@example.test".Length));
-                candidate = $"{localPart}@example.test";
+                var localPart = BuildCompactToken(semanticSource, asciiSeed, rowToken, Math.Max(1, targetLength - "@sample.jp".Length));
+                candidate = $"{localPart.ToLowerInvariant()}@sample.jp";
             }
             else if (LooksLikeUrl(source ?? string.Empty) || IsUrlColumn(column))
             {
-                var host = BuildCompactToken(semanticSource, $"{tableToken}{columnToken}", rowToken, Math.Max(1, targetLength - "https://.example.test".Length));
-                candidate = $"https://{host.ToLowerInvariant()}.example.test";
+                var host = BuildCompactToken(semanticSource, asciiSeed, rowToken, Math.Max(1, targetLength - "https://.sample.jp".Length));
+                candidate = $"https://{host.ToLowerInvariant()}.sample.jp";
             }
             else if (IsPhoneColumn(column))
             {
@@ -964,38 +953,27 @@ namespace SqlTestDataGenerator.DataGeneration
             }
             else if (IsCodeLikeColumn(column))
             {
-                candidate = BuildCompactToken(semanticSource, $"{tableToken}{columnToken}", rowToken, targetLength);
+                candidate = BuildCompactToken(semanticSource, asciiSeed, rowToken, targetLength);
             }
             else if (IsTierLikeColumn(column))
             {
-                var tiers = new[] { "Bronze", "Silver", "Gold", "Platinum", "Diamond" };
+                var tiers = useJapanese
+                    ? new[] { "標準", "優先", "上位", "特別", "最上" }
+                    : new[] { "Standard", "Priority", "Premium", "Special", "Highest" };
                 var tier = tiers[(rowIndex + GetColumnVariantOffset(column)) % tiers.Length];
-                candidate = ComposeSemanticLabel(tier, tableToken, rowToken, targetLength);
+                candidate = ComposeSemanticLabel(tier, GetLocalizedTableLabel(column.TableName, useJapanese), rowToken, targetLength);
             }
             else if (IsStatusLikeColumn(column))
             {
-                var states = new[] { "Active", "Ready", "Primary", "Enabled", "Current" };
+                var states = useJapanese
+                    ? new[] { "有効", "準備済", "主要", "通常", "継続" }
+                    : new[] { "Active", "Ready", "Primary", "Enabled", "Current" };
                 var state = states[(rowIndex + GetColumnVariantOffset(column)) % states.Length];
-                candidate = ComposeSemanticLabel(state, tableToken, rowToken, targetLength);
-            }
-            else if (IsNameLikeColumn(column))
-            {
-                var tableLabel = HumanizeToken(column.TableName);
-                var columnLabel = HumanizeToken(column.ColumnName);
-                candidate = $"{tableLabel} {columnLabel} {rowToken}";
-                if (!string.IsNullOrWhiteSpace(semanticSource))
-                {
-                    candidate = $"{tableLabel} {semanticSource} {rowToken}";
-                }
+                candidate = ComposeSemanticLabel(state, GetLocalizedTableLabel(column.TableName, useJapanese), rowToken, targetLength);
             }
             else
             {
-                var columnLabel = HumanizeToken(column.ColumnName);
-                candidate = $"{tableToken}-{columnLabel}-{rowToken}";
-                if (!string.IsNullOrWhiteSpace(semanticSource))
-                {
-                    candidate = $"{columnLabel} {semanticSource} {rowToken}";
-                }
+                candidate = BuildLocalizedPhrase(column, rowIndex, semanticSource);
             }
 
             candidate = FitSemanticString(candidate, rowToken, targetLength);
@@ -1087,13 +1065,13 @@ namespace SqlTestDataGenerator.DataGeneration
                 return string.Empty;
 
             var spaced = System.Text.RegularExpressions.Regex.Replace(value, "([a-z0-9])([A-Z])", "$1 $2");
-            spaced = System.Text.RegularExpressions.Regex.Replace(spaced, "[^A-Za-z0-9]+", " ").Trim();
+            spaced = System.Text.RegularExpressions.Regex.Replace(spaced, @"[^\p{L}\p{N}]+", " ").Trim();
             if (string.IsNullOrWhiteSpace(spaced))
                 return string.Empty;
 
             var words = spaced
                 .Split(' ', StringSplitOptions.RemoveEmptyEntries)
-                .Select(w => char.ToUpperInvariant(w[0]) + w[1..].ToLowerInvariant());
+                .Select(TitleCaseAsciiWord);
             return string.Join(" ", words);
         }
 
@@ -1103,7 +1081,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 return string.Empty;
 
             var sourceToken = new string((semanticSource ?? string.Empty)
-                .Where(char.IsLetterOrDigit)
+                .Where(c => c < 128 && char.IsLetterOrDigit(c))
                 .Take(6)
                 .Select(char.ToUpperInvariant)
                 .ToArray());
@@ -1136,6 +1114,148 @@ namespace SqlTestDataGenerator.DataGeneration
         {
             var candidate = $"{seed} {tableToken} {rowToken}";
             return FitSemanticString(candidate, rowToken, targetLength);
+        }
+
+        private static string BuildLocalizedPhrase(ColumnSchema column, int rowIndex, string? semanticSource)
+        {
+            var useJapanese = SupportsJapaneseText(column);
+            var tableLabel = GetLocalizedTableLabel(column.TableName, useJapanese);
+            var columnLabel = GetLocalizedColumnLabel(column.ColumnName, useJapanese);
+            var rowToken = (rowIndex + 1).ToString("D3");
+
+            return !string.IsNullOrWhiteSpace(semanticSource)
+                ? $"{tableLabel} {semanticSource} {rowToken}"
+                : $"{tableLabel} {columnLabel} {rowToken}";
+        }
+
+        private static string RepeatPhraseToLength(string phrase, string rowToken, int targetLength)
+        {
+            if (targetLength <= 0)
+                return string.Empty;
+
+            if (string.IsNullOrWhiteSpace(phrase))
+                phrase = rowToken;
+
+            var builder = new System.Text.StringBuilder(phrase);
+            while (builder.Length < targetLength + phrase.Length)
+            {
+                builder.Append(' ');
+                builder.Append(phrase);
+            }
+
+            return FitSemanticString(builder.ToString(), rowToken, targetLength);
+        }
+
+        private static bool SupportsJapaneseText(ColumnSchema column)
+        {
+            return column.DataType.StartsWith("n", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string GetLocalizedTableLabel(string tableName, bool useJapanese)
+        {
+            var lower = tableName.ToLowerInvariant();
+            return lower switch
+            {
+                var name when name.Contains("customer") => useJapanese ? "顧客" : "Customer",
+                var name when name.Contains("supplier") => useJapanese ? "仕入先" : "Supplier",
+                var name when name.Contains("store") => useJapanese ? "店舗" : "Store",
+                var name when name.Contains("employee") => useJapanese ? "社員" : "Employee",
+                var name when name.Contains("productvariant") => useJapanese ? "商品規格" : "Variant",
+                var name when name.Contains("product") => useJapanese ? "商品" : "Product",
+                var name when name.Contains("category") => useJapanese ? "分類" : "Category",
+                var name when name.Contains("brand") => useJapanese ? "ブランド" : "Brand",
+                var name when name.Contains("address") => useJapanese ? "住所" : "Address",
+                var name when name.Contains("country") => useJapanese ? "国" : "Country",
+                var name when name.Contains("state") || name.Contains("province") => useJapanese ? "都道府県" : "State",
+                var name when name.Contains("city") => useJapanese ? "市区町村" : "City",
+                var name when name.Contains("department") => useJapanese ? "部門" : "Department",
+                var name when name.Contains("jobtitle") || name.Contains("title") => useJapanese ? "職位" : "JobTitle",
+                var name when name.Contains("payment") => useJapanese ? "支払" : "Payment",
+                var name when name.Contains("salesorderline") => useJapanese ? "受注明細" : "OrderLine",
+                var name when name.Contains("salesorder") || name.Contains("order") => useJapanese ? "受注" : "Order",
+                _ => useJapanese ? "項目" : HumanizeToken(tableName)
+            };
+        }
+
+        private static string GetLocalizedColumnLabel(string columnName, bool useJapanese)
+        {
+            var lower = columnName.ToLowerInvariant();
+            return lower switch
+            {
+                var name when name.Contains("fullname") => useJapanese ? "氏名" : "FullName",
+                var name when name.Contains("firstname") => useJapanese ? "名" : "FirstName",
+                var name when name.Contains("lastname") => useJapanese ? "姓" : "LastName",
+                var name when name.Contains("name") || name.Contains("title") => useJapanese ? "名称" : "Name",
+                var name when name.Contains("code") || name.EndsWith("number") || name.EndsWith("no") || name.Contains("sku") || name.Contains("barcode") => useJapanese ? "コード" : "Code",
+                var name when name.Contains("tier") || name.Contains("level") => useJapanese ? "ランク" : "Tier",
+                var name when name.Contains("status") || name.Contains("state") => useJapanese ? "状態" : "Status",
+                var name when name.Contains("type") || name.Contains("format") => useJapanese ? "種別" : "Type",
+                var name when name.Contains("description") => useJapanese ? "説明" : "Description",
+                var name when name.Contains("note") => useJapanese ? "備考" : "Notes",
+                var name when name.Contains("email") => useJapanese ? "メール" : "Email",
+                var name when name.Contains("phone") || name.Contains("mobile") || name.Contains("fax") => useJapanese ? "電話" : "Phone",
+                var name when name.Contains("unitofmeasure") => useJapanese ? "単位" : "Unit",
+                var name when name.Contains("address") => useJapanese ? "住所" : "Address",
+                var name when name.Contains("color") => useJapanese ? "色名" : "Color",
+                var name when name.Contains("size") => useJapanese ? "サイズ" : "Size",
+                var name when name.Contains("url") || name.Contains("website") => useJapanese ? "URL" : "Url",
+                _ => useJapanese ? "項目" : HumanizeToken(columnName)
+            };
+        }
+
+        private static string GetAsciiTableLabel(ColumnSchema column)
+        {
+            var lower = column.TableName.ToLowerInvariant();
+            return lower switch
+            {
+                var name when name.Contains("customer") => "CUST",
+                var name when name.Contains("supplier") => "SUP",
+                var name when name.Contains("store") => "STORE",
+                var name when name.Contains("employee") => "EMP",
+                var name when name.Contains("productvariant") => "VAR",
+                var name when name.Contains("product") => "PROD",
+                var name when name.Contains("category") => "CAT",
+                var name when name.Contains("brand") => "BRAND",
+                var name when name.Contains("address") => "ADDR",
+                var name when name.Contains("country") => "COUNTRY",
+                var name when name.Contains("state") || name.Contains("province") => "STATE",
+                var name when name.Contains("city") => "CITY",
+                var name when name.Contains("department") => "DEPT",
+                var name when name.Contains("payment") => "PAY",
+                var name when name.Contains("salesorderline") => "LINE",
+                var name when name.Contains("salesorder") || name.Contains("order") => "ORDER",
+                _ => Abbreviate(column.TableName, 6)
+            };
+        }
+
+        private static string GetAsciiColumnLabel(ColumnSchema column)
+        {
+            var lower = column.ColumnName.ToLowerInvariant();
+            return lower switch
+            {
+                var name when name.Contains("fullname") => "FULLNAME",
+                var name when name.Contains("firstname") => "FIRST",
+                var name when name.Contains("lastname") => "LAST",
+                var name when name.Contains("name") => "NAME",
+                var name when name.Contains("code") || name.EndsWith("number") || name.EndsWith("no") || name.Contains("sku") || name.Contains("barcode") => "CODE",
+                var name when name.Contains("tier") || name.Contains("level") => "TIER",
+                var name when name.Contains("status") || name.Contains("state") => "STATUS",
+                var name when name.Contains("type") || name.Contains("format") => "TYPE",
+                var name when name.Contains("email") => "MAIL",
+                var name when name.Contains("phone") || name.Contains("mobile") || name.Contains("fax") => "PHONE",
+                var name when name.Contains("url") || name.Contains("website") => "URL",
+                _ => Abbreviate(column.ColumnName, 6)
+            };
+        }
+
+        private static string TitleCaseAsciiWord(string word)
+        {
+            if (string.IsNullOrWhiteSpace(word))
+                return string.Empty;
+
+            return word.All(c => c < 128)
+                ? char.ToUpperInvariant(word[0]) + word[1..].ToLowerInvariant()
+                : word;
         }
 
         private static string FitSemanticString(string value, string rowToken, int targetLength)

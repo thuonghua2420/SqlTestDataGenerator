@@ -36,22 +36,77 @@ namespace SqlTestDataGenerator.Database
         {
             var tableSql = $"{QuoteIdentifier(schema.SchemaName)}.{QuoteIdentifier(schema.TableName)}";
             var orderBy = BuildOrderBy(schema);
-            var sql = $"SELECT TOP (1) * FROM {tableSql}{orderBy};";
+            var sql = $"SELECT TOP (128) * FROM {tableSql}{orderBy};";
 
             using var cmd = connection.CreateCommand();
             cmd.CommandText = sql;
 
             using var reader = cmd.ExecuteReader();
-            if (!reader.Read())
-                return null;
+            Dictionary<string, object?>? bestRow = null;
+            int bestScore = int.MinValue;
 
-            var values = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
-            for (int i = 0; i < reader.FieldCount; i++)
+            while (reader.Read())
             {
-                values[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                var values = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < reader.FieldCount; i++)
+                {
+                    values[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                }
+
+                var score = ScoreSampleRow(values);
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestRow = values;
+                }
             }
 
-            return values;
+            return bestRow;
+        }
+
+        private static int ScoreSampleRow(Dictionary<string, object?> values)
+        {
+            int score = 0;
+
+            foreach (var value in values.Values)
+            {
+                if (value == null || value == DBNull.Value)
+                    continue;
+
+                if (value is string text)
+                {
+                    if (string.IsNullOrWhiteSpace(text))
+                        continue;
+
+                    score += IsGeneratedLikeString(text) ? -6 : 6;
+                    continue;
+                }
+
+                score += 1;
+            }
+
+            return score;
+        }
+
+        private static bool IsGeneratedLikeString(string value)
+        {
+            var trimmed = value.Trim();
+            if (trimmed.Length == 0)
+                return true;
+
+            if (trimmed.Contains("TestData", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(trimmed, @"^TD[0-9A-Z_]+$"))
+                return true;
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(trimmed, @"^[A-Z]{2,4}(?:[A-Z]{2,4}){3,}\d*$"))
+                return true;
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(trimmed, @"^TestData_\d+_[A-Z0-9]{4,}$", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                return true;
+
+            return false;
         }
 
         private static string BuildOrderBy(TableSchema schema)

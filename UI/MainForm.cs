@@ -35,8 +35,10 @@ namespace SqlTestDataGenerator.UI
         private ParsedQuery? _currentQuery;
         private Dictionary<string, TableSchema>? _schemas;
         private DataGeneration.Models.GeneratedDataSet? _currentDataSet;
+        private Dictionary<string, Dictionary<string, object?>> _baselineSampleRows = new(StringComparer.OrdinalIgnoreCase);
         private List<DataGeneration.Models.BranchScenario> _availableScenarios = new();
         private List<DirectInsertTableInfo> _lastInsertedTables = new();
+        private bool _currentDataSetIsGenerated;
 
         // ── UI Controls ──
         private Panel _headerPanel = null!;
@@ -544,6 +546,7 @@ namespace SqlTestDataGenerator.UI
                 ForeColor = _textPrimary,
                 BackColor = SystemColors.Control
             };
+            _maxLengthMaxValueCheck.CheckedChanged += MaxLengthMaxValueCheck_CheckedChanged;
 
             _toolbarPanel.Controls.AddRange(new Control[]
             {
@@ -1221,6 +1224,7 @@ namespace SqlTestDataGenerator.UI
                     _schemaIntrospector = new SchemaIntrospector(() => _connectionManager.CreateNewConnection());
                     _tableKeySeedResolver = new TableKeySeedResolver(() => _connectionManager.CreateNewConnection());
                     _tableSampleExtractor = new TableSampleExtractor(() => _connectionManager.CreateNewConnection());
+                    _baselineSampleRows.Clear();
                     ClearLastInsertedTables();
                     _connectionStatusLabel.Text = $"● Connected: {form.ServerName}/{form.DatabaseName}";
                     _connectionStatusLabel.ForeColor = Color.Green;
@@ -1245,6 +1249,8 @@ namespace SqlTestDataGenerator.UI
             _schemaIntrospector = null;
             _tableKeySeedResolver = null;
             _tableSampleExtractor = null;
+            _baselineSampleRows.Clear();
+            _currentDataSetIsGenerated = false;
             ClearLastInsertedTables();
             _connectionStatusLabel.Text = "● Not Connected";
             _connectionStatusLabel.ForeColor = _accentRed;
@@ -1279,6 +1285,7 @@ namespace SqlTestDataGenerator.UI
                     _availableScenarios.Clear();
                     _generateBtn.Enabled = false;
                     _currentDataSet = null;
+                    _currentDataSetIsGenerated = false;
                     UpdateDbInsertButtonState();
                     SetStatus("Parse errors found.");
                     LogWarn($"SQL analysis found {_currentQuery.Errors.Count} parse error(s).");
@@ -1316,6 +1323,7 @@ namespace SqlTestDataGenerator.UI
                 _availableScenarios.Clear();
                 _generateBtn.Enabled = false;
                 _currentDataSet = null;
+                _currentDataSetIsGenerated = false;
                 UpdateDbInsertButtonState();
                 SetStatus("Analysis failed.");
                 LogError($"SQL analysis failed: {BuildErrorChain(ex)}");
@@ -1343,7 +1351,7 @@ namespace SqlTestDataGenerator.UI
                 _dataEngine.TableSeedStarts = null;
                 _dataEngine.SampleRowsByTable = null;
                 _dataEngine.UseMaxLengthMaxValueMode = _maxLengthMaxValueCheck.Checked;
-                LogInfo($"Starting data generation with {_dataEngine.RowsPerTable} row(s)/table.");
+                LogInfo($"Starting data generation with {_dataEngine.RowsPerTable} row(s)/table, mode = {(_maxLengthMaxValueCheck.Checked ? "Maxlength/MaxValue" : "Sample-based")}.");
 
                 // Get schemas from database if connected
                 _schemas = null;
@@ -1387,8 +1395,16 @@ namespace SqlTestDataGenerator.UI
                 {
                     try
                     {
-                        _dataEngine.SampleRowsByTable = _tableSampleExtractor.LoadSamples(_schemas.Values);
-                        LogInfo($"Loaded sample row(s) for {_dataEngine.SampleRowsByTable.Count} table(s).");
+                        var cachedSamples = EnsureBaselineSampleRows(_schemas.Values);
+                        if (_maxLengthMaxValueCheck.Checked)
+                        {
+                            LogInfo($"Baseline sample cache ready for {cachedSamples.Count} table(s); current generation uses Maxlength/MaxValue mode.");
+                        }
+                        else if (cachedSamples.Count > 0)
+                        {
+                            _dataEngine.SampleRowsByTable = cachedSamples;
+                            LogInfo($"Using cached baseline sample row(s) for {cachedSamples.Count} table(s).");
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -1429,6 +1445,8 @@ namespace SqlTestDataGenerator.UI
                 if (_currentDataSet == null)
                     throw new InvalidOperationException("Data generation returned no dataset.");
 
+                _currentDataSetIsGenerated = true;
+
                 if (_schemas != null && _schemas.Any())
                 {
                     _dataNormalizer.Normalize(_currentDataSet, _schemas);
@@ -1442,6 +1460,7 @@ namespace SqlTestDataGenerator.UI
             catch (Exception ex)
             {
                 _currentDataSet = null;
+                _currentDataSetIsGenerated = false;
                 UpdateDbInsertButtonState();
                 _scriptCleanOutput.Text = $"-- Error: {ex.Message}";
                 SetStatus("Generation failed.");
@@ -1702,6 +1721,7 @@ namespace SqlTestDataGenerator.UI
 
                 var importData = await _csvImporter.LoadFolderAsync(folderPath, _schemas);
                 _currentDataSet = importData.DataSet;
+                _currentDataSetIsGenerated = false;
                 _dataNormalizer.Normalize(_currentDataSet, _schemas);
                 RefreshInsertScriptPreview("imported CSV data");
                 LogInfo($"Loaded {importData.CsvFilesRead} CSV file(s) and parsed {importData.ParsedRows} row(s).");
@@ -1888,6 +1908,52 @@ namespace SqlTestDataGenerator.UI
         {
             _lastInsertedTables.Clear();
             UpdateDbInsertButtonState();
+        }
+
+        private void MaxLengthMaxValueCheck_CheckedChanged(object? sender, EventArgs e)
+        {
+            if (!_currentDataSetIsGenerated || _currentDataSet == null)
+                return;
+
+            _currentDataSet = null;
+            _currentDataSetIsGenerated = false;
+            _scriptCleanOutput.Clear();
+            UpdateDbInsertButtonState();
+
+            var modeLabel = _maxLengthMaxValueCheck.Checked ? "Maxlength/MaxValue" : "sample-based";
+            SetStatus($"Generation mode changed to {modeLabel}. Generate data again to apply the change.");
+            LogInfo($"Generation mode changed to {modeLabel}; stale generated dataset was cleared.");
+        }
+
+        private Dictionary<string, Dictionary<string, object?>> EnsureBaselineSampleRows(IEnumerable<TableSchema> schemas)
+        {
+            if (_tableSampleExtractor == null)
+                return new Dictionary<string, Dictionary<string, object?>>(StringComparer.OrdinalIgnoreCase);
+
+            var schemaList = schemas.ToList();
+            var missingSchemas = schemaList
+                .Where(schema => !_baselineSampleRows.ContainsKey(schema.TableName))
+                .ToList();
+
+            if (missingSchemas.Count > 0)
+            {
+                var loadedSamples = _tableSampleExtractor.LoadSamples(missingSchemas);
+                foreach (var entry in loadedSamples)
+                {
+                    _baselineSampleRows[entry.Key] = new Dictionary<string, object?>(entry.Value, StringComparer.OrdinalIgnoreCase);
+                }
+            }
+
+            var result = new Dictionary<string, Dictionary<string, object?>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var schema in schemaList)
+            {
+                if (_baselineSampleRows.TryGetValue(schema.TableName, out var sample))
+                {
+                    result[schema.TableName] = new Dictionary<string, object?>(sample, StringComparer.OrdinalIgnoreCase);
+                }
+            }
+
+            return result;
         }
 
         private void UpdateDbInsertButtonState()
