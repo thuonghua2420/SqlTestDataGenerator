@@ -112,10 +112,13 @@ namespace SqlTestDataGenerator.Parsing
         {
             var condition = new ConditionInfo
             {
-                Operator = ConvertOperator(node.ComparisonType)
+                Operator = ConvertOperator(node.ComparisonType),
+                LeftExpression = BuildScalarExpression(node.FirstExpression),
+                RightExpression = BuildScalarExpression(node.SecondExpression)
             };
 
             ExtractColumnReference(node.FirstExpression, condition, isLeft: true);
+            CollectReferencedColumns(node.FirstExpression, condition, isRightSide: false);
 
             if (IsColumnReference(node.SecondExpression))
             {
@@ -126,6 +129,8 @@ namespace SqlTestDataGenerator.Parsing
             {
                 condition.Value = ExtractLiteralValue(node.SecondExpression);
             }
+
+            CollectReferencedColumns(node.SecondExpression, condition, isRightSide: true);
 
             return condition;
         }
@@ -142,10 +147,12 @@ namespace SqlTestDataGenerator.Parsing
                 Operator = op,
                 IsNegated = op == ComparisonOp.NotIn,
                 HasSubquery = node.Subquery != null,
-                SubquerySql = subquerySql
+                SubquerySql = subquerySql,
+                LeftExpression = BuildScalarExpression(node.Expression)
             };
 
             ExtractColumnReference(node.Expression, condition, isLeft: true);
+            CollectReferencedColumns(node.Expression, condition, isRightSide: false);
 
             if (node.Subquery == null)
             {
@@ -163,10 +170,13 @@ namespace SqlTestDataGenerator.Parsing
             var condition = new ConditionInfo
             {
                 Operator = ComparisonOp.Between,
-                IsNegated = node.TernaryExpressionType == BooleanTernaryExpressionType.NotBetween
+                IsNegated = node.TernaryExpressionType == BooleanTernaryExpressionType.NotBetween,
+                LeftExpression = BuildScalarExpression(node.FirstExpression),
+                RightExpression = BuildScalarExpression(node.SecondExpression)
             };
 
             ExtractColumnReference(node.FirstExpression, condition, isLeft: true);
+            CollectReferencedColumns(node.FirstExpression, condition, isRightSide: false);
             condition.Value = ExtractLiteralValue(node.SecondExpression);
             condition.SecondValue = ExtractLiteralValue(node.ThirdExpression);
             return condition;
@@ -177,10 +187,14 @@ namespace SqlTestDataGenerator.Parsing
             var condition = new ConditionInfo
             {
                 Operator = ComparisonOp.Like,
-                IsNegated = node.NotDefined
+                IsNegated = node.NotDefined,
+                LeftExpression = BuildScalarExpression(node.FirstExpression),
+                RightExpression = BuildScalarExpression(node.SecondExpression)
             };
 
             ExtractColumnReference(node.FirstExpression, condition, isLeft: true);
+            CollectReferencedColumns(node.FirstExpression, condition, isRightSide: false);
+            CollectReferencedColumns(node.SecondExpression, condition, isRightSide: true);
             condition.LikePattern = ExtractLiteralValue(node.SecondExpression);
             condition.Value = condition.LikePattern;
             return condition;
@@ -191,10 +205,12 @@ namespace SqlTestDataGenerator.Parsing
             var condition = new ConditionInfo
             {
                 Operator = node.IsNot ? ComparisonOp.IsNotNull : ComparisonOp.IsNull,
-                IsNegated = node.IsNot
+                IsNegated = node.IsNot,
+                LeftExpression = BuildScalarExpression(node.Expression)
             };
 
             ExtractColumnReference(node.Expression, condition, isLeft: true);
+            CollectReferencedColumns(node.Expression, condition, isRightSide: false);
             return condition;
         }
 
@@ -270,10 +286,13 @@ namespace SqlTestDataGenerator.Parsing
                 if (aggFunc.HasValue)
                 {
                     condition.AggregateFunc = aggFunc;
-                    if (funcCall.Parameters.Count > 0)
-                    {
-                        ExtractColumnReference(funcCall.Parameters[0], condition, isLeft);
-                    }
+                }
+
+                foreach (var parameter in funcCall.Parameters)
+                {
+                    ExtractColumnReference(parameter, condition, isLeft);
+                    if (HasResolvedConditionColumn(condition, isLeft))
+                        return;
                 }
 
                 return;
@@ -284,9 +303,206 @@ namespace SqlTestDataGenerator.Parsing
                 if (isLeft)
                 {
                     condition.ExpressionText = GetFragmentText(expr);
-                    ExtractColumnReference(binary.FirstExpression, condition, isLeft);
                 }
+
+                ExtractColumnReference(binary.FirstExpression, condition, isLeft);
+                if (HasResolvedConditionColumn(condition, isLeft))
+                    return;
+
+                ExtractColumnReference(binary.SecondExpression, condition, isLeft);
+                return;
             }
+
+            if (expr is ParenthesisExpression paren)
+            {
+                ExtractColumnReference(paren.Expression, condition, isLeft);
+                return;
+            }
+
+            if (expr is UnaryExpression unary)
+            {
+                ExtractColumnReference(unary.Expression, condition, isLeft);
+            }
+        }
+
+        private static bool HasResolvedConditionColumn(ConditionInfo condition, bool isLeft)
+        {
+            return isLeft
+                ? !string.IsNullOrWhiteSpace(condition.ColumnName)
+                : !string.IsNullOrWhiteSpace(condition.RightColumnName);
+        }
+
+        private ScalarExpressionInfo? BuildScalarExpression(ScalarExpression? expr)
+        {
+            if (expr == null)
+                return null;
+
+            return expr switch
+            {
+                ColumnReferenceExpression colRef => BuildColumnExpression(colRef),
+                StringLiteral str => new LiteralScalarExpressionInfo
+                {
+                    Value = str.Value,
+                    Kind = ScalarLiteralKind.String,
+                    Text = GetFragmentText(str)
+                },
+                IntegerLiteral integer => new LiteralScalarExpressionInfo
+                {
+                    Value = integer.Value,
+                    Kind = ScalarLiteralKind.Integer,
+                    Text = GetFragmentText(integer)
+                },
+                NumericLiteral numeric => new LiteralScalarExpressionInfo
+                {
+                    Value = numeric.Value,
+                    Kind = ScalarLiteralKind.Numeric,
+                    Text = GetFragmentText(numeric)
+                },
+                RealLiteral real => new LiteralScalarExpressionInfo
+                {
+                    Value = real.Value,
+                    Kind = ScalarLiteralKind.Real,
+                    Text = GetFragmentText(real)
+                },
+                MoneyLiteral money => new LiteralScalarExpressionInfo
+                {
+                    Value = money.Value,
+                    Kind = ScalarLiteralKind.Money,
+                    Text = GetFragmentText(money)
+                },
+                NullLiteral => new LiteralScalarExpressionInfo
+                {
+                    Value = string.Empty,
+                    Kind = ScalarLiteralKind.Null,
+                    Text = "NULL"
+                },
+                DefaultLiteral => new LiteralScalarExpressionInfo
+                {
+                    Value = "DEFAULT",
+                    Kind = ScalarLiteralKind.Default,
+                    Text = "DEFAULT"
+                },
+                VariableReference variable => new LiteralScalarExpressionInfo
+                {
+                    Value = $"@{variable.Name}",
+                    Kind = ScalarLiteralKind.Variable,
+                    Text = GetFragmentText(variable)
+                },
+                ParenthesisExpression paren => BuildScalarExpression(paren.Expression),
+                UnaryExpression unary => new UnaryScalarExpressionInfo
+                {
+                    Operator = unary.UnaryExpressionType.ToString(),
+                    Operand = BuildScalarExpression(unary.Expression),
+                    Text = GetFragmentText(unary)
+                },
+                FunctionCall func => new FunctionScalarExpressionInfo
+                {
+                    Name = func.FunctionName?.Value ?? string.Empty,
+                    Arguments = func.Parameters.Select(BuildScalarExpression).Where(p => p != null).Cast<ScalarExpressionInfo>().ToList(),
+                    Text = GetFragmentText(func)
+                },
+                BinaryExpression binary => new BinaryScalarExpressionInfo
+                {
+                    Operator = ConvertBinaryOperator(binary.BinaryExpressionType),
+                    Left = BuildScalarExpression(binary.FirstExpression),
+                    Right = BuildScalarExpression(binary.SecondExpression),
+                    Text = GetFragmentText(binary)
+                },
+                _ => new LiteralScalarExpressionInfo
+                {
+                    Value = GetFragmentText(expr),
+                    Kind = ScalarLiteralKind.Other,
+                    Text = GetFragmentText(expr)
+                }
+            };
+        }
+
+        private static ColumnScalarExpressionInfo BuildColumnExpression(ColumnReferenceExpression colRef)
+        {
+            var parts = colRef.MultiPartIdentifier?.Identifiers;
+            var alias = parts != null && parts.Count >= 2 ? parts[0].Value : string.Empty;
+            var column = parts?.Count > 0 ? parts[^1].Value : string.Empty;
+
+            return new ColumnScalarExpressionInfo
+            {
+                TableAlias = alias,
+                ColumnName = column,
+                Text = GetFragmentText(colRef)
+            };
+        }
+
+        private static ScalarBinaryOperator ConvertBinaryOperator(BinaryExpressionType type)
+        {
+            return type switch
+            {
+                BinaryExpressionType.Add => ScalarBinaryOperator.Add,
+                BinaryExpressionType.Subtract => ScalarBinaryOperator.Subtract,
+                BinaryExpressionType.Multiply => ScalarBinaryOperator.Multiply,
+                BinaryExpressionType.Divide => ScalarBinaryOperator.Divide,
+                BinaryExpressionType.Modulo => ScalarBinaryOperator.Modulo,
+                BinaryExpressionType.BitwiseAnd => ScalarBinaryOperator.BitwiseAnd,
+                BinaryExpressionType.BitwiseOr => ScalarBinaryOperator.BitwiseOr,
+                BinaryExpressionType.BitwiseXor => ScalarBinaryOperator.BitwiseXor,
+                _ => ScalarBinaryOperator.Unknown
+            };
+        }
+
+        private void CollectReferencedColumns(ScalarExpression expr, ConditionInfo condition, bool isRightSide)
+        {
+            switch (expr)
+            {
+                case ColumnReferenceExpression colRef:
+                    AddReferencedColumn(colRef, condition, isRightSide);
+                    break;
+
+                case FunctionCall funcCall:
+                    foreach (var parameter in funcCall.Parameters)
+                    {
+                        CollectReferencedColumns(parameter, condition, isRightSide);
+                    }
+                    break;
+
+                case BinaryExpression binary:
+                    CollectReferencedColumns(binary.FirstExpression, condition, isRightSide);
+                    CollectReferencedColumns(binary.SecondExpression, condition, isRightSide);
+                    break;
+
+                case ParenthesisExpression paren:
+                    CollectReferencedColumns(paren.Expression, condition, isRightSide);
+                    break;
+
+                case UnaryExpression unary:
+                    CollectReferencedColumns(unary.Expression, condition, isRightSide);
+                    break;
+            }
+        }
+
+        private static void AddReferencedColumn(
+            ColumnReferenceExpression colRef,
+            ConditionInfo condition,
+            bool isRightSide)
+        {
+            var parts = colRef.MultiPartIdentifier?.Identifiers;
+            if (parts == null || parts.Count == 0)
+                return;
+
+            var alias = parts.Count >= 2 ? parts[0].Value : string.Empty;
+            var column = parts[^1].Value;
+
+            if (condition.ReferencedColumns.Any(r =>
+                    r.IsRightSide == isRightSide &&
+                    r.ColumnName.Equals(column, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(r.TableAlias, alias, StringComparison.OrdinalIgnoreCase)))
+            {
+                return;
+            }
+
+            condition.ReferencedColumns.Add(new ConditionColumnReference
+            {
+                TableAlias = alias,
+                ColumnName = column,
+                IsRightSide = isRightSide
+            });
         }
 
         private static AggregateFunction? ParseAggregateFunction(string name)

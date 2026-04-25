@@ -49,6 +49,7 @@ namespace SqlTestDataGenerator.Parsing
             result.Tables = tableVisitor.Tables
                 .Where(t => !cteNames.Contains(t.TableName))
                 .ToList();
+            result.DerivedColumnMappings = CollectDerivedColumnMappings(fragment);
 
             // Step 4: Extract JOINs and update table roles
             var joinVisitor = new JoinExtractorVisitor();
@@ -57,11 +58,13 @@ namespace SqlTestDataGenerator.Parsing
                 querySpec.FromClause.Accept(joinVisitor);
             }
             result.Joins = joinVisitor.Joins;
+            RewriteJoinAliases(result);
             UpdateTableRolesFromJoins(result);
             var outerScopeAliasMap = BuildScopeAliasMap(querySpec.FromClause);
 
-            // Step 5/6: Extract exact WHERE/HAVING predicate scopes
+            // Step 5/6: Extract exact WHERE/HAVING/JOIN predicate scopes
             AnalyzePredicateScopes(querySpec, result, predicateBuilder, outerScopeAliasMap, "Main");
+            AnalyzeJoinPredicateScopes(querySpec.FromClause, result, predicateBuilder, outerScopeAliasMap, "Main");
 
             // Step 7: Extract GROUP BY
             if (querySpec.GroupByClause != null)
@@ -87,8 +90,8 @@ namespace SqlTestDataGenerator.Parsing
             // Step 10: Extract SELECT columns
             ExtractSelectColumns(querySpec, result);
 
-            // Step 10.5: Merge execution constraints from CTE query bodies.
-            AnalyzeCteQuerySpecifications(fragment, result, predicateBuilder);
+            // Step 10.5: Merge execution constraints from nested query bodies.
+            AnalyzeNestedQuerySpecifications(fragment, result, predicateBuilder, querySpec);
 
             // Step 10.6: Link outer EXISTS/IN predicate leaves back to extracted subqueries.
             AttachSubqueryPredicateKeys(result);
@@ -312,16 +315,29 @@ namespace SqlTestDataGenerator.Parsing
             }
         }
 
-        private void AnalyzeCteQuerySpecifications(
+        private void AnalyzeNestedQuerySpecifications(
             TSqlFragment fragment,
             ParsedQuery result,
-            PredicateTreeBuilder predicateBuilder)
+            PredicateTreeBuilder predicateBuilder,
+            QuerySpecification mainQuerySpec)
         {
+            int nestedIndex = 1;
+
             foreach (var cte in ExtractCteQuerySpecifications(fragment))
             {
                 AnalyzeQuerySpecification(cte.Name, cte.Spec, result, predicateBuilder);
             }
 
+            foreach (var spec in ExtractDerivedTableQuerySpecifications(fragment))
+            {
+                if (ReferenceEquals(spec, mainQuerySpec))
+                    continue;
+
+                AnalyzeQuerySpecification($"Derived Query {nestedIndex++}", spec, result, predicateBuilder);
+            }
+
+            RewriteConditionAliases(result);
+            RewriteJoinAliases(result);
             DeduplicateAnalysis(result);
         }
 
@@ -347,6 +363,7 @@ namespace SqlTestDataGenerator.Parsing
             }
 
             AnalyzePredicateScopes(spec, result, predicateBuilder, scopeAliasMap, scopeLabel);
+            AnalyzeJoinPredicateScopes(spec.FromClause, result, predicateBuilder, scopeAliasMap, scopeLabel);
 
             if (spec.HavingClause != null)
             {
@@ -390,6 +407,20 @@ namespace SqlTestDataGenerator.Parsing
                             yield return ($"CTE {cteName}", spec);
                         }
                     }
+                }
+            }
+        }
+
+        private IEnumerable<QuerySpecification> ExtractDerivedTableQuerySpecifications(TSqlFragment fragment)
+        {
+            var visitor = new DerivedTableCollectorVisitor();
+            fragment.Accept(visitor);
+
+            foreach (var derivedTable in visitor.DerivedTables)
+            {
+                foreach (var spec in EnumerateQuerySpecifications(derivedTable.QueryExpression))
+                {
+                    yield return spec;
                 }
             }
         }
@@ -480,6 +511,33 @@ namespace SqlTestDataGenerator.Parsing
             }
         }
 
+        private void AnalyzeJoinPredicateScopes(
+            FromClause? fromClause,
+            ParsedQuery result,
+            PredicateTreeBuilder predicateBuilder,
+            IReadOnlyDictionary<string, string> scopeAliasMap,
+            string scopeLabel)
+        {
+            if (fromClause == null)
+                return;
+
+            int joinIndex = 1;
+            foreach (var join in EnumerateQualifiedJoins(fromClause.TableReferences))
+            {
+                if (join.SearchCondition == null)
+                    continue;
+
+                var joinScope = predicateBuilder.BuildScope(
+                    join.SearchCondition,
+                    ConditionSource.JoinOn,
+                    $"{NormalizeScopeLabel(scopeLabel)}:join{joinIndex}",
+                    $"{scopeLabel} JOIN {ResolveTableReferenceLabel(join.SecondTableReference)}");
+                joinScope.Conditions = FilterConditionsToScope(joinScope.Conditions, scopeAliasMap);
+                result.PredicateScopes.Add(joinScope);
+                joinIndex++;
+            }
+        }
+
         private List<SubqueryInfo> NormalizeSubqueries(IEnumerable<SubqueryInfo> subqueries)
         {
             return subqueries
@@ -541,6 +599,17 @@ namespace SqlTestDataGenerator.Parsing
                 if (!string.IsNullOrWhiteSpace(table.TableName))
                 {
                     map[table.TableName] = table.TableName;
+                }
+            }
+
+            var derivedVisitor = new DerivedTableCollectorVisitor();
+            fromClause.Accept(derivedVisitor);
+            foreach (var derived in derivedVisitor.DerivedTables)
+            {
+                var alias = derived.Alias?.Value;
+                if (!string.IsNullOrWhiteSpace(alias))
+                {
+                    map[alias] = alias;
                 }
             }
 
@@ -650,6 +719,114 @@ namespace SqlTestDataGenerator.Parsing
                 join.RightTableAlias,
                 join.RightColumn,
                 join.OnConditionText);
+        }
+
+        private void RewriteJoinAliases(ParsedQuery result)
+        {
+            foreach (var join in result.Joins)
+            {
+                var leftAlias = join.LeftTableAlias;
+                var leftColumn = join.LeftColumn;
+                ResolveDerivedAliasColumn(result, ref leftAlias, ref leftColumn);
+                join.LeftTableAlias = leftAlias;
+                join.LeftColumn = leftColumn;
+
+                var rightAlias = join.RightTableAlias;
+                var rightColumn = join.RightColumn;
+                ResolveDerivedAliasColumn(result, ref rightAlias, ref rightColumn);
+                join.RightTableAlias = rightAlias;
+                join.RightColumn = rightColumn;
+
+                foreach (var condition in join.AdditionalOnConditions)
+                {
+                    ResolveConditionDerivedAliases(result, condition);
+                }
+            }
+        }
+
+        private static void RewriteConditionAliases(ParsedQuery result)
+        {
+            foreach (var scope in result.PredicateScopes)
+            {
+                foreach (var condition in scope.Conditions)
+                {
+                    ResolveConditionDerivedAliases(result, condition);
+                }
+            }
+
+            RewriteSubqueryConditionAliases(result, result.Subqueries);
+        }
+
+        private static void RewriteSubqueryConditionAliases(ParsedQuery result, IEnumerable<SubqueryInfo> subqueries)
+        {
+            foreach (var subquery in subqueries)
+            {
+                foreach (var condition in subquery.Conditions)
+                {
+                    ResolveConditionDerivedAliases(result, condition);
+                }
+
+                if (subquery.WherePredicateScope != null)
+                {
+                    foreach (var condition in subquery.WherePredicateScope.Conditions)
+                    {
+                        ResolveConditionDerivedAliases(result, condition);
+                    }
+                }
+
+                RewriteSubqueryConditionAliases(result, subquery.NestedSubqueries);
+            }
+        }
+
+        private static void ResolveConditionDerivedAliases(ParsedQuery result, ConditionInfo condition)
+        {
+            if (!string.IsNullOrWhiteSpace(condition.TableAlias) &&
+                !string.IsNullOrWhiteSpace(condition.ColumnName))
+            {
+                var alias = condition.TableAlias;
+                var column = condition.ColumnName;
+                ResolveDerivedAliasColumn(result, ref alias, ref column);
+                condition.TableAlias = alias;
+                condition.ColumnName = column;
+            }
+
+            if (!string.IsNullOrWhiteSpace(condition.RightTableAlias) &&
+                !string.IsNullOrWhiteSpace(condition.RightColumnName))
+            {
+                var alias = condition.RightTableAlias;
+                var column = condition.RightColumnName;
+                ResolveDerivedAliasColumn(result, ref alias, ref column);
+                condition.RightTableAlias = alias;
+                condition.RightColumnName = column;
+            }
+
+            foreach (var reference in condition.ReferencedColumns)
+            {
+                if (string.IsNullOrWhiteSpace(reference.TableAlias) ||
+                    string.IsNullOrWhiteSpace(reference.ColumnName))
+                {
+                    continue;
+                }
+
+                var alias = reference.TableAlias;
+                var column = reference.ColumnName;
+                ResolveDerivedAliasColumn(result, ref alias, ref column);
+                reference.TableAlias = alias;
+                reference.ColumnName = column;
+            }
+        }
+
+        private static void ResolveDerivedAliasColumn(ParsedQuery result, ref string alias, ref string column)
+        {
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            while (!string.IsNullOrWhiteSpace(alias) &&
+                   !string.IsNullOrWhiteSpace(column) &&
+                   seen.Add($"{alias}|{column}") &&
+                   result.TryResolveDerivedColumn(alias, column, out var binding))
+            {
+                alias = binding.SourceAlias;
+                column = binding.SourceColumn;
+            }
         }
 
         private static string BuildSubqueryKey(SubqueryInfo subquery)
@@ -777,6 +954,193 @@ namespace SqlTestDataGenerator.Parsing
             return cteNames;
         }
 
+        private Dictionary<string, Dictionary<string, DerivedColumnBinding>> CollectDerivedColumnMappings(TSqlFragment fragment)
+        {
+            var visitor = new DerivedTableCollectorVisitor();
+            fragment.Accept(visitor);
+
+            var mappings = new Dictionary<string, Dictionary<string, DerivedColumnBinding>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var derivedTable in visitor.DerivedTables)
+            {
+                var alias = derivedTable.Alias?.Value ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(alias))
+                    continue;
+
+                var bindings = BuildDerivedColumnBindings(alias, derivedTable.QueryExpression);
+                if (bindings.Count > 0)
+                {
+                    mappings[alias] = bindings;
+                }
+            }
+
+            return mappings;
+        }
+
+        private Dictionary<string, DerivedColumnBinding> BuildDerivedColumnBindings(string derivedAlias, QueryExpression? expression)
+        {
+            var bindings = new Dictionary<string, DerivedColumnBinding>(StringComparer.OrdinalIgnoreCase);
+            var spec = EnumerateQuerySpecifications(expression).FirstOrDefault();
+            if (spec == null)
+                return bindings;
+
+            var localDerivedMappings = new Dictionary<string, Dictionary<string, DerivedColumnBinding>>(StringComparer.OrdinalIgnoreCase);
+            if (spec.FromClause != null)
+            {
+                foreach (var tableReference in spec.FromClause.TableReferences)
+                {
+                    CollectDerivedMappingsFromTableReference(tableReference, localDerivedMappings);
+                }
+            }
+
+            foreach (var element in spec.SelectElements.OfType<SelectScalarExpression>())
+            {
+                var outputColumn = element.ColumnName?.Value;
+                if (string.IsNullOrWhiteSpace(outputColumn) &&
+                    element.Expression is ColumnReferenceExpression colRef)
+                {
+                    outputColumn = colRef.MultiPartIdentifier?.Identifiers.LastOrDefault()?.Value;
+                }
+
+                if (string.IsNullOrWhiteSpace(outputColumn))
+                    continue;
+
+                if (!TryResolveExpressionSource(element.Expression, localDerivedMappings, out var sourceAlias, out var sourceColumn))
+                    continue;
+
+                bindings[outputColumn] = new DerivedColumnBinding
+                {
+                    DerivedAlias = derivedAlias,
+                    OutputColumn = outputColumn,
+                    SourceAlias = sourceAlias,
+                    SourceColumn = sourceColumn,
+                    SourceExpression = GetFragmentText(element.Expression)
+                };
+            }
+
+            return bindings;
+        }
+
+        private void CollectDerivedMappingsFromTableReference(
+            TableReference tableReference,
+            Dictionary<string, Dictionary<string, DerivedColumnBinding>> mappings)
+        {
+            switch (tableReference)
+            {
+                case QueryDerivedTable derivedTable:
+                {
+                    var alias = derivedTable.Alias?.Value ?? string.Empty;
+                    if (!string.IsNullOrWhiteSpace(alias))
+                    {
+                        var bindings = BuildDerivedColumnBindings(alias, derivedTable.QueryExpression);
+                        if (bindings.Count > 0)
+                        {
+                            mappings[alias] = bindings;
+                        }
+                    }
+                    break;
+                }
+
+                case QualifiedJoin qualifiedJoin:
+                    CollectDerivedMappingsFromTableReference(qualifiedJoin.FirstTableReference, mappings);
+                    CollectDerivedMappingsFromTableReference(qualifiedJoin.SecondTableReference, mappings);
+                    break;
+
+                case JoinParenthesisTableReference joinParen:
+                    CollectDerivedMappingsFromTableReference(joinParen.Join, mappings);
+                    break;
+            }
+        }
+
+        private bool TryResolveExpressionSource(
+            ScalarExpression expression,
+            IReadOnlyDictionary<string, Dictionary<string, DerivedColumnBinding>> localDerivedMappings,
+            out string sourceAlias,
+            out string sourceColumn)
+        {
+            sourceAlias = string.Empty;
+            sourceColumn = string.Empty;
+
+            switch (expression)
+            {
+                case ColumnReferenceExpression colRef:
+                {
+                    var parts = colRef.MultiPartIdentifier?.Identifiers;
+                    if (parts == null || parts.Count == 0)
+                        return false;
+
+                    var alias = parts.Count >= 2 ? parts[0].Value : string.Empty;
+                    var column = parts[^1].Value;
+                    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    while (!string.IsNullOrWhiteSpace(alias) &&
+                           localDerivedMappings.TryGetValue(alias, out var derivedColumns) &&
+                           derivedColumns.TryGetValue(column, out var binding) &&
+                           seen.Add($"{alias}|{column}"))
+                    {
+                        alias = binding.SourceAlias;
+                        column = binding.SourceColumn;
+                    }
+
+                    sourceAlias = alias;
+                    sourceColumn = column;
+                    return !string.IsNullOrWhiteSpace(sourceColumn);
+                }
+
+                case ParenthesisExpression paren:
+                    return TryResolveExpressionSource(paren.Expression, localDerivedMappings, out sourceAlias, out sourceColumn);
+            }
+
+            return false;
+        }
+
+        private static IEnumerable<QualifiedJoin> EnumerateQualifiedJoins(IEnumerable<TableReference> tableReferences)
+        {
+            foreach (var tableReference in tableReferences)
+            {
+                foreach (var join in EnumerateQualifiedJoins(tableReference))
+                {
+                    yield return join;
+                }
+            }
+        }
+
+        private static IEnumerable<QualifiedJoin> EnumerateQualifiedJoins(TableReference tableReference)
+        {
+            switch (tableReference)
+            {
+                case QualifiedJoin qualifiedJoin:
+                    foreach (var nested in EnumerateQualifiedJoins(qualifiedJoin.FirstTableReference))
+                    {
+                        yield return nested;
+                    }
+
+                    foreach (var nested in EnumerateQualifiedJoins(qualifiedJoin.SecondTableReference))
+                    {
+                        yield return nested;
+                    }
+
+                    yield return qualifiedJoin;
+                    yield break;
+
+                case JoinParenthesisTableReference joinParen:
+                    foreach (var nested in EnumerateQualifiedJoins(joinParen.Join))
+                    {
+                        yield return nested;
+                    }
+                    yield break;
+            }
+        }
+
+        private static string ResolveTableReferenceLabel(TableReference tableReference)
+        {
+            return tableReference switch
+            {
+                NamedTableReference named => named.Alias?.Value ?? named.SchemaObject.BaseIdentifier?.Value ?? "JOIN",
+                QueryDerivedTable derived => derived.Alias?.Value ?? "Derived",
+                QualifiedJoin nested => ResolveTableReferenceLabel(nested.SecondTableReference),
+                _ => "JOIN"
+            };
+        }
+
         private string GetFragmentText(TSqlFragment node)
         {
             if (node.ScriptTokenStream != null && node.FirstTokenIndex >= 0 && node.LastTokenIndex >= 0)
@@ -789,6 +1153,28 @@ namespace SqlTestDataGenerator.Parsing
                 return string.Join("", tokens).Trim();
             }
             return "";
+        }
+
+        private sealed class QuerySpecificationCollectorVisitor : TSqlFragmentVisitor
+        {
+            public List<QuerySpecification> QuerySpecifications { get; } = new();
+
+            public override void Visit(QuerySpecification node)
+            {
+                QuerySpecifications.Add(node);
+                base.Visit(node);
+            }
+        }
+
+        private sealed class DerivedTableCollectorVisitor : TSqlFragmentVisitor
+        {
+            public List<QueryDerivedTable> DerivedTables { get; } = new();
+
+            public override void Visit(QueryDerivedTable node)
+            {
+                DerivedTables.Add(node);
+                base.Visit(node);
+            }
         }
     }
 }

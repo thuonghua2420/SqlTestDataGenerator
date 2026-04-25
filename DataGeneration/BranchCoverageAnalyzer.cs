@@ -36,6 +36,8 @@ namespace SqlTestDataGenerator.DataGeneration
                 }
             }
 
+            AppendSubqueryScenarios(query.Subqueries, positiveTruthMap, scenarios, conditionByKey);
+
             foreach (var join in query.Joins.Where(j => j.Type == JoinType.Left))
             {
                 if (CanCreateJoinMissScenario(join, query))
@@ -85,6 +87,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
             var scopePrefix = type == ScenarioType.HavingNegative ? "HAVING negative" :
                 type == ScenarioType.SubqueryMiss ? "Subquery negative" :
+                scope.Source == ConditionSource.JoinOn ? "JOIN negative" :
                 "WHERE negative";
 
             return new BranchScenario
@@ -223,6 +226,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 return false;
 
             return !query.PredicateScopes
+                .Where(s => s.Source != ConditionSource.JoinOn)
                 .SelectMany(s => s.Conditions)
                 .Any(c => MatchesAlias(query, c, alias));
         }
@@ -253,6 +257,44 @@ namespace SqlTestDataGenerator.DataGeneration
 
             _nextId = uniqueScenarios.Count + 1;
             return uniqueScenarios;
+        }
+
+        private void AppendSubqueryScenarios(
+            IEnumerable<SubqueryInfo> subqueries,
+            IReadOnlyDictionary<string, bool> positiveTruthMap,
+            List<BranchScenario> scenarios,
+            IReadOnlyDictionary<string, ConditionInfo> conditionByKey)
+        {
+            foreach (var subquery in subqueries)
+            {
+                if (subquery.WherePredicateScope?.Root != null &&
+                    !string.IsNullOrWhiteSpace(subquery.PredicateConditionKey))
+                {
+                    var shouldReturnRows = IsNegativeSubqueryOperator(subquery.Operator);
+                    var assignments = PredicateTruthPlanner.GetMinimalAssignments(
+                        subquery.WherePredicateScope.Root,
+                        desiredTruth: shouldReturnRows);
+
+                    foreach (var assignment in assignments)
+                    {
+                        var truthMap = MergeTruthMaps(positiveTruthMap, assignment);
+                        truthMap[subquery.PredicateConditionKey] = false;
+                        scenarios.Add(CreateNegativeScenario(
+                            subquery.WherePredicateScope,
+                            ScenarioType.SubqueryMiss,
+                            assignment,
+                            truthMap,
+                            conditionByKey));
+                    }
+                }
+
+                AppendSubqueryScenarios(subquery.NestedSubqueries, positiveTruthMap, scenarios, conditionByKey);
+            }
+        }
+
+        private static bool IsNegativeSubqueryOperator(SubqueryOperator op)
+        {
+            return op is SubqueryOperator.NotExists or SubqueryOperator.NotIn;
         }
 
         private static string BuildScenarioKey(BranchScenario scenario)

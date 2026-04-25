@@ -96,6 +96,17 @@ WHERE s.name = @SchemaName
             if (nextValue <= 0)
                 nextValue = 1;
 
+            var maxAllowed = keyColumn.DataType.ToLowerInvariant() switch
+            {
+                "tinyint" => byte.MaxValue,
+                "smallint" => short.MaxValue,
+                "int" => int.MaxValue,
+                _ => long.MaxValue
+            };
+
+            if (nextValue > maxAllowed)
+                return 0;
+
             return nextValue > int.MaxValue ? int.MaxValue : (int)nextValue;
         }
 

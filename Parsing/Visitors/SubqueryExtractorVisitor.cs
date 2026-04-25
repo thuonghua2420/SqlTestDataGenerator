@@ -142,6 +142,10 @@ namespace SqlTestDataGenerator.Parsing.Visitors
             var tableVisitor = new TableExtractorVisitor();
             spec.FromClause?.Accept(tableVisitor);
             subInfo.Tables.AddRange(tableVisitor.Tables);
+            if (spec.FromClause != null)
+            {
+                ExtractTableFunctions(spec.FromClause.TableReferences, subInfo.TableFunctions);
+            }
 
             // Extract WHERE conditions from subquery
             if (spec.WhereClause != null)
@@ -154,6 +158,7 @@ namespace SqlTestDataGenerator.Parsing.Visitors
                     $"Subquery {subInfo.Id} WHERE");
                 subInfo.WherePredicateScope = scope;
                 subInfo.Conditions.AddRange(scope.Conditions);
+                EnrichConditionsFromTableFunctions(subInfo);
             }
 
             // Check for nested subqueries
@@ -206,6 +211,117 @@ namespace SqlTestDataGenerator.Parsing.Visitors
                     }
                 }
             }
+        }
+
+        private void ExtractTableFunctions(IEnumerable<TableReference> tableReferences, List<TableFunctionInfo> functions)
+        {
+            foreach (var tableReference in tableReferences)
+            {
+                ExtractTableFunctions(tableReference, functions);
+            }
+        }
+
+        private void ExtractTableFunctions(TableReference tableReference, List<TableFunctionInfo> functions)
+        {
+            switch (tableReference)
+            {
+                case QualifiedJoin qualified:
+                    ExtractTableFunctions(qualified.FirstTableReference, functions);
+                    ExtractTableFunctions(qualified.SecondTableReference, functions);
+                    break;
+
+                case JoinParenthesisTableReference joinParen:
+                    ExtractTableFunctions(joinParen.Join, functions);
+                    break;
+
+                case BuiltInFunctionTableReference builtIn:
+                    AddTableFunction(functions, builtIn.Alias?.Value ?? string.Empty, builtIn.Name?.Value ?? string.Empty, builtIn.Parameters);
+                    break;
+
+                case GlobalFunctionTableReference global:
+                    AddTableFunction(functions, global.Alias?.Value ?? string.Empty, global.Name?.Value ?? string.Empty, global.Parameters);
+                    break;
+
+                case SchemaObjectFunctionTableReference schemaFunc:
+                    AddTableFunction(functions, schemaFunc.Alias?.Value ?? string.Empty, schemaFunc.SchemaObject.BaseIdentifier?.Value ?? string.Empty, schemaFunc.Parameters);
+                    break;
+            }
+        }
+
+        private static void AddTableFunction(
+            List<TableFunctionInfo> functions,
+            string alias,
+            string functionName,
+            IList<ScalarExpression> parameters)
+        {
+            if (string.IsNullOrWhiteSpace(alias) || string.IsNullOrWhiteSpace(functionName))
+                return;
+
+            functions.Add(new TableFunctionInfo
+            {
+                Alias = alias,
+                FunctionName = functionName,
+                LiteralArguments = parameters.Select(ExtractLiteralValue).ToList()
+            });
+        }
+
+        private static void EnrichConditionsFromTableFunctions(SubqueryInfo subInfo)
+        {
+            if (subInfo.TableFunctions.Count == 0)
+                return;
+
+            foreach (var function in subInfo.TableFunctions)
+            {
+                if (!function.FunctionName.Equals("STRING_SPLIT", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (function.LiteralArguments.Count < 2)
+                    continue;
+
+                var source = function.LiteralArguments[0];
+                var separator = function.LiteralArguments[1];
+                if (string.IsNullOrEmpty(separator))
+                    continue;
+
+                var values = source.Split(separator, StringSplitOptions.None)
+                    .Where(v => !string.IsNullOrWhiteSpace(v))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                if (values.Count == 0)
+                    continue;
+
+                foreach (var condition in subInfo.Conditions)
+                {
+                    if (condition.ReferencedColumns.Any(r =>
+                            r.ColumnName.Equals("value", StringComparison.OrdinalIgnoreCase) &&
+                            r.TableAlias.Equals(function.Alias, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        foreach (var value in values)
+                        {
+                            if (!condition.DynamicStringValues.Contains(value, StringComparer.OrdinalIgnoreCase))
+                            {
+                                condition.DynamicStringValues.Add(value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private static string ExtractLiteralValue(ScalarExpression expr)
+        {
+            return expr switch
+            {
+                StringLiteral str => str.Value,
+                IntegerLiteral intLit => intLit.Value,
+                NumericLiteral numLit => numLit.Value,
+                RealLiteral real => real.Value,
+                MoneyLiteral money => money.Value,
+                ParenthesisExpression paren => ExtractLiteralValue(paren.Expression),
+                UnaryExpression unary => (unary.UnaryExpressionType == UnaryExpressionType.Negative ? "-" : "") + ExtractLiteralValue(unary.Expression),
+                _ => string.Empty
+            };
         }
 
         private string GetFragmentText(TSqlFragment node)

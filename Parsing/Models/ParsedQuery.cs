@@ -48,6 +48,10 @@ namespace SqlTestDataGenerator.Parsing.Models
         /// <summary>Warnings during analysis</summary>
         public List<string> Warnings { get; set; } = new();
 
+        /// <summary>Derived table / subquery alias column lineage to physical aliases where resolvable.</summary>
+        public Dictionary<string, Dictionary<string, DerivedColumnBinding>> DerivedColumnMappings { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
         /// <summary>Map alias → table name for quick lookup</summary>
         public Dictionary<string, string> AliasToTableMap
         {
@@ -69,6 +73,15 @@ namespace SqlTestDataGenerator.Parsing.Models
         {
             var m = AliasToTableMap;
             return m.TryGetValue(aliasOrName, out var name) ? name : aliasOrName;
+        }
+
+        public bool TryResolveDerivedColumn(string alias, string columnName, out DerivedColumnBinding binding)
+        {
+            binding = null!;
+            if (!DerivedColumnMappings.TryGetValue(alias, out var columns))
+                return false;
+
+            return columns.TryGetValue(columnName, out binding!);
         }
 
         public IEnumerable<ConditionInfo> EnumerateScopeConditions(ConditionSource source)
@@ -109,5 +122,14 @@ namespace SqlTestDataGenerator.Parsing.Models
         public string OutputAlias { get; set; } = string.Empty;
         public string Expression { get; set; } = string.Empty;
         public bool IsAggregate { get; set; }
+    }
+
+    public sealed class DerivedColumnBinding
+    {
+        public string DerivedAlias { get; set; } = string.Empty;
+        public string OutputColumn { get; set; } = string.Empty;
+        public string SourceAlias { get; set; } = string.Empty;
+        public string SourceColumn { get; set; } = string.Empty;
+        public string SourceExpression { get; set; } = string.Empty;
     }
 }

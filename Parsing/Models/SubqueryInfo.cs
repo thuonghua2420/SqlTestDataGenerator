@@ -41,6 +41,9 @@ namespace SqlTestDataGenerator.Parsing.Models
         /// <summary>Nested subqueries inside this subquery</summary>
         public List<SubqueryInfo> NestedSubqueries { get; set; } = new();
 
+        /// <summary>Table-valued function sources declared in this subquery (for example STRING_SPLIT aliases).</summary>
+        public List<TableFunctionInfo> TableFunctions { get; set; } = new();
+
         /// <summary>Whether this is a correlated subquery (references parent tables)</summary>
         public bool IsCorrelated { get; set; }
 
@@ -72,5 +75,12 @@ namespace SqlTestDataGenerator.Parsing.Models
         ScalarComparison,
         Any,
         All
+    }
+
+    public sealed class TableFunctionInfo
+    {
+        public string Alias { get; set; } = string.Empty;
+        public string FunctionName { get; set; } = string.Empty;
+        public List<string> LiteralArguments { get; set; } = new();
     }
 }

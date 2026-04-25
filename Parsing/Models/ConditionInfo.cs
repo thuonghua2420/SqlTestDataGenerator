@@ -5,6 +5,11 @@ namespace SqlTestDataGenerator.Parsing.Models
     /// </summary>
     public class ConditionInfo
     {
+        public List<ConditionColumnReference> ReferencedColumns { get; set; } = new();
+        public ScalarExpressionInfo? LeftExpression { get; set; }
+        public ScalarExpressionInfo? RightExpression { get; set; }
+        public List<string> DynamicStringValues { get; set; } = new();
+
         /// <summary>Stable key for this predicate occurrence.</summary>
         public string Key { get; set; } = string.Empty;
 
@@ -74,6 +79,12 @@ namespace SqlTestDataGenerator.Parsing.Models
 
         public override string ToString()
         {
+            if (!string.IsNullOrWhiteSpace(ExpressionText) &&
+                (ReferencedColumns.Count > 1 || string.IsNullOrWhiteSpace(ColumnName)))
+            {
+                return ExpressionText;
+            }
+
             var prefix = AggregateFunc.HasValue ? $"{AggregateFunc}(" : "";
             var suffix = AggregateFunc.HasValue ? ")" : "";
             var alias = string.IsNullOrEmpty(TableAlias) ? "" : $"{TableAlias}.";
@@ -146,5 +157,12 @@ namespace SqlTestDataGenerator.Parsing.Models
         Max,
         Min,
         CountDistinct
+    }
+
+    public sealed class ConditionColumnReference
+    {
+        public string TableAlias { get; set; } = string.Empty;
+        public string ColumnName { get; set; } = string.Empty;
+        public bool IsRightSide { get; set; }
     }
 }

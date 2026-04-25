@@ -1,3 +1,6 @@
 /bin
 /bin
 /bin/Debug
+/bin/Release/net8.0-windows
+/bin/Debug
+/obj/Debug

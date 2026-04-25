@@ -41,7 +41,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
     public class IntegerValueGenerator : IValueGenerator
     {
         private readonly Dictionary<string, int> _counters = new(StringComparer.OrdinalIgnoreCase);
-        private const int StartValue = 90000;
+        private const int StartValue = 1;
 
         public bool CanHandle(DataTypeCategory category) => category == DataTypeCategory.Integer;
 
@@ -108,9 +108,9 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
         {
             return column.DataType.ToLowerInvariant() switch
             {
-                "tinyint" => (byte)(Math.Abs(value) % 256),
-                "smallint" => (short)((value % 65536 + 65536) % 65536 - 32768),
-                "int" => (int)value,
+                "tinyint" => (byte)Math.Clamp(value, byte.MinValue, byte.MaxValue),
+                "smallint" => (short)Math.Clamp(value, short.MinValue, short.MaxValue),
+                "int" => (int)Math.Clamp(value, int.MinValue, int.MaxValue),
                 _ => value
             };
         }
