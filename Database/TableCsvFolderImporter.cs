@@ -14,6 +14,8 @@ namespace SqlTestDataGenerator.Database
     /// </summary>
     public class TableCsvFolderImporter
     {
+        private const int ReaderBufferSize = 64 * 1024;
+
         public IReadOnlyList<CsvTableFileReference> DiscoverTableFiles(string folderPath)
         {
             if (string.IsNullOrWhiteSpace(folderPath))
@@ -135,12 +137,20 @@ namespace SqlTestDataGenerator.Database
             TableSchema schema,
             CancellationToken cancellationToken)
         {
-            var text = await File.ReadAllTextAsync(filePath, Encoding.UTF8, cancellationToken);
-            var records = ParseCsvRecords(text);
-            if (records.Count == 0)
+            await using var stream = new FileStream(
+                filePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                ReaderBufferSize,
+                FileOptions.SequentialScan | FileOptions.Asynchronous);
+            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, ReaderBufferSize, leaveOpen: false);
+            var csvReader = new BufferedCsvCharReader(reader);
+
+            var header = await ReadNextCsvRecordAsync(csvReader, cancellationToken);
+            if (header == null)
                 return new List<GeneratedRow>();
 
-            var header = records[0];
             if (header.Count == 0)
                 throw new InvalidOperationException($"CSV file [{filePath}] does not contain a header row.");
 
@@ -151,9 +161,14 @@ namespace SqlTestDataGenerator.Database
             ValidateHeaders(headers, schema, filePath);
 
             var rows = new List<GeneratedRow>();
-            for (int rowIndex = 1; rowIndex < records.Count; rowIndex++)
+            int rowIndex = 1;
+            while (true)
             {
-                var record = records[rowIndex];
+                cancellationToken.ThrowIfCancellationRequested();
+                var record = await ReadNextCsvRecordAsync(csvReader, cancellationToken);
+                if (record == null)
+                    break;
+
                 if (record.Count != headers.Length)
                 {
                     throw new InvalidOperationException(
@@ -172,6 +187,7 @@ namespace SqlTestDataGenerator.Database
                 }
 
                 rows.Add(row);
+                rowIndex++;
             }
 
             return rows;
@@ -259,14 +275,24 @@ namespace SqlTestDataGenerator.Database
         private static byte[] ParseBinary(string value)
         {
             if (value.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
-                return Convert.FromHexString(value[2..]);
+            {
+                var hex = value[2..];
+                if ((hex.Length & 1) != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Binary hex payload has odd length {hex.Length}. A valid byte stream must contain an even number of hex characters.");
+                }
+
+                return Convert.FromHexString(hex);
+            }
 
             return Encoding.UTF8.GetBytes(value);
         }
 
-        private static List<List<CsvField>> ParseCsvRecords(string text)
+        private static async Task<List<CsvField>?> ReadNextCsvRecordAsync(
+            BufferedCsvCharReader reader,
+            CancellationToken cancellationToken)
         {
-            var records = new List<List<CsvField>>();
             var currentRecord = new List<CsvField>();
             var currentValue = new StringBuilder();
             bool inQuotes = false;
@@ -281,25 +307,33 @@ namespace SqlTestDataGenerator.Database
                 atFieldStart = true;
             }
 
-            void CompleteRecord()
+            while (true)
             {
-                CompleteField();
-                records.Add(currentRecord);
-                currentRecord = new List<CsvField>();
-            }
+                cancellationToken.ThrowIfCancellationRequested();
+                int codePoint = await reader.ReadAsync(cancellationToken);
+                if (codePoint < 0)
+                {
+                    if (inQuotes)
+                        throw new InvalidOperationException("CSV parse error: unterminated quoted field.");
 
-            for (int i = 0; i < text.Length; i++)
-            {
-                var ch = text[i];
+                    if (currentValue.Length == 0 && !fieldWasQuoted && currentRecord.Count == 0)
+                        return null;
+
+                    CompleteField();
+                    return currentRecord;
+                }
+
+                var ch = (char)codePoint;
 
                 if (inQuotes)
                 {
                     if (ch == '"')
                     {
-                        if (i + 1 < text.Length && text[i + 1] == '"')
+                        int next = await reader.PeekAsync(cancellationToken);
+                        if (next == '"')
                         {
+                            await reader.ReadAsync(cancellationToken);
                             currentValue.Append('"');
-                            i++;
                         }
                         else
                         {
@@ -330,34 +364,71 @@ namespace SqlTestDataGenerator.Database
 
                 if (ch == '\r' || ch == '\n')
                 {
-                    if (ch == '\r' && i + 1 < text.Length && text[i + 1] == '\n')
-                        i++;
+                    if (ch == '\r' && await reader.PeekAsync(cancellationToken) == '\n')
+                    {
+                        await reader.ReadAsync(cancellationToken);
+                    }
 
-                    CompleteRecord();
-                    continue;
+                    CompleteField();
+                    return currentRecord;
                 }
 
                 currentValue.Append(ch);
                 atFieldStart = false;
             }
-
-            if (inQuotes)
-                throw new InvalidOperationException("CSV parse error: unterminated quoted field.");
-
-            if (currentValue.Length > 0 || fieldWasQuoted || currentRecord.Count > 0)
-            {
-                CompleteRecord();
-            }
-
-            while (records.Count > 0 && records[^1].Count == 1 && records[^1][0].Value.Length == 0 && !records[^1][0].WasQuoted)
-            {
-                records.RemoveAt(records.Count - 1);
-            }
-
-            return records;
         }
 
         private readonly record struct CsvField(string Value, bool WasQuoted);
+
+        private sealed class BufferedCsvCharReader
+        {
+            private readonly TextReader _reader;
+            private readonly char[] _buffer;
+            private int _bufferLength;
+            private int _bufferOffset;
+            private bool _hasPushback;
+            private char _pushbackChar;
+
+            public BufferedCsvCharReader(TextReader reader, int bufferSize = ReaderBufferSize)
+            {
+                _reader = reader;
+                _buffer = new char[Math.Max(1024, bufferSize)];
+            }
+
+            public async Task<int> ReadAsync(CancellationToken cancellationToken)
+            {
+                if (_hasPushback)
+                {
+                    _hasPushback = false;
+                    return _pushbackChar;
+                }
+
+                if (_bufferOffset >= _bufferLength)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    _bufferLength = await _reader.ReadAsync(_buffer, 0, _buffer.Length);
+                    _bufferOffset = 0;
+                    if (_bufferLength == 0)
+                        return -1;
+                }
+
+                return _buffer[_bufferOffset++];
+            }
+
+            public async Task<int> PeekAsync(CancellationToken cancellationToken)
+            {
+                if (_hasPushback)
+                    return _pushbackChar;
+
+                int next = await ReadAsync(cancellationToken);
+                if (next < 0)
+                    return -1;
+
+                _hasPushback = true;
+                _pushbackChar = (char)next;
+                return next;
+            }
+        }
     }
 
     public class CsvTableFileReference

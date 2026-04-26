@@ -1302,6 +1302,10 @@ namespace SqlTestDataGenerator.UI
             try
             {
                 ClearLastInsertedTables();
+                _currentDataSet = null;
+                _currentDataSetIsGenerated = false;
+                _scriptCleanOutput.Clear();
+                UpdateDbInsertButtonState();
                 SetStatus("Analyzing SQL...");
                 LogInfo("Starting SQL analysis.");
                 _currentQuery = _parser.Parse(sql);

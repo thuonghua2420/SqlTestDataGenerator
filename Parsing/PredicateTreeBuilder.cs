@@ -298,6 +298,54 @@ namespace SqlTestDataGenerator.Parsing
                 return;
             }
 
+            if (expr is NullIfExpression nullIf)
+            {
+                ExtractColumnReference(nullIf.FirstExpression, condition, isLeft);
+                if (HasResolvedConditionColumn(condition, isLeft))
+                    return;
+
+                ExtractColumnReference(nullIf.SecondExpression, condition, isLeft);
+                return;
+            }
+
+            if (expr is CastCall castCall)
+            {
+                ExtractColumnReference(castCall.Parameter, condition, isLeft);
+                return;
+            }
+
+            if (expr is TryCastCall tryCastCall)
+            {
+                ExtractColumnReference(tryCastCall.Parameter, condition, isLeft);
+                return;
+            }
+
+            if (expr is ConvertCall convertCall)
+            {
+                ExtractColumnReference(convertCall.Parameter, condition, isLeft);
+                if (HasResolvedConditionColumn(condition, isLeft))
+                    return;
+
+                if (convertCall.Style != null)
+                {
+                    ExtractColumnReference(convertCall.Style, condition, isLeft);
+                }
+                return;
+            }
+
+            if (expr is TryConvertCall tryConvertCall)
+            {
+                ExtractColumnReference(tryConvertCall.Parameter, condition, isLeft);
+                if (HasResolvedConditionColumn(condition, isLeft))
+                    return;
+
+                if (tryConvertCall.Style != null)
+                {
+                    ExtractColumnReference(tryConvertCall.Style, condition, isLeft);
+                }
+                return;
+            }
+
             if (expr is BinaryExpression binary)
             {
                 if (isLeft)
@@ -401,6 +449,43 @@ namespace SqlTestDataGenerator.Parsing
                     Arguments = func.Parameters.Select(BuildScalarExpression).Where(p => p != null).Cast<ScalarExpressionInfo>().ToList(),
                     Text = GetFragmentText(func)
                 },
+                NullIfExpression nullIf => new FunctionScalarExpressionInfo
+                {
+                    Name = "NULLIF",
+                    Arguments = new List<ScalarExpressionInfo?>
+                    {
+                        BuildScalarExpression(nullIf.FirstExpression),
+                        BuildScalarExpression(nullIf.SecondExpression)
+                    }
+                    .Where(a => a != null)
+                    .Cast<ScalarExpressionInfo>()
+                    .ToList(),
+                    Text = GetFragmentText(nullIf)
+                },
+                CastCall cast => new FunctionScalarExpressionInfo
+                {
+                    Name = "CAST",
+                    Arguments = BuildConvertArguments(cast.DataType, cast.Parameter, style: null),
+                    Text = GetFragmentText(cast)
+                },
+                TryCastCall tryCast => new FunctionScalarExpressionInfo
+                {
+                    Name = "TRY_CAST",
+                    Arguments = BuildConvertArguments(tryCast.DataType, tryCast.Parameter, style: null),
+                    Text = GetFragmentText(tryCast)
+                },
+                ConvertCall convert => new FunctionScalarExpressionInfo
+                {
+                    Name = "CONVERT",
+                    Arguments = BuildConvertArguments(convert.DataType, convert.Parameter, convert.Style),
+                    Text = GetFragmentText(convert)
+                },
+                TryConvertCall tryConvert => new FunctionScalarExpressionInfo
+                {
+                    Name = "TRY_CONVERT",
+                    Arguments = BuildConvertArguments(tryConvert.DataType, tryConvert.Parameter, tryConvert.Style),
+                    Text = GetFragmentText(tryConvert)
+                },
                 BinaryExpression binary => new BinaryScalarExpressionInfo
                 {
                     Operator = ConvertBinaryOperator(binary.BinaryExpressionType),
@@ -459,6 +544,35 @@ namespace SqlTestDataGenerator.Parsing
                     foreach (var parameter in funcCall.Parameters)
                     {
                         CollectReferencedColumns(parameter, condition, isRightSide);
+                    }
+                    break;
+
+                case NullIfExpression nullIf:
+                    CollectReferencedColumns(nullIf.FirstExpression, condition, isRightSide);
+                    CollectReferencedColumns(nullIf.SecondExpression, condition, isRightSide);
+                    break;
+
+                case CastCall castCall:
+                    CollectReferencedColumns(castCall.Parameter, condition, isRightSide);
+                    break;
+
+                case TryCastCall tryCastCall:
+                    CollectReferencedColumns(tryCastCall.Parameter, condition, isRightSide);
+                    break;
+
+                case ConvertCall convertCall:
+                    CollectReferencedColumns(convertCall.Parameter, condition, isRightSide);
+                    if (convertCall.Style != null)
+                    {
+                        CollectReferencedColumns(convertCall.Style, condition, isRightSide);
+                    }
+                    break;
+
+                case TryConvertCall tryConvertCall:
+                    CollectReferencedColumns(tryConvertCall.Parameter, condition, isRightSide);
+                    if (tryConvertCall.Style != null)
+                    {
+                        CollectReferencedColumns(tryConvertCall.Style, condition, isRightSide);
                     }
                     break;
 
@@ -547,6 +661,36 @@ namespace SqlTestDataGenerator.Parsing
                 ColumnReferenceExpression c => GetFragmentText(c),
                 _ => GetFragmentText(expr)
             };
+        }
+
+        private List<ScalarExpressionInfo> BuildConvertArguments(
+            DataTypeReference dataType,
+            ScalarExpression parameter,
+            ScalarExpression? style)
+        {
+            var args = new List<ScalarExpressionInfo>
+            {
+                new LiteralScalarExpressionInfo
+                {
+                    Value = GetFragmentText(dataType),
+                    Kind = ScalarLiteralKind.Other,
+                    Text = GetFragmentText(dataType)
+                }
+            };
+
+            var parameterExpression = BuildScalarExpression(parameter);
+            if (parameterExpression != null)
+            {
+                args.Add(parameterExpression);
+            }
+
+            var styleExpression = BuildScalarExpression(style);
+            if (styleExpression != null)
+            {
+                args.Add(styleExpression);
+            }
+
+            return args;
         }
 
         private static string GetFragmentText(TSqlFragment? node)

@@ -386,27 +386,15 @@ namespace SqlTestDataGenerator.Parsing
 
         private IEnumerable<(string Name, QuerySpecification Spec)> ExtractCteQuerySpecifications(TSqlFragment fragment)
         {
-            if (fragment is not TSqlScript script)
-                yield break;
+            var visitor = new CteCollectorVisitor();
+            fragment.Accept(visitor);
 
-            foreach (var batch in script.Batches)
+            foreach (var cte in visitor.CommonTableExpressions)
             {
-                foreach (var stmt in batch.Statements)
+                var cteName = cte.ExpressionName?.Value ?? "CTE";
+                foreach (var spec in EnumerateQuerySpecifications(cte.QueryExpression))
                 {
-                    if (stmt is not SelectStatement selectStmt ||
-                        selectStmt.WithCtesAndXmlNamespaces?.CommonTableExpressions == null)
-                    {
-                        continue;
-                    }
-
-                    foreach (var cte in selectStmt.WithCtesAndXmlNamespaces.CommonTableExpressions)
-                    {
-                        var cteName = cte.ExpressionName?.Value ?? "CTE";
-                        foreach (var spec in EnumerateQuerySpecifications(cte.QueryExpression))
-                        {
-                            yield return ($"CTE {cteName}", spec);
-                        }
-                    }
+                    yield return ($"CTE {cteName}", spec);
                 }
             }
         }
@@ -780,6 +768,9 @@ namespace SqlTestDataGenerator.Parsing
 
         private static void ResolveConditionDerivedAliases(ParsedQuery result, ConditionInfo condition)
         {
+            ResolveScalarExpressionDerivedAliases(result, condition.LeftExpression);
+            ResolveScalarExpressionDerivedAliases(result, condition.RightExpression);
+
             if (!string.IsNullOrWhiteSpace(condition.TableAlias) &&
                 !string.IsNullOrWhiteSpace(condition.ColumnName))
             {
@@ -813,6 +804,38 @@ namespace SqlTestDataGenerator.Parsing
                 ResolveDerivedAliasColumn(result, ref alias, ref column);
                 reference.TableAlias = alias;
                 reference.ColumnName = column;
+            }
+        }
+
+        private static void ResolveScalarExpressionDerivedAliases(ParsedQuery result, ScalarExpressionInfo? expression)
+        {
+            switch (expression)
+            {
+                case ColumnScalarExpressionInfo column:
+                {
+                    var alias = column.TableAlias;
+                    var columnName = column.ColumnName;
+                    ResolveDerivedAliasColumn(result, ref alias, ref columnName);
+                    column.TableAlias = alias;
+                    column.ColumnName = columnName;
+                    break;
+                }
+
+                case FunctionScalarExpressionInfo function:
+                    foreach (var argument in function.Arguments)
+                    {
+                        ResolveScalarExpressionDerivedAliases(result, argument);
+                    }
+                    break;
+
+                case BinaryScalarExpressionInfo binary:
+                    ResolveScalarExpressionDerivedAliases(result, binary.Left);
+                    ResolveScalarExpressionDerivedAliases(result, binary.Right);
+                    break;
+
+                case UnaryScalarExpressionInfo unary:
+                    ResolveScalarExpressionDerivedAliases(result, unary.Operand);
+                    break;
             }
         }
 
@@ -960,6 +983,21 @@ namespace SqlTestDataGenerator.Parsing
             fragment.Accept(visitor);
 
             var mappings = new Dictionary<string, Dictionary<string, DerivedColumnBinding>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (name, spec) in ExtractCteQuerySpecifications(fragment))
+            {
+                var alias = name.StartsWith("CTE ", StringComparison.OrdinalIgnoreCase)
+                    ? name[4..]
+                    : name;
+                if (string.IsNullOrWhiteSpace(alias))
+                    continue;
+
+                var bindings = BuildDerivedColumnBindings(alias, spec);
+                if (bindings.Count > 0)
+                {
+                    mappings[alias] = bindings;
+                }
+            }
+
             foreach (var derivedTable in visitor.DerivedTables)
             {
                 var alias = derivedTable.Alias?.Value ?? string.Empty;
@@ -1087,6 +1125,10 @@ namespace SqlTestDataGenerator.Parsing
 
                 case ParenthesisExpression paren:
                     return TryResolveExpressionSource(paren.Expression, localDerivedMappings, out sourceAlias, out sourceColumn);
+
+                case FunctionCall func when IsAggregateFunction(func.FunctionName?.Value ?? string.Empty) &&
+                                            func.Parameters.Count > 0:
+                    return TryResolveExpressionSource(func.Parameters[0], localDerivedMappings, out sourceAlias, out sourceColumn);
             }
 
             return false;
@@ -1173,6 +1215,17 @@ namespace SqlTestDataGenerator.Parsing
             public override void Visit(QueryDerivedTable node)
             {
                 DerivedTables.Add(node);
+                base.Visit(node);
+            }
+        }
+
+        private sealed class CteCollectorVisitor : TSqlFragmentVisitor
+        {
+            public List<CommonTableExpression> CommonTableExpressions { get; } = new();
+
+            public override void Visit(CommonTableExpression node)
+            {
+                CommonTableExpressions.Add(node);
                 base.Visit(node);
             }
         }

@@ -19,6 +19,8 @@ namespace SqlTestDataGenerator.Database
     public class TableCsvExporter
     {
         private const int DefaultCommandTimeoutSeconds = 60;
+        private const int BinaryChunkSize = 32 * 1024;
+        private const int WriterBufferSize = 64 * 1024;
 
         public async Task<CsvExportResult> ExportAsync(
             SqlConnection connection,
@@ -81,7 +83,11 @@ namespace SqlTestDataGenerator.Database
             cmd.CommandTimeout = DefaultCommandTimeoutSeconds;
 
             using var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess, cancellationToken);
-            await using var writer = new StreamWriter(filePath, false, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            await using var writer = new StreamWriter(
+                filePath,
+                false,
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+                WriterBufferSize);
 
             var columnNames = Enumerable.Range(0, reader.FieldCount)
                 .Select(reader.GetName)
@@ -95,19 +101,80 @@ namespace SqlTestDataGenerator.Database
             int rowCount = 0;
             while (await reader.ReadAsync(cancellationToken))
             {
-                var fields = new string[reader.FieldCount];
-                for (int i = 0; i < reader.FieldCount; i++)
-                {
-                    var value = reader.IsDBNull(i) ? null : reader.GetValue(i);
-                    fields[i] = FormatCsvField(value, columns[i]);
-                }
-
-                await writer.WriteLineAsync(BuildCsvLine(fields));
+                await WriteCsvRecordAsync(reader, writer, columns, cancellationToken);
                 rowCount++;
             }
 
             await writer.FlushAsync(cancellationToken);
             return rowCount;
+        }
+
+        private static async Task WriteCsvRecordAsync(
+            SqlDataReader reader,
+            StreamWriter writer,
+            IReadOnlyList<ColumnSchema?> columns,
+            CancellationToken cancellationToken)
+        {
+            for (int i = 0; i < reader.FieldCount; i++)
+            {
+                if (i > 0)
+                    await writer.WriteAsync(",");
+
+                if (reader.IsDBNull(i))
+                    continue;
+
+                if (IsBinaryColumn(columns[i]))
+                {
+                    await WriteBinaryCsvFieldAsync(reader, i, writer, cancellationToken);
+                    continue;
+                }
+
+                var value = reader.GetValue(i);
+                await writer.WriteAsync(FormatCsvField(value, columns[i]));
+            }
+
+            await writer.WriteLineAsync();
+        }
+
+        private static bool IsBinaryColumn(ColumnSchema? column) =>
+            column?.TypeCategory == DataTypeCategory.Binary;
+
+        private static async Task WriteBinaryCsvFieldAsync(
+            SqlDataReader reader,
+            int ordinal,
+            StreamWriter writer,
+            CancellationToken cancellationToken)
+        {
+            long totalBytes = reader.GetBytes(ordinal, 0, null, 0, 0);
+            await writer.WriteAsync("0x");
+
+            if (totalBytes == 0)
+                return;
+
+            var buffer = new byte[BinaryChunkSize];
+            long offset = 0;
+
+            while (offset < totalBytes)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                int requested = (int)Math.Min(buffer.Length, totalBytes - offset);
+                long read = reader.GetBytes(ordinal, offset, buffer, 0, requested);
+                if (read <= 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Unexpected end of binary stream while exporting ordinal {ordinal}. Expected {totalBytes} byte(s), exported {offset} byte(s).");
+                }
+
+                await writer.WriteAsync(Convert.ToHexString(buffer.AsSpan(0, (int)read)));
+                offset += read;
+            }
+
+            if (offset != totalBytes)
+            {
+                throw new InvalidOperationException(
+                    $"Binary export length mismatch for ordinal {ordinal}. Expected {totalBytes} byte(s), exported {offset} byte(s).");
+            }
         }
 
         private static string FormatCsvField(object? value, ColumnSchema? column)

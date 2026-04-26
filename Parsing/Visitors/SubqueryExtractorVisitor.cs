@@ -135,6 +135,25 @@ namespace SqlTestDataGenerator.Parsing.Visitors
                             }
                         }
                     }
+                    else if (scalarExpr.Expression is FunctionCall func &&
+                             IsAggregateFunction(func.FunctionName?.Value) &&
+                             func.Parameters.Count > 0 &&
+                             func.Parameters[0] is ColumnReferenceExpression aggregateColRef)
+                    {
+                        var parts = aggregateColRef.MultiPartIdentifier?.Identifiers;
+                        if (parts != null)
+                        {
+                            if (parts.Count >= 2)
+                            {
+                                subInfo.SelectTableAlias = parts[0].Value;
+                                subInfo.SelectColumn = parts[1].Value;
+                            }
+                            else if (parts.Count == 1)
+                            {
+                                subInfo.SelectColumn = parts[0].Value;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -323,6 +342,14 @@ namespace SqlTestDataGenerator.Parsing.Visitors
                 _ => string.Empty
             };
         }
+
+        private static bool IsAggregateFunction(string? name) =>
+            name != null &&
+            (name.Equals("COUNT", StringComparison.OrdinalIgnoreCase) ||
+             name.Equals("SUM", StringComparison.OrdinalIgnoreCase) ||
+             name.Equals("AVG", StringComparison.OrdinalIgnoreCase) ||
+             name.Equals("MIN", StringComparison.OrdinalIgnoreCase) ||
+             name.Equals("MAX", StringComparison.OrdinalIgnoreCase));
 
         private string GetFragmentText(TSqlFragment node)
         {
