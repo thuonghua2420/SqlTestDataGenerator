@@ -243,14 +243,30 @@ namespace SqlTestDataGenerator.Parsing.Visitors
         {
             switch (expr)
             {
-                case ColumnReferenceExpression colRef:
+                case ColumnReferenceExpression colRef when !IsCurrentDateTimeKeyword(colRef):
                     AddReferencedColumn(colRef, condition, isRightSide);
                     break;
 
                 case FunctionCall funcCall:
-                    foreach (var parameter in funcCall.Parameters)
+                    foreach (var parameter in GetColumnBearingFunctionParameters(funcCall))
                     {
                         CollectReferencedColumns(parameter, condition, isRightSide);
+                    }
+                    break;
+
+                case ParseCall parseCall:
+                    CollectReferencedColumns(parseCall.StringValue, condition, isRightSide);
+                    if (parseCall.Culture != null)
+                    {
+                        CollectReferencedColumns(parseCall.Culture, condition, isRightSide);
+                    }
+                    break;
+
+                case TryParseCall tryParseCall:
+                    CollectReferencedColumns(tryParseCall.StringValue, condition, isRightSide);
+                    if (tryParseCall.Culture != null)
+                    {
+                        CollectReferencedColumns(tryParseCall.Culture, condition, isRightSide);
                     }
                     break;
 
@@ -298,6 +314,9 @@ namespace SqlTestDataGenerator.Parsing.Visitors
         {
             if (expr is ColumnReferenceExpression colRef)
             {
+                if (IsCurrentDateTimeKeyword(colRef))
+                    return;
+
                 var parts = colRef.MultiPartIdentifier?.Identifiers;
                 if (parts != null)
                 {
@@ -336,12 +355,20 @@ namespace SqlTestDataGenerator.Parsing.Visitors
                     condition.AggregateFunc = aggFunc;
                 }
 
-                foreach (var parameter in funcCall.Parameters)
+                foreach (var parameter in GetColumnBearingFunctionParameters(funcCall))
                 {
                     ExtractColumnReference(parameter, condition, isLeft);
                     if (HasResolvedConditionColumn(condition, isLeft))
                         return;
                 }
+            }
+            else if (expr is ParseCall parseCall)
+            {
+                ExtractColumnReference(parseCall.StringValue, condition, isLeft);
+            }
+            else if (expr is TryParseCall tryParseCall)
+            {
+                ExtractColumnReference(tryParseCall.StringValue, condition, isLeft);
             }
             else if (expr is BinaryExpression binExpr)
             {
@@ -376,7 +403,7 @@ namespace SqlTestDataGenerator.Parsing.Visitors
 
         private bool IsColumnReference(ScalarExpression expr)
         {
-            return expr is ColumnReferenceExpression;
+            return expr is ColumnReferenceExpression colRef && !IsCurrentDateTimeKeyword(colRef);
         }
 
         private string ExtractLiteralValue(ScalarExpression expr)
@@ -395,6 +422,9 @@ namespace SqlTestDataGenerator.Parsing.Visitors
                 ParenthesisExpression paren => ExtractLiteralValue(paren.Expression),
                 UnaryExpression unary => (unary.UnaryExpressionType == UnaryExpressionType.Negative ? "-" : "") + ExtractLiteralValue(unary.Expression),
                 FunctionCall func => GetNodeText(func),
+                ParameterlessCall parameterless => GetNodeText(parameterless),
+                ParseCall parse => GetNodeText(parse),
+                TryParseCall tryParse => GetNodeText(tryParse),
                 _ => GetNodeText(expr)
             };
         }
@@ -406,6 +436,16 @@ namespace SqlTestDataGenerator.Parsing.Visitors
 
             return expr switch
             {
+                ParameterlessCall parameterless => new FunctionScalarExpressionInfo
+                {
+                    Name = parameterless.ParameterlessCallType.ToString(),
+                    Text = GetNodeText(parameterless)
+                },
+                ColumnReferenceExpression colRef when IsCurrentDateTimeKeyword(colRef) => new FunctionScalarExpressionInfo
+                {
+                    Name = GetCurrentDateTimeKeyword(colRef),
+                    Text = GetNodeText(colRef)
+                },
                 ColumnReferenceExpression colRef => BuildColumnExpression(colRef),
                 StringLiteral str => new LiteralScalarExpressionInfo
                 {
@@ -443,6 +483,18 @@ namespace SqlTestDataGenerator.Parsing.Visitors
                     Name = func.FunctionName?.Value ?? string.Empty,
                     Arguments = func.Parameters.Select(BuildScalarExpression).Where(p => p != null).Cast<ScalarExpressionInfo>().ToList(),
                     Text = GetNodeText(func)
+                },
+                ParseCall parse => new FunctionScalarExpressionInfo
+                {
+                    Name = "PARSE",
+                    Arguments = BuildParseArguments(parse.DataType, parse.StringValue, parse.Culture),
+                    Text = GetNodeText(parse)
+                },
+                TryParseCall tryParse => new FunctionScalarExpressionInfo
+                {
+                    Name = "TRY_PARSE",
+                    Arguments = BuildParseArguments(tryParse.DataType, tryParse.StringValue, tryParse.Culture),
+                    Text = GetNodeText(tryParse)
                 },
                 BinaryExpression binary => new BinaryScalarExpressionInfo
                 {
@@ -491,6 +543,67 @@ namespace SqlTestDataGenerator.Parsing.Visitors
                 "MAX" => Models.AggregateFunction.Max,
                 "MIN" => Models.AggregateFunction.Min,
                 _ => null
+            };
+        }
+
+        private List<ScalarExpressionInfo> BuildParseArguments(
+            DataTypeReference dataType,
+            ScalarExpression stringValue,
+            ScalarExpression? culture)
+        {
+            var args = new List<ScalarExpressionInfo>
+            {
+                new LiteralScalarExpressionInfo
+                {
+                    Value = GetNodeText(dataType),
+                    Kind = ScalarLiteralKind.Other,
+                    Text = GetNodeText(dataType)
+                }
+            };
+
+            var valueExpression = BuildScalarExpression(stringValue);
+            if (valueExpression != null)
+            {
+                args.Add(valueExpression);
+            }
+
+            var cultureExpression = BuildScalarExpression(culture);
+            if (cultureExpression != null)
+            {
+                args.Add(cultureExpression);
+            }
+
+            return args;
+        }
+
+        private static IEnumerable<ScalarExpression> GetColumnBearingFunctionParameters(FunctionCall function)
+        {
+            var startIndex = IsDatePartFunction(function.FunctionName?.Value) ? 1 : 0;
+            return function.Parameters.Skip(startIndex);
+        }
+
+        private static bool IsDatePartFunction(string? functionName)
+        {
+            return functionName?.ToUpperInvariant() is "DATEADD" or "DATEDIFF" or "DATEPART" or "DATENAME";
+        }
+
+        private static bool IsCurrentDateTimeKeyword(ColumnReferenceExpression colRef)
+        {
+            var parts = colRef.MultiPartIdentifier?.Identifiers;
+            return parts?.Count == 1 &&
+                   GetCurrentDateTimeKeyword(colRef).Length > 0;
+        }
+
+        private static string GetCurrentDateTimeKeyword(ColumnReferenceExpression colRef)
+        {
+            var parts = colRef.MultiPartIdentifier?.Identifiers;
+            var token = parts?.Count == 1 ? parts[0].Value : string.Empty;
+            var normalized = token.Replace(" ", string.Empty, StringComparison.Ordinal).ToUpperInvariant();
+            return normalized switch
+            {
+                "CURRENT_TIMESTAMP" or "CURRENTTIMESTAMP" => "CURRENT_TIMESTAMP",
+                "CURRENT_DATE" or "CURRENTDATE" => "CURRENT_DATE",
+                _ => string.Empty
             };
         }
 

@@ -17,6 +17,8 @@ namespace SqlTestDataGenerator.DataGeneration
         private readonly DependencyOrderResolver _orderResolver = new();
         private int _fallbackSeedCounter = 1;
         private Dictionary<string, int> _tableIdMaxValues = new(StringComparer.OrdinalIgnoreCase);
+        private DateTime _generationLocalNow = DateTime.SpecifyKind(DateTime.Now, DateTimeKind.Unspecified);
+        private DateTime _generationUtcNow = DateTime.UtcNow;
 
         /// <summary>
         /// Fallback starting seed for generated data when database-backed per-table seeds are unavailable.
@@ -56,6 +58,8 @@ namespace SqlTestDataGenerator.DataGeneration
         {
             _fallbackSeedCounter = StartId;
             _tableIdMaxValues = BuildTableIdMaxValues(schemas);
+            _generationLocalNow = DateTime.SpecifyKind(DateTime.Now, DateTimeKind.Unspecified);
+            _generationUtcNow = DateTime.UtcNow;
             var dataSet = new GeneratedDataSet
             {
                 OriginalSql = query.OriginalSql
@@ -2321,6 +2325,12 @@ namespace SqlTestDataGenerator.DataGeneration
                 return new ResolvedColumnValue(true, stringValue);
             }
 
+            if (IsTemporalColumn(col) &&
+                TryResolveFunctionAwareTemporalValue(scenario, query, currentRow, col, tableAlias, targets, generator, out var temporalValue))
+            {
+                return new ResolvedColumnValue(true, temporalValue);
+            }
+
             var candidates = new List<object?>();
 
             foreach (var target in targets)
@@ -2455,6 +2465,403 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             return false;
+        }
+
+        private bool TryResolveFunctionAwareTemporalValue(
+            BranchScenario scenario,
+            ParsedQuery query,
+            GeneratedRow? currentRow,
+            ColumnSchema column,
+            string tableAlias,
+            IReadOnlyCollection<ColumnConditionTarget> targets,
+            IValueGenerator generator,
+            out object? value)
+        {
+            value = null;
+            if (!IsTemporalColumn(column) || targets.Count == 0)
+                return false;
+
+            var candidates = new List<object?>();
+
+            void AddTemporal(object? candidate)
+            {
+                if (candidate == null)
+                    return;
+
+                try
+                {
+                    if (candidate is DateTimeOffset offset)
+                    {
+                        candidates.Add(SqlServerValueNormalizer.NormalizeValue(column, offset) ?? offset);
+                        candidates.Add(SqlServerValueNormalizer.NormalizeValue(column, offset.DateTime) ?? offset.DateTime);
+                        return;
+                    }
+
+                    if (candidate is TimeSpan time)
+                    {
+                        candidates.Add(SqlServerValueNormalizer.NormalizeValue(column, time) ?? time);
+                        return;
+                    }
+
+                    if (TryConvertToDateTimeValue(candidate, out var dateTime))
+                    {
+                        candidates.Add(SqlServerValueNormalizer.NormalizeValue(column, dateTime) ?? dateTime);
+                    }
+                }
+                catch
+                {
+                    candidates.Add(candidate);
+                }
+            }
+
+            void AddDateTimeWithNeighbors(DateTime dateTime)
+            {
+                AddTemporal(dateTime);
+                AddTemporal(dateTime.AddDays(-1));
+                AddTemporal(dateTime.AddDays(1));
+                AddTemporal(dateTime.AddHours(-1));
+                AddTemporal(dateTime.AddHours(1));
+                AddTemporal(dateTime.AddMinutes(-1));
+                AddTemporal(dateTime.AddMinutes(1));
+            }
+
+            if (TryBuildCompositeDatePartCandidate(targets, scenario, query, currentRow, column, tableAlias, out var compositeDate))
+            {
+                AddTemporal(compositeDate);
+            }
+
+            foreach (var target in targets)
+            {
+                AddTemporalExpressionCandidates(target, scenario, query, currentRow, column, tableAlias, AddDateTimeWithNeighbors, AddTemporal);
+                AddDateDiffTemporalCandidates(target, scenario, query, currentRow, column, tableAlias, AddDateTimeWithNeighbors);
+            }
+
+            var now = _generationLocalNow;
+            var utcNow = DateTime.SpecifyKind(_generationUtcNow, DateTimeKind.Unspecified);
+            AddTemporal(now);
+            AddTemporal(now.Date);
+            AddTemporal(now.Date.AddHours(12));
+            AddTemporal(now.AddDays(-1));
+            AddTemporal(now.AddDays(1));
+            AddTemporal(now.AddDays(-7));
+            AddTemporal(now.AddDays(7));
+            AddTemporal(now.AddDays(-30));
+            AddTemporal(now.AddDays(30));
+            AddTemporal(new DateTime(now.Year, 1, 1, 12, 0, 0, DateTimeKind.Unspecified));
+            AddTemporal(new DateTime(now.Year, now.Month, 1, 12, 0, 0, DateTimeKind.Unspecified));
+            AddTemporal(EndOfMonth(now).AddHours(12));
+            AddTemporal(utcNow);
+            AddTemporal(utcNow.Date.AddHours(12));
+            AddTemporal(utcNow.AddDays(-1));
+            AddTemporal(utcNow.AddDays(1));
+
+            if (column.TypeCategory == DataTypeCategory.Time)
+            {
+                AddTemporal(now.TimeOfDay);
+                AddTemporal(now.AddHours(-1).TimeOfDay);
+                AddTemporal(now.AddHours(1).TimeOfDay);
+            }
+
+            foreach (var candidate in DeduplicateCandidates(candidates))
+            {
+                if (targets.All(target => EvaluateConditionTarget(candidate, target, scenario, query, column, generator, tableAlias, currentRow)))
+                {
+                    value = candidate;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool IsTemporalColumn(ColumnSchema column) =>
+            column.TypeCategory is DataTypeCategory.DateTime or DataTypeCategory.DateTimeOffset or DataTypeCategory.Time;
+
+        private bool TryBuildCompositeDatePartCandidate(
+            IReadOnlyCollection<ColumnConditionTarget> targets,
+            BranchScenario scenario,
+            ParsedQuery query,
+            GeneratedRow? currentRow,
+            ColumnSchema column,
+            string tableAlias,
+            out DateTime candidate)
+        {
+            var now = _generationLocalNow;
+            int? year = null;
+            int? month = null;
+            int? day = null;
+            int? hour = null;
+            int? minute = null;
+            int? second = null;
+
+            foreach (var target in targets.Where(t => t.DesiredTruth))
+            {
+                if (!TryGetDatePartConstraintValue(target.Condition, scenario, query, currentRow, column, tableAlias, out var datePart, out var partValue))
+                    continue;
+
+                switch (NormalizeDatePart(datePart))
+                {
+                    case "year":
+                        year = Clamp(partValue, 1, 9999);
+                        break;
+                    case "month":
+                        month = Clamp(partValue, 1, 12);
+                        break;
+                    case "day":
+                        day = Clamp(partValue, 1, 31);
+                        break;
+                    case "hour":
+                        hour = Clamp(partValue, 0, 23);
+                        break;
+                    case "minute":
+                        minute = Clamp(partValue, 0, 59);
+                        break;
+                    case "second":
+                        second = Clamp(partValue, 0, 59);
+                        break;
+                }
+            }
+
+            if (year == null && month == null && day == null && hour == null && minute == null && second == null)
+            {
+                candidate = default;
+                return false;
+            }
+
+            var resolvedYear = year ?? now.Year;
+            var resolvedMonth = month ?? now.Month;
+            var maxDay = DateTime.DaysInMonth(resolvedYear, resolvedMonth);
+            var resolvedDay = Math.Min(day ?? now.Day, maxDay);
+            candidate = new DateTime(
+                resolvedYear,
+                resolvedMonth,
+                resolvedDay,
+                hour ?? now.Hour,
+                minute ?? now.Minute,
+                second ?? now.Second,
+                DateTimeKind.Unspecified);
+            return true;
+        }
+
+        private bool TryGetDatePartConstraintValue(
+            ConditionInfo condition,
+            BranchScenario scenario,
+            ParsedQuery query,
+            GeneratedRow? currentRow,
+            ColumnSchema column,
+            string tableAlias,
+            out string datePart,
+            out int value)
+        {
+            datePart = string.Empty;
+            value = 0;
+
+            if (!TryExtractDatePartExpression(condition.LeftExpression, column, tableAlias, out datePart))
+                return false;
+
+            if (!TryChooseIntegerForCondition(condition, scenario, query, currentRow, column, tableAlias, out value))
+                return false;
+
+            return true;
+        }
+
+        private bool TryChooseIntegerForCondition(
+            ConditionInfo condition,
+            BranchScenario scenario,
+            ParsedQuery query,
+            GeneratedRow? currentRow,
+            ColumnSchema column,
+            string tableAlias,
+            out int value)
+        {
+            value = 0;
+            object? rawValue = null;
+
+            if (condition.Operator == ComparisonOp.Between)
+            {
+                rawValue = condition.RightExpression != null
+                    ? EvaluateScalarExpression(condition.RightExpression, null, scenario, query, currentRow, column, tableAlias, null)
+                    : condition.Value;
+            }
+            else if (condition.RightExpression != null)
+            {
+                rawValue = EvaluateScalarExpression(condition.RightExpression, null, scenario, query, currentRow, column, tableAlias, null);
+            }
+            else if (!string.IsNullOrWhiteSpace(condition.Value))
+            {
+                rawValue = condition.Value;
+            }
+
+            if (!TryConvertInt(rawValue, out var boundary))
+                return false;
+
+            value = condition.Operator switch
+            {
+                ComparisonOp.GreaterThan => boundary + 1,
+                ComparisonOp.LessThan => boundary - 1,
+                ComparisonOp.Between => boundary,
+                _ => boundary
+            };
+            return true;
+        }
+
+        private static bool TryExtractDatePartExpression(
+            ScalarExpressionInfo? expression,
+            ColumnSchema column,
+            string tableAlias,
+            out string datePart)
+        {
+            datePart = string.Empty;
+            if (expression is not FunctionScalarExpressionInfo function ||
+                !ExpressionReferencesTargetColumn(function, column, tableAlias))
+            {
+                return false;
+            }
+
+            var name = function.Name.ToUpperInvariant();
+            if (name is "YEAR" or "MONTH" or "DAY")
+            {
+                datePart = name.ToLowerInvariant();
+                return function.Arguments.Count > 0 &&
+                       ExpressionReferencesTargetColumn(function.Arguments[0], column, tableAlias);
+            }
+
+            if (name == "DATEPART" && function.Arguments.Count >= 2 &&
+                ExpressionReferencesTargetColumn(function.Arguments[1], column, tableAlias))
+            {
+                datePart = ExtractDatePartToken(function.Arguments[0], null);
+                return !string.IsNullOrWhiteSpace(datePart);
+            }
+
+            return false;
+        }
+
+        private void AddTemporalExpressionCandidates(
+            ColumnConditionTarget target,
+            BranchScenario scenario,
+            ParsedQuery query,
+            GeneratedRow? currentRow,
+            ColumnSchema column,
+            string tableAlias,
+            Action<DateTime> addDateTimeWithNeighbors,
+            Action<object?> addTemporal)
+        {
+            foreach (var expression in EnumerateHintExpressions(target.Condition.LeftExpression, column, tableAlias)
+                         .Concat(EnumerateHintExpressions(target.Condition.RightExpression, column, tableAlias)))
+            {
+                var evaluated = EvaluateScalarExpression(expression, null, scenario, query, currentRow, column, tableAlias, null);
+                if (TryConvertToDateTimeValue(evaluated, out var dateTime))
+                {
+                    addDateTimeWithNeighbors(dateTime);
+                }
+                else if (evaluated is DateTimeOffset offset)
+                {
+                    addTemporal(offset);
+                }
+                else if (evaluated is TimeSpan time)
+                {
+                    addTemporal(time);
+                }
+            }
+
+            if (TryConvertToDateTimeValue(target.Condition.Value, out var lower))
+            {
+                addDateTimeWithNeighbors(lower);
+            }
+
+            if (TryConvertToDateTimeValue(target.Condition.SecondValue, out var upper))
+            {
+                addDateTimeWithNeighbors(upper);
+            }
+        }
+
+        private void AddDateDiffTemporalCandidates(
+            ColumnConditionTarget target,
+            BranchScenario scenario,
+            ParsedQuery query,
+            GeneratedRow? currentRow,
+            ColumnSchema column,
+            string tableAlias,
+            Action<DateTime> addDateTimeWithNeighbors)
+        {
+            if (!TryExtractDateDiffExpression(target.Condition.LeftExpression, column, tableAlias, out var datePart, out var targetIsStart, out var otherExpression))
+                return;
+
+            var otherValue = EvaluateScalarExpression(otherExpression, null, scenario, query, currentRow, column, tableAlias, null);
+            if (!TryConvertToDateTimeValue(otherValue, out var anchor))
+                return;
+
+            foreach (var diff in ExtractCandidateDiffValues(target.Condition, scenario, query, currentRow, column, tableAlias))
+            {
+                var signedDiff = targetIsStart ? -diff : diff;
+                var candidate = AddSqlDatePart(anchor, datePart, signedDiff);
+                if (candidate.HasValue)
+                {
+                    addDateTimeWithNeighbors(candidate.Value);
+                }
+            }
+        }
+
+        private IEnumerable<int> ExtractCandidateDiffValues(
+            ConditionInfo condition,
+            BranchScenario scenario,
+            ParsedQuery query,
+            GeneratedRow? currentRow,
+            ColumnSchema column,
+            string tableAlias)
+        {
+            var values = new List<int> { 0, 1, -1, 7, -7, 30, -30 };
+
+            void AddInt(object? raw)
+            {
+                if (TryConvertInt(raw, out var parsed))
+                {
+                    values.Add(parsed);
+                    values.Add(parsed - 1);
+                    values.Add(parsed + 1);
+                }
+            }
+
+            AddInt(condition.Value);
+            AddInt(condition.SecondValue);
+            if (condition.RightExpression != null)
+            {
+                AddInt(EvaluateScalarExpression(condition.RightExpression, null, scenario, query, currentRow, column, tableAlias, null));
+            }
+
+            return values.Distinct();
+        }
+
+        private static bool TryExtractDateDiffExpression(
+            ScalarExpressionInfo? expression,
+            ColumnSchema column,
+            string tableAlias,
+            out string datePart,
+            out bool targetIsStart,
+            out ScalarExpressionInfo? otherExpression)
+        {
+            datePart = string.Empty;
+            targetIsStart = false;
+            otherExpression = null;
+
+            if (expression is not FunctionScalarExpressionInfo function ||
+                !function.Name.Equals("DATEDIFF", StringComparison.OrdinalIgnoreCase) ||
+                function.Arguments.Count < 3)
+            {
+                return false;
+            }
+
+            var startExpression = function.Arguments[1];
+            var endExpression = function.Arguments[2];
+            var targetInStart = ExpressionReferencesTargetColumn(startExpression, column, tableAlias);
+            var targetInEnd = ExpressionReferencesTargetColumn(endExpression, column, tableAlias);
+            if (targetInStart == targetInEnd)
+                return false;
+
+            datePart = ExtractDatePartToken(function.Arguments[0], null);
+            targetIsStart = targetInStart;
+            otherExpression = targetInStart ? endExpression : startExpression;
+            return !string.IsNullOrWhiteSpace(datePart);
         }
 
         private static List<string> ExtractStringHints(IReadOnlyCollection<ColumnConditionTarget> targets)
@@ -2702,7 +3109,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     (string.IsNullOrWhiteSpace(columnExpr.TableAlias) ||
                      columnExpr.TableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase) ||
                      columnExpr.TableAlias.Equals(targetColumn.TableName, StringComparison.OrdinalIgnoreCase)),
-                FunctionScalarExpressionInfo func => func.Arguments.Any(arg => ExpressionReferencesTargetColumn(arg, targetColumn, tableAlias)),
+                FunctionScalarExpressionInfo func => GetColumnBearingFunctionArguments(func).Any(arg => ExpressionReferencesTargetColumn(arg, targetColumn, tableAlias)),
                 BinaryScalarExpressionInfo binary =>
                     ExpressionReferencesTargetColumn(binary.Left, targetColumn, tableAlias) ||
                     ExpressionReferencesTargetColumn(binary.Right, targetColumn, tableAlias),
@@ -2710,6 +3117,15 @@ namespace SqlTestDataGenerator.DataGeneration
                 _ => false
             };
         }
+
+        private static IEnumerable<ScalarExpressionInfo> GetColumnBearingFunctionArguments(FunctionScalarExpressionInfo function)
+        {
+            var startIndex = IsDatePartFunctionName(function.Name) ? 1 : 0;
+            return function.Arguments.Skip(startIndex);
+        }
+
+        private static bool IsDatePartFunctionName(string? name) =>
+            name?.ToUpperInvariant() is "DATEADD" or "DATEDIFF" or "DATEPART" or "DATENAME";
 
         private bool TryEvaluateExpressionConditionTarget(
             object? candidate,
@@ -2874,6 +3290,16 @@ namespace SqlTestDataGenerator.DataGeneration
                     return null;
 
                 case ColumnScalarExpressionInfo columnExpr:
+                    if (IsCurrentTimestampExpression(columnExpr))
+                    {
+                        return _generationLocalNow;
+                    }
+
+                    if (IsCurrentDateExpression(columnExpr))
+                    {
+                        return _generationLocalNow.Date;
+                    }
+
                     if (columnExpr.ColumnName.Equals(targetColumn.ColumnName, StringComparison.OrdinalIgnoreCase) &&
                         (string.IsNullOrWhiteSpace(columnExpr.TableAlias) ||
                          columnExpr.TableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase) ||
@@ -2928,8 +3354,17 @@ namespace SqlTestDataGenerator.DataGeneration
             return null;
         }
 
-        private static object? EvaluateLiteralExpression(LiteralScalarExpressionInfo literal)
+        private object? EvaluateLiteralExpression(LiteralScalarExpressionInfo literal)
         {
+            if (literal.Kind == ScalarLiteralKind.Other)
+            {
+                if (IsCurrentTimestampText(literal.Value) || IsCurrentTimestampText(literal.Text))
+                    return _generationLocalNow;
+
+                if (IsCurrentDateText(literal.Value) || IsCurrentDateText(literal.Text))
+                    return _generationLocalNow.Date;
+            }
+
             return literal.Kind switch
             {
                 ScalarLiteralKind.String => literal.Value,
@@ -3004,8 +3439,103 @@ namespace SqlTestDataGenerator.DataGeneration
                 "CONVERT" => EvaluateConversionFunction(args, tryMode: false),
                 "TRY_CAST" => EvaluateConversionFunction(args, tryMode: true),
                 "TRY_CONVERT" => EvaluateConversionFunction(args, tryMode: true),
+                "PARSE" => EvaluateConversionFunction(args, tryMode: false),
+                "TRY_PARSE" => EvaluateConversionFunction(args, tryMode: true),
+                "GETDATE" => _generationLocalNow,
+                "SYSDATETIME" => _generationLocalNow,
+                "CURRENT_TIMESTAMP" or "CURRENTTIMESTAMP" => _generationLocalNow,
+                "CURRENT_DATE" or "CURRENTDATE" => _generationLocalNow.Date,
+                "GETUTCDATE" => _generationUtcNow,
+                "SYSUTCDATETIME" => _generationUtcNow,
+                "DATEADD" => EvaluateDateAdd(function, args),
+                "DATEDIFF" => EvaluateDateDiff(function, args),
+                "DATEPART" => EvaluateDatePart(function, args),
+                "YEAR" => EvaluateDatePartValue("year", args.ElementAtOrDefault(0)),
+                "MONTH" => EvaluateDatePartValue("month", args.ElementAtOrDefault(0)),
+                "DAY" => EvaluateDatePartValue("day", args.ElementAtOrDefault(0)),
+                "EOMONTH" => EvaluateEomonth(args),
                 _ => null
             };
+        }
+
+        private object? EvaluateDateAdd(FunctionScalarExpressionInfo function, IReadOnlyList<object?> args)
+        {
+            var datePart = ExtractDatePartToken(function.Arguments.ElementAtOrDefault(0), args.ElementAtOrDefault(0));
+            if (!TryConvertInt(args.ElementAtOrDefault(1), out var amount))
+                return null;
+
+            var dateValue = args.ElementAtOrDefault(2);
+            if (dateValue is DateTimeOffset offset)
+            {
+                return AddSqlDatePart(offset, datePart, amount);
+            }
+
+            if (!TryConvertToDateTimeValue(dateValue, out var dateTime))
+                return null;
+
+            return AddSqlDatePart(dateTime, datePart, amount);
+        }
+
+        private object? EvaluateDateDiff(FunctionScalarExpressionInfo function, IReadOnlyList<object?> args)
+        {
+            var datePart = ExtractDatePartToken(function.Arguments.ElementAtOrDefault(0), args.ElementAtOrDefault(0));
+            if (!TryConvertToDateTimeValue(args.ElementAtOrDefault(1), out var start) ||
+                !TryConvertToDateTimeValue(args.ElementAtOrDefault(2), out var end))
+            {
+                return null;
+            }
+
+            return EvaluateDateDiffValue(datePart, start, end);
+        }
+
+        private object? EvaluateDatePart(FunctionScalarExpressionInfo function, IReadOnlyList<object?> args)
+        {
+            var datePart = ExtractDatePartToken(function.Arguments.ElementAtOrDefault(0), args.ElementAtOrDefault(0));
+            return EvaluateDatePartValue(datePart, args.ElementAtOrDefault(1));
+        }
+
+        private static object? EvaluateDatePartValue(string datePart, object? value)
+        {
+            var normalized = NormalizeDatePart(datePart);
+            if (normalized == "tzoffset" && value is DateTimeOffset offset)
+            {
+                return (int)offset.Offset.TotalMinutes;
+            }
+
+            if (!TryConvertToDateTimeValue(value, out var dateTime))
+                return null;
+
+            return normalized switch
+            {
+                "year" => dateTime.Year,
+                "quarter" => ((dateTime.Month - 1) / 3) + 1,
+                "month" => dateTime.Month,
+                "dayofyear" => dateTime.DayOfYear,
+                "day" => dateTime.Day,
+                "week" => System.Globalization.CultureInfo.InvariantCulture.Calendar.GetWeekOfYear(
+                    dateTime,
+                    System.Globalization.CalendarWeekRule.FirstDay,
+                    DayOfWeek.Sunday),
+                "weekday" => ((int)dateTime.DayOfWeek) + 1,
+                "hour" => dateTime.Hour,
+                "minute" => dateTime.Minute,
+                "second" => dateTime.Second,
+                "millisecond" => dateTime.Millisecond,
+                "microsecond" => (dateTime.Ticks % TimeSpan.TicksPerSecond) / 10,
+                "nanosecond" => (dateTime.Ticks % TimeSpan.TicksPerSecond) * 100,
+                _ => null
+            };
+        }
+
+        private static object? EvaluateEomonth(IReadOnlyList<object?> args)
+        {
+            if (!TryConvertToDateTimeValue(args.ElementAtOrDefault(0), out var startDate))
+                return null;
+
+            var monthToAdd = TryConvertInt(args.ElementAtOrDefault(1), out var parsedMonthToAdd)
+                ? parsedMonthToAdd
+                : 0;
+            return EndOfMonth(startDate.AddMonths(monthToAdd));
         }
 
         private static object? EvaluateNullIf(IReadOnlyList<object?> args)
@@ -3195,6 +3725,20 @@ namespace SqlTestDataGenerator.DataGeneration
             if (left is TimeSpan leftTime && right is TimeSpan rightTime)
                 return leftTime.CompareTo(rightTime);
 
+            if ((IsDateLikeValue(left) || IsDateLikeValue(right)) &&
+                TryConvertToDateTimeValue(left, out var leftDate) &&
+                TryConvertToDateTimeValue(right, out var rightDate))
+            {
+                return leftDate.CompareTo(rightDate);
+            }
+
+            if ((left is TimeSpan || right is TimeSpan) &&
+                TryConvertToTimeSpanValue(left, out var leftTimeValue) &&
+                TryConvertToTimeSpanValue(right, out var rightTimeValue))
+            {
+                return leftTimeValue.CompareTo(rightTimeValue);
+            }
+
             return string.Compare(left.ToString(), right.ToString(), StringComparison.OrdinalIgnoreCase);
         }
 
@@ -3232,6 +3776,268 @@ namespace SqlTestDataGenerator.DataGeneration
                         out result);
             }
         }
+
+        private static bool TryConvertToDateTimeValue(object? value, out DateTime result)
+        {
+            switch (value)
+            {
+                case DateTime dateTime:
+                    result = DateTime.SpecifyKind(dateTime, DateTimeKind.Unspecified);
+                    return true;
+                case DateTimeOffset offset:
+                    result = DateTime.SpecifyKind(offset.DateTime, DateTimeKind.Unspecified);
+                    return true;
+                case string text when !string.IsNullOrWhiteSpace(text):
+                    var trimmed = text.Trim();
+                    if (TryParseOdbcDateLiteral(trimmed, out result))
+                        return true;
+                    if (DateTimeOffset.TryParse(
+                            trimmed,
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            System.Globalization.DateTimeStyles.RoundtripKind,
+                            out var parsedOffset))
+                    {
+                        result = DateTime.SpecifyKind(parsedOffset.DateTime, DateTimeKind.Unspecified);
+                        return true;
+                    }
+                    if (DateTime.TryParse(
+                            trimmed,
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            System.Globalization.DateTimeStyles.None,
+                            out var parsedDateTime))
+                    {
+                        result = DateTime.SpecifyKind(parsedDateTime, DateTimeKind.Unspecified);
+                        return true;
+                    }
+                    break;
+            }
+
+            result = default;
+            return false;
+        }
+
+        private static bool TryConvertToTimeSpanValue(object? value, out TimeSpan result)
+        {
+            switch (value)
+            {
+                case TimeSpan time:
+                    result = time;
+                    return true;
+                case DateTime dateTime:
+                    result = dateTime.TimeOfDay;
+                    return true;
+                case DateTimeOffset offset:
+                    result = offset.TimeOfDay;
+                    return true;
+                case string text when TimeSpan.TryParse(
+                    text,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var parsed):
+                    result = parsed;
+                    return true;
+                default:
+                    result = default;
+                    return false;
+            }
+        }
+
+        private static bool IsDateLikeValue(object? value)
+        {
+            return value switch
+            {
+                DateTime or DateTimeOffset => true,
+                string text => LooksLikeDateTimeText(text),
+                _ => false
+            };
+        }
+
+        private static bool LooksLikeDateTimeText(string text)
+        {
+            var trimmed = text.Trim();
+            return trimmed.Contains('-', StringComparison.Ordinal) ||
+                   trimmed.Contains('/', StringComparison.Ordinal) ||
+                   trimmed.Contains(':', StringComparison.Ordinal) ||
+                   trimmed.StartsWith("{d", StringComparison.OrdinalIgnoreCase) ||
+                   trimmed.StartsWith("{ts", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool TryParseOdbcDateLiteral(string text, out DateTime value)
+        {
+            value = default;
+            var trimmed = text.Trim();
+            if (!trimmed.StartsWith("{", StringComparison.Ordinal) ||
+                !trimmed.EndsWith("}", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            var firstQuote = trimmed.IndexOf('\'');
+            var lastQuote = trimmed.LastIndexOf('\'');
+            if (firstQuote < 0 || lastQuote <= firstQuote)
+                return false;
+
+            var inner = trimmed.Substring(firstQuote + 1, lastQuote - firstQuote - 1);
+            if (!DateTime.TryParse(
+                    inner,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.None,
+                    out var parsed))
+            {
+                return false;
+            }
+
+            value = DateTime.SpecifyKind(parsed, DateTimeKind.Unspecified);
+            return true;
+        }
+
+        private static string ExtractDatePartToken(ScalarExpressionInfo? expression, object? evaluatedValue)
+        {
+            var raw = expression switch
+            {
+                ColumnScalarExpressionInfo column when !string.IsNullOrWhiteSpace(column.ColumnName) => column.ColumnName,
+                LiteralScalarExpressionInfo literal when !string.IsNullOrWhiteSpace(literal.Value) => literal.Value,
+                { Text.Length: > 0 } => expression.Text,
+                _ => Convert.ToString(evaluatedValue, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty
+            };
+
+            return NormalizeDatePart(raw);
+        }
+
+        private static string NormalizeDatePart(string value)
+        {
+            var token = value
+                .Trim()
+                .Trim('[', ']')
+                .Trim('\'', '"')
+                .Replace(" ", string.Empty, StringComparison.Ordinal)
+                .ToLowerInvariant();
+
+            return token switch
+            {
+                "yy" or "yyyy" or "year" => "year",
+                "qq" or "q" or "quarter" => "quarter",
+                "mm" or "m" or "month" => "month",
+                "dy" or "y" or "dayofyear" => "dayofyear",
+                "dd" or "d" or "day" => "day",
+                "wk" or "ww" or "week" => "week",
+                "dw" or "w" or "weekday" => "weekday",
+                "hh" or "hour" => "hour",
+                "mi" or "n" or "minute" => "minute",
+                "ss" or "s" or "second" => "second",
+                "ms" or "millisecond" => "millisecond",
+                "mcs" or "microsecond" => "microsecond",
+                "ns" or "nanosecond" => "nanosecond",
+                "tz" or "tzoffset" => "tzoffset",
+                _ => token
+            };
+        }
+
+        private static DateTime? AddSqlDatePart(DateTime value, string datePart, int amount)
+        {
+            try
+            {
+                return NormalizeDatePart(datePart) switch
+                {
+                    "year" => value.AddYears(amount),
+                    "quarter" => value.AddMonths(amount * 3),
+                    "month" => value.AddMonths(amount),
+                    "dayofyear" or "day" or "weekday" => value.AddDays(amount),
+                    "week" => value.AddDays(amount * 7),
+                    "hour" => value.AddHours(amount),
+                    "minute" => value.AddMinutes(amount),
+                    "second" => value.AddSeconds(amount),
+                    "millisecond" => value.AddMilliseconds(amount),
+                    "microsecond" => value.AddTicks(amount * 10L),
+                    "nanosecond" => value.AddTicks(amount / 100L),
+                    _ => null
+                };
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static DateTimeOffset? AddSqlDatePart(DateTimeOffset value, string datePart, int amount)
+        {
+            try
+            {
+                return NormalizeDatePart(datePart) switch
+                {
+                    "year" => value.AddYears(amount),
+                    "quarter" => value.AddMonths(amount * 3),
+                    "month" => value.AddMonths(amount),
+                    "dayofyear" or "day" or "weekday" => value.AddDays(amount),
+                    "week" => value.AddDays(amount * 7),
+                    "hour" => value.AddHours(amount),
+                    "minute" => value.AddMinutes(amount),
+                    "second" => value.AddSeconds(amount),
+                    "millisecond" => value.AddMilliseconds(amount),
+                    "microsecond" => value.AddTicks(amount * 10L),
+                    "nanosecond" => value.AddTicks(amount / 100L),
+                    _ => null
+                };
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static int EvaluateDateDiffValue(string datePart, DateTime start, DateTime end)
+        {
+            return NormalizeDatePart(datePart) switch
+            {
+                "year" => end.Year - start.Year,
+                "quarter" => ((end.Year * 4) + ((end.Month - 1) / 3)) -
+                             ((start.Year * 4) + ((start.Month - 1) / 3)),
+                "month" => ((end.Year - start.Year) * 12) + end.Month - start.Month,
+                "dayofyear" or "day" => (end.Date - start.Date).Days,
+                "week" => (StartOfSqlWeek(end) - StartOfSqlWeek(start)).Days / 7,
+                "hour" => (int)Math.Truncate((end - start).TotalHours),
+                "minute" => (int)Math.Truncate((end - start).TotalMinutes),
+                "second" => (int)Math.Truncate((end - start).TotalSeconds),
+                "millisecond" => (int)Math.Truncate((end - start).TotalMilliseconds),
+                "microsecond" => (int)Math.Truncate((end - start).Ticks / 10d),
+                "nanosecond" => (int)Math.Truncate((end - start).Ticks * 100d),
+                _ => 0
+            };
+        }
+
+        private static DateTime EndOfMonth(DateTime value)
+        {
+            var days = DateTime.DaysInMonth(value.Year, value.Month);
+            return new DateTime(value.Year, value.Month, days, 0, 0, 0, DateTimeKind.Unspecified);
+        }
+
+        private static DateTime StartOfSqlWeek(DateTime value) =>
+            value.Date.AddDays(-(int)value.DayOfWeek);
+
+        private static int Clamp(int value, int min, int max) =>
+            Math.Min(Math.Max(value, min), max);
+
+        private static bool IsCurrentTimestampExpression(ColumnScalarExpressionInfo expression) =>
+            string.IsNullOrWhiteSpace(expression.TableAlias) &&
+            IsCurrentTimestampText(expression.ColumnName);
+
+        private static bool IsCurrentDateExpression(ColumnScalarExpressionInfo expression) =>
+            string.IsNullOrWhiteSpace(expression.TableAlias) &&
+            IsCurrentDateText(expression.ColumnName);
+
+        private static bool IsCurrentTimestampText(string? text)
+        {
+            var normalized = NormalizeKeywordText(text);
+            return normalized is "CURRENT_TIMESTAMP" or "CURRENTTIMESTAMP";
+        }
+
+        private static bool IsCurrentDateText(string? text)
+        {
+            var normalized = NormalizeKeywordText(text);
+            return normalized is "CURRENT_DATE" or "CURRENTDATE";
+        }
+
+        private static string NormalizeKeywordText(string? text) =>
+            (text ?? string.Empty).Trim().Trim('[', ']').Replace(" ", string.Empty, StringComparison.Ordinal).ToUpperInvariant();
 
         private bool EvaluateCondition(
             object? candidate,

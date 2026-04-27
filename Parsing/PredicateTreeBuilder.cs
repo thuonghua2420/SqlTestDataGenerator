@@ -241,13 +241,16 @@ namespace SqlTestDataGenerator.Parsing
 
         private static bool IsColumnReference(ScalarExpression expr)
         {
-            return expr is ColumnReferenceExpression;
+            return expr is ColumnReferenceExpression colRef && !IsCurrentDateTimeKeyword(colRef);
         }
 
         private void ExtractColumnReference(ScalarExpression expr, ConditionInfo condition, bool isLeft)
         {
             if (expr is ColumnReferenceExpression colRef)
             {
+                if (IsCurrentDateTimeKeyword(colRef))
+                    return;
+
                 var parts = colRef.MultiPartIdentifier?.Identifiers;
                 if (parts != null)
                 {
@@ -288,7 +291,7 @@ namespace SqlTestDataGenerator.Parsing
                     condition.AggregateFunc = aggFunc;
                 }
 
-                foreach (var parameter in funcCall.Parameters)
+                foreach (var parameter in GetColumnBearingFunctionParameters(funcCall))
                 {
                     ExtractColumnReference(parameter, condition, isLeft);
                     if (HasResolvedConditionColumn(condition, isLeft))
@@ -346,6 +349,18 @@ namespace SqlTestDataGenerator.Parsing
                 return;
             }
 
+            if (expr is ParseCall parseCall)
+            {
+                ExtractColumnReference(parseCall.StringValue, condition, isLeft);
+                return;
+            }
+
+            if (expr is TryParseCall tryParseCall)
+            {
+                ExtractColumnReference(tryParseCall.StringValue, condition, isLeft);
+                return;
+            }
+
             if (expr is BinaryExpression binary)
             {
                 if (isLeft)
@@ -387,6 +402,16 @@ namespace SqlTestDataGenerator.Parsing
 
             return expr switch
             {
+                ParameterlessCall parameterless => new FunctionScalarExpressionInfo
+                {
+                    Name = parameterless.ParameterlessCallType.ToString(),
+                    Text = GetFragmentText(parameterless)
+                },
+                ColumnReferenceExpression colRef when IsCurrentDateTimeKeyword(colRef) => new FunctionScalarExpressionInfo
+                {
+                    Name = GetCurrentDateTimeKeyword(colRef),
+                    Text = GetFragmentText(colRef)
+                },
                 ColumnReferenceExpression colRef => BuildColumnExpression(colRef),
                 StringLiteral str => new LiteralScalarExpressionInfo
                 {
@@ -486,6 +511,24 @@ namespace SqlTestDataGenerator.Parsing
                     Arguments = BuildConvertArguments(tryConvert.DataType, tryConvert.Parameter, tryConvert.Style),
                     Text = GetFragmentText(tryConvert)
                 },
+                ParseCall parse => new FunctionScalarExpressionInfo
+                {
+                    Name = "PARSE",
+                    Arguments = BuildParseArguments(parse.DataType, parse.StringValue, parse.Culture),
+                    Text = GetFragmentText(parse)
+                },
+                TryParseCall tryParse => new FunctionScalarExpressionInfo
+                {
+                    Name = "TRY_PARSE",
+                    Arguments = BuildParseArguments(tryParse.DataType, tryParse.StringValue, tryParse.Culture),
+                    Text = GetFragmentText(tryParse)
+                },
+                OdbcLiteral odbc => new LiteralScalarExpressionInfo
+                {
+                    Value = GetFragmentText(odbc),
+                    Kind = ScalarLiteralKind.Other,
+                    Text = GetFragmentText(odbc)
+                },
                 BinaryExpression binary => new BinaryScalarExpressionInfo
                 {
                     Operator = ConvertBinaryOperator(binary.BinaryExpressionType),
@@ -536,12 +579,12 @@ namespace SqlTestDataGenerator.Parsing
         {
             switch (expr)
             {
-                case ColumnReferenceExpression colRef:
+                case ColumnReferenceExpression colRef when !IsCurrentDateTimeKeyword(colRef):
                     AddReferencedColumn(colRef, condition, isRightSide);
                     break;
 
                 case FunctionCall funcCall:
-                    foreach (var parameter in funcCall.Parameters)
+                    foreach (var parameter in GetColumnBearingFunctionParameters(funcCall))
                     {
                         CollectReferencedColumns(parameter, condition, isRightSide);
                     }
@@ -573,6 +616,22 @@ namespace SqlTestDataGenerator.Parsing
                     if (tryConvertCall.Style != null)
                     {
                         CollectReferencedColumns(tryConvertCall.Style, condition, isRightSide);
+                    }
+                    break;
+
+                case ParseCall parseCall:
+                    CollectReferencedColumns(parseCall.StringValue, condition, isRightSide);
+                    if (parseCall.Culture != null)
+                    {
+                        CollectReferencedColumns(parseCall.Culture, condition, isRightSide);
+                    }
+                    break;
+
+                case TryParseCall tryParseCall:
+                    CollectReferencedColumns(tryParseCall.StringValue, condition, isRightSide);
+                    if (tryParseCall.Culture != null)
+                    {
+                        CollectReferencedColumns(tryParseCall.Culture, condition, isRightSide);
                     }
                     break;
 
@@ -656,6 +715,9 @@ namespace SqlTestDataGenerator.Parsing
                 RealLiteral r => r.Value,
                 BinaryLiteral b => b.Value,
                 OdbcLiteral o => GetFragmentText(o),
+                ParameterlessCall p => GetFragmentText(p),
+                ParseCall p => GetFragmentText(p),
+                TryParseCall p => GetFragmentText(p),
                 VariableReference v => $"@{v.Name}",
                 FunctionCall f => GetFragmentText(f),
                 ColumnReferenceExpression c => GetFragmentText(c),
@@ -691,6 +753,67 @@ namespace SqlTestDataGenerator.Parsing
             }
 
             return args;
+        }
+
+        private List<ScalarExpressionInfo> BuildParseArguments(
+            DataTypeReference dataType,
+            ScalarExpression stringValue,
+            ScalarExpression? culture)
+        {
+            var args = new List<ScalarExpressionInfo>
+            {
+                new LiteralScalarExpressionInfo
+                {
+                    Value = GetFragmentText(dataType),
+                    Kind = ScalarLiteralKind.Other,
+                    Text = GetFragmentText(dataType)
+                }
+            };
+
+            var valueExpression = BuildScalarExpression(stringValue);
+            if (valueExpression != null)
+            {
+                args.Add(valueExpression);
+            }
+
+            var cultureExpression = BuildScalarExpression(culture);
+            if (cultureExpression != null)
+            {
+                args.Add(cultureExpression);
+            }
+
+            return args;
+        }
+
+        private static IEnumerable<ScalarExpression> GetColumnBearingFunctionParameters(FunctionCall function)
+        {
+            var startIndex = IsDatePartFunction(function.FunctionName?.Value) ? 1 : 0;
+            return function.Parameters.Skip(startIndex);
+        }
+
+        private static bool IsDatePartFunction(string? functionName)
+        {
+            return functionName?.ToUpperInvariant() is "DATEADD" or "DATEDIFF" or "DATEPART" or "DATENAME";
+        }
+
+        private static bool IsCurrentDateTimeKeyword(ColumnReferenceExpression colRef)
+        {
+            var parts = colRef.MultiPartIdentifier?.Identifiers;
+            return parts?.Count == 1 &&
+                   GetCurrentDateTimeKeyword(colRef).Length > 0;
+        }
+
+        private static string GetCurrentDateTimeKeyword(ColumnReferenceExpression colRef)
+        {
+            var parts = colRef.MultiPartIdentifier?.Identifiers;
+            var token = parts?.Count == 1 ? parts[0].Value : string.Empty;
+            var normalized = token.Replace(" ", string.Empty, StringComparison.Ordinal).ToUpperInvariant();
+            return normalized switch
+            {
+                "CURRENT_TIMESTAMP" or "CURRENTTIMESTAMP" => "CURRENT_TIMESTAMP",
+                "CURRENT_DATE" or "CURRENTDATE" => "CURRENT_DATE",
+                _ => string.Empty
+            };
         }
 
         private static string GetFragmentText(TSqlFragment? node)
