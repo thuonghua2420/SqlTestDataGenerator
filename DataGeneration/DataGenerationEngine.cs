@@ -2490,7 +2490,7 @@ namespace SqlTestDataGenerator.DataGeneration
                             out comparisonValue);
                     }
 
-                    targets.Add(new ColumnConditionTarget(condition, desiredTruth, comparisonValue));
+                    targets.Add(new ColumnConditionTarget(condition, desiredTruth, comparisonValue, localAliasMap));
                 }
 
                 CollectSubqueryConditionTargets(
@@ -2847,6 +2847,35 @@ namespace SqlTestDataGenerator.DataGeneration
                 AddCandidate($"{trimmedHint} {baseCandidate}");
                 AddCandidate($"{trimmedHint}-{baseCandidate}");
                 AddCandidate($"{trimmedHint}{baseCandidate}Z");
+            }
+
+            // Constraint-derived candidates: invert function expressions to generate targeted values.
+            // For f(col) OP value, the solver computes what col must look like — e.g.
+            //   LEFT(UPPER(TRIM(col)), 1) BETWEEN 'A' AND 'Z'  → FirstCharMin='A', FirstCharMax='Z'
+            //   CHARINDEX(',', col) > 0                        → RequiredContains=","
+            //   SUBSTRING(col, 2, 5) = 'BRAND'                → "ABRAND..." at position 2
+            foreach (var target in targets)
+            {
+                if (target.Condition.LeftExpression == null) continue;
+
+                var solverValue = target.Condition.Operator == ComparisonOp.Like
+                    ? target.Condition.LikePattern
+                    : target.Condition.Value;
+
+                var constraintHints = ExpressionConstraintSolver.Solve(
+                    target.Condition.LeftExpression,
+                    target.Condition.Operator,
+                    string.IsNullOrEmpty(solverValue) ? null : solverValue,
+                    string.IsNullOrEmpty(target.Condition.SecondValue) ? null : target.Condition.SecondValue,
+                    column,
+                    tableAlias,
+                    target.SubqueryAliasMap);
+
+                if (constraintHints?.HasAnyHint != true) continue;
+
+                var solvedCandidate = constraintHints.BuildCandidate(baseCandidate);
+                if (!string.IsNullOrEmpty(solvedCandidate))
+                    AddCandidate(solvedCandidate);
             }
 
             foreach (var candidate in DeduplicateCandidates(candidates).OfType<string>())
@@ -3277,6 +3306,8 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 if (!string.IsNullOrWhiteSpace(target.Condition.Value))
                     hints.Add(target.Condition.Value);
+                if (!string.IsNullOrWhiteSpace(target.Condition.SecondValue))
+                    hints.Add(target.Condition.SecondValue);
 
                 foreach (var dynamicValue in target.Condition.DynamicStringValues)
                 {
@@ -3457,7 +3488,7 @@ namespace SqlTestDataGenerator.DataGeneration
             GeneratedRow? currentRow)
         {
             if (RequiresExpressionEvaluation(target.Condition) &&
-                TryEvaluateExpressionConditionTarget(candidate, target.Condition, scenario, query, currentRow, col, tableAlias, out var expressionTruth))
+                TryEvaluateExpressionConditionTarget(candidate, target.Condition, scenario, query, currentRow, col, tableAlias, target.SubqueryAliasMap, out var expressionTruth))
                 return expressionTruth == target.DesiredTruth;
 
             var actualTruth = EvaluateCondition(candidate, target.Condition, target.ComparisonValue, col, generator);
@@ -3529,12 +3560,13 @@ namespace SqlTestDataGenerator.DataGeneration
             GeneratedRow? currentRow,
             ColumnSchema column,
             string tableAlias,
+            IReadOnlyDictionary<string, string>? aliasMap,
             out bool truth)
         {
             truth = false;
             if (condition.IsColumnComparison ||
                 condition.LeftExpression == null ||
-                !ConditionReferencesTargetColumn(condition, column, tableAlias))
+                !ConditionReferencesTargetColumn(condition, column, tableAlias, aliasMap))
             {
                 return false;
             }
@@ -3545,7 +3577,7 @@ namespace SqlTestDataGenerator.DataGeneration
             {
                 foreach (var dynamicValue in condition.DynamicStringValues)
                 {
-                    if (TryEvaluateExpressionConditionTarget(candidate, condition, scenario, query, currentRow, column, tableAlias, dynamicValue, out truth) &&
+                    if (TryEvaluateExpressionConditionTarget(candidate, condition, scenario, query, currentRow, column, tableAlias, aliasMap, dynamicValue, out truth) &&
                         truth)
                     {
                         return true;
@@ -3556,7 +3588,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 return true;
             }
 
-            return TryEvaluateExpressionConditionTarget(candidate, condition, scenario, query, currentRow, column, tableAlias, null, out truth);
+            return TryEvaluateExpressionConditionTarget(candidate, condition, scenario, query, currentRow, column, tableAlias, aliasMap, null, out truth);
         }
 
         private bool TryEvaluateExpressionConditionTarget(
@@ -3567,6 +3599,7 @@ namespace SqlTestDataGenerator.DataGeneration
             GeneratedRow? currentRow,
             ColumnSchema column,
             string tableAlias,
+            IReadOnlyDictionary<string, string>? aliasMap,
             string? dynamicValue,
             out bool truth)
         {
@@ -3659,13 +3692,27 @@ namespace SqlTestDataGenerator.DataGeneration
         private static bool ConditionReferencesTargetColumn(
             ConditionInfo condition,
             ColumnSchema column,
-            string tableAlias)
+            string tableAlias,
+            IReadOnlyDictionary<string, string>? aliasMap = null)
         {
             return condition.ReferencedColumns.Any(r =>
                 r.ColumnName.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase) &&
-                (string.IsNullOrWhiteSpace(r.TableAlias) ||
-                 r.TableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase) ||
-                 r.TableAlias.Equals(column.TableName, StringComparison.OrdinalIgnoreCase)));
+                ReferencedColumnTableMatches(r.TableAlias, column.TableName, tableAlias, aliasMap));
+        }
+
+        private static bool ReferencedColumnTableMatches(
+            string? refAlias,
+            string tableName,
+            string outerAlias,
+            IReadOnlyDictionary<string, string>? aliasMap)
+        {
+            if (string.IsNullOrWhiteSpace(refAlias)) return true;
+            if (refAlias.Equals(outerAlias, StringComparison.OrdinalIgnoreCase)) return true;
+            if (refAlias.Equals(tableName, StringComparison.OrdinalIgnoreCase))  return true;
+            // Resolve subquery alias (e.g. "b2") → physical table name via aliasMap
+            if (aliasMap != null && aliasMap.TryGetValue(refAlias, out var resolved))
+                return resolved.Equals(tableName, StringComparison.OrdinalIgnoreCase);
+            return false;
         }
 
         private object? EvaluateScalarExpression(
@@ -4906,16 +4953,25 @@ namespace SqlTestDataGenerator.DataGeneration
             public ColumnConditionTarget(
                 ConditionInfo condition,
                 bool desiredTruth,
-                object? comparisonValue = null)
+                object? comparisonValue = null,
+                IReadOnlyDictionary<string, string>? subqueryAliasMap = null)
             {
                 Condition = condition;
                 DesiredTruth = desiredTruth;
                 ComparisonValue = comparisonValue;
+                SubqueryAliasMap = subqueryAliasMap;
             }
 
             public ConditionInfo Condition { get; }
             public bool DesiredTruth { get; }
             public object? ComparisonValue { get; }
+
+            /// <summary>
+            /// Alias map from the subquery context where this condition originated.
+            /// Used to resolve subquery-local aliases (e.g. "b2") back to their
+            /// physical table names when evaluating function expressions.
+            /// </summary>
+            public IReadOnlyDictionary<string, string>? SubqueryAliasMap { get; }
         }
 
         private readonly struct ResolvedColumnValue
