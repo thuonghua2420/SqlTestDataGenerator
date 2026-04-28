@@ -128,31 +128,32 @@ namespace SqlTestDataGenerator.DataGeneration
             Dictionary<string, int> nextTableIds)
         {
             var selfReferencePlans = BuildSelfReferencePlans(query, schemas);
+            var forcedColumnValues = BuildScenarioForcedColumnValues(scenario, query, schemas);
 
             switch (scenario.Type)
             {
                 case ScenarioType.Positive:
-                    GeneratePositiveData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans);
+                    GeneratePositiveData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans, forcedColumnValues);
                     break;
 
                 case ScenarioType.WhereNegative:
-                    GenerateWhereNegativeData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans);
+                    GenerateWhereNegativeData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans, forcedColumnValues);
                     break;
 
                 case ScenarioType.HavingNegative:
-                    GenerateHavingNegativeData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans);
+                    GenerateHavingNegativeData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans, forcedColumnValues);
                     break;
 
                 case ScenarioType.JoinMiss:
-                    GenerateJoinMissData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans);
+                    GenerateJoinMissData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans, forcedColumnValues);
                     break;
 
                 case ScenarioType.SubqueryMiss:
-                    GenerateSubqueryMissData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans);
+                    GenerateSubqueryMissData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans, forcedColumnValues);
                     break;
 
                 case ScenarioType.Boundary:
-                    GenerateBoundaryData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans);
+                    GenerateBoundaryData(scenario, query, schemas, insertOrder, nextTableIds, selfReferencePlans, forcedColumnValues);
                     break;
             }
         }
@@ -301,7 +302,8 @@ namespace SqlTestDataGenerator.DataGeneration
         private void GeneratePositiveData(
             BranchScenario scenario, ParsedQuery query,
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, Dictionary<string, int> nextTableIds,
-            Dictionary<string, SelfReferencePlan> selfReferencePlans)
+            Dictionary<string, SelfReferencePlan> selfReferencePlans,
+            Dictionary<string, object?> forcedColumnValues)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
@@ -349,7 +351,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                         var value = GenerateColumnValue(scenario, col, alias, query, schemas,
                             tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
-                            rowId, satisfy: true, rowIdx, includeSubqueryConditions: true, currentRow: row);
+                            forcedColumnValues, rowId, satisfy: true, rowIdx, includeSubqueryConditions: true, currentRow: row);
                         row.SetValue(col.ColumnName, value);
                     }
 
@@ -357,8 +359,8 @@ namespace SqlTestDataGenerator.DataGeneration
                     scenario.AddRow(tableName, row);
                 }
 
-                RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
-                RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
+                RegisterGeneratedIds(tableRowIds, tableName, scenario, schema, currentId, rowCount);
+                RegisterReferenceableIds(referenceableTableIds, tableName, scenario, schema, currentId, rowCount, selfReferencePlans);
             }
 
         }
@@ -367,7 +369,8 @@ namespace SqlTestDataGenerator.DataGeneration
         private void GenerateWhereNegativeData(
             BranchScenario scenario, ParsedQuery query,
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, Dictionary<string, int> nextTableIds,
-            Dictionary<string, SelfReferencePlan> selfReferencePlans)
+            Dictionary<string, SelfReferencePlan> selfReferencePlans,
+            Dictionary<string, object?> forcedColumnValues)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
@@ -398,15 +401,15 @@ namespace SqlTestDataGenerator.DataGeneration
 
                         var value = GenerateColumnValue(scenario, col, alias, query, schemas,
                             tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
-                            rowId, satisfy: true, rowIdx, includeSubqueryConditions: true, currentRow: row);
+                            forcedColumnValues, rowId, satisfy: true, rowIdx, includeSubqueryConditions: true, currentRow: row);
                         row.SetValue(col.ColumnName, value);
                     }
 
                     scenario.AddRow(tableName, row);
                 }
 
-                RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
-                RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
+                RegisterGeneratedIds(tableRowIds, tableName, scenario, schema, currentId, rowCount);
+                RegisterReferenceableIds(referenceableTableIds, tableName, scenario, schema, currentId, rowCount, selfReferencePlans);
             }
 
         }
@@ -415,7 +418,8 @@ namespace SqlTestDataGenerator.DataGeneration
         private void GenerateHavingNegativeData(
             BranchScenario scenario, ParsedQuery query,
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, Dictionary<string, int> nextTableIds,
-            Dictionary<string, SelfReferencePlan> selfReferencePlans)
+            Dictionary<string, SelfReferencePlan> selfReferencePlans,
+            Dictionary<string, object?> forcedColumnValues)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
@@ -481,7 +485,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         {
                             value = GenerateColumnValue(scenario, col, alias, query, schemas,
                                 tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
-                                rowId, satisfy: true, rowIdx, includeSubqueryConditions: true, currentRow: row);
+                                forcedColumnValues, rowId, satisfy: true, rowIdx, includeSubqueryConditions: true, currentRow: row);
                         }
 
                         row.SetValue(col.ColumnName, value);
@@ -490,8 +494,8 @@ namespace SqlTestDataGenerator.DataGeneration
                     scenario.AddRow(tableName, row);
                 }
 
-                RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
-                RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
+                RegisterGeneratedIds(tableRowIds, tableName, scenario, schema, currentId, rowCount);
+                RegisterReferenceableIds(referenceableTableIds, tableName, scenario, schema, currentId, rowCount, selfReferencePlans);
             }
 
         }
@@ -500,7 +504,8 @@ namespace SqlTestDataGenerator.DataGeneration
         private void GenerateJoinMissData(
             BranchScenario scenario, ParsedQuery query,
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, Dictionary<string, int> nextTableIds,
-            Dictionary<string, SelfReferencePlan> selfReferencePlans)
+            Dictionary<string, SelfReferencePlan> selfReferencePlans,
+            Dictionary<string, object?> forcedColumnValues)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
@@ -556,7 +561,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         {
                             value = GenerateColumnValue(scenario, col, alias, query, schemas,
                                 tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
-                                rowId, satisfy: true, rowIdx, includeSubqueryConditions: true, currentRow: row);
+                                forcedColumnValues, rowId, satisfy: true, rowIdx, includeSubqueryConditions: true, currentRow: row);
                         }
 
                         row.SetValue(col.ColumnName, value);
@@ -565,8 +570,8 @@ namespace SqlTestDataGenerator.DataGeneration
                     scenario.AddRow(tableName, row);
                 }
 
-                RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
-                RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
+                RegisterGeneratedIds(tableRowIds, tableName, scenario, schema, currentId, rowCount);
+                RegisterReferenceableIds(referenceableTableIds, tableName, scenario, schema, currentId, rowCount, selfReferencePlans);
             }
         }
 
@@ -574,7 +579,8 @@ namespace SqlTestDataGenerator.DataGeneration
         private void GenerateSubqueryMissData(
             BranchScenario scenario, ParsedQuery query,
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, Dictionary<string, int> nextTableIds,
-            Dictionary<string, SelfReferencePlan> selfReferencePlans)
+            Dictionary<string, SelfReferencePlan> selfReferencePlans,
+            Dictionary<string, object?> forcedColumnValues)
         {
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
@@ -605,15 +611,15 @@ namespace SqlTestDataGenerator.DataGeneration
 
                         var value = GenerateColumnValue(scenario, col, alias, query, schemas,
                             tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
-                            rowId, satisfy: true, rowIdx, includeSubqueryConditions: true, currentRow: row);
+                            forcedColumnValues, rowId, satisfy: true, rowIdx, includeSubqueryConditions: true, currentRow: row);
                         row.SetValue(col.ColumnName, value);
                     }
 
                     scenario.AddRow(tableName, row);
                 }
 
-                RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
-                RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
+                RegisterGeneratedIds(tableRowIds, tableName, scenario, schema, currentId, rowCount);
+                RegisterReferenceableIds(referenceableTableIds, tableName, scenario, schema, currentId, rowCount, selfReferencePlans);
             }
 
         }
@@ -622,7 +628,8 @@ namespace SqlTestDataGenerator.DataGeneration
         private void GenerateBoundaryData(
             BranchScenario scenario, ParsedQuery query,
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, Dictionary<string, int> nextTableIds,
-            Dictionary<string, SelfReferencePlan> selfReferencePlans)
+            Dictionary<string, SelfReferencePlan> selfReferencePlans,
+            Dictionary<string, object?> forcedColumnValues)
         {
             // Similar to positive, but range conditions use exact boundary values
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
@@ -698,7 +705,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         {
                             value = GenerateColumnValue(scenario, col, alias, query, schemas,
                                 tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
-                                rowId, satisfy: true, rowIdx, includeSubqueryConditions: true, currentRow: row);
+                                forcedColumnValues, rowId, satisfy: true, rowIdx, includeSubqueryConditions: true, currentRow: row);
                         }
 
                         row.SetValue(col.ColumnName, value);
@@ -708,8 +715,8 @@ namespace SqlTestDataGenerator.DataGeneration
                     scenario.AddRow(tableName, row);
                 }
 
-                RegisterGeneratedIds(tableRowIds, tableName, currentId, rowCount);
-                RegisterReferenceableIds(referenceableTableIds, tableName, currentId, rowCount, selfReferencePlans);
+                RegisterGeneratedIds(tableRowIds, tableName, scenario, schema, currentId, rowCount);
+                RegisterReferenceableIds(referenceableTableIds, tableName, scenario, schema, currentId, rowCount, selfReferencePlans);
             }
 
         }
@@ -717,6 +724,228 @@ namespace SqlTestDataGenerator.DataGeneration
         // ═════════════════════════════════════════════════════════════════
         // Column value generation
         // ═════════════════════════════════════════════════════════════════
+
+        private Dictionary<string, object?> BuildScenarioForcedColumnValues(
+            BranchScenario scenario,
+            ParsedQuery query,
+            Dictionary<string, TableSchema> schemas)
+        {
+            var forcedValues = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            var emptyIdMap = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var schema in schemas.Values)
+            {
+                foreach (var column in schema.Columns.Where(c => ShouldPrebindRelationalColumn(schema, c)))
+                {
+                    foreach (var alias in ResolveAliasesForTable(query, schema.TableName))
+                    {
+                        var targets = GetApplicableConditionTargets(
+                                scenario,
+                                query,
+                                query.EnumerateScopeConditions(ConditionSource.Where),
+                                schema.TableName,
+                                alias,
+                                column.ColumnName,
+                                excludeHasSubquery: true)
+                            .Concat(GetApplicableConditionTargets(
+                                scenario,
+                                query,
+                                query.EnumerateScopeConditions(ConditionSource.JoinOn),
+                                schema.TableName,
+                                alias,
+                                column.ColumnName,
+                                excludeHasSubquery: false))
+                            .Concat(FindApplicableSubqueryConditionTargets(
+                                scenario,
+                                query,
+                                schema.TableName,
+                                alias,
+                                column.ColumnName))
+                            .Where(t => IsPrebindableRelationalCondition(t.Condition))
+                            .ToList();
+
+                        if (targets.Count == 0)
+                            continue;
+
+                        var generator = _valueFactory.GetGenerator(column.TypeCategory);
+                        var resolved = ResolveColumnValueFromTargets(
+                            scenario,
+                            query,
+                            column,
+                            generator,
+                            targets,
+                            emptyIdMap,
+                            alias,
+                            rowIndex: 0,
+                            currentRow: null);
+
+                        if (!resolved.Resolved)
+                            continue;
+
+                        AddForcedColumnValueAndReferencedKeys(
+                            forcedValues,
+                            schemas,
+                            schema,
+                            column,
+                            resolved.Value,
+                            new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+                        break;
+                    }
+                }
+            }
+
+            return forcedValues;
+        }
+
+        private static bool ShouldPrebindRelationalColumn(TableSchema schema, ColumnSchema column)
+        {
+            return column.IsIdentity ||
+                   column.IsPrimaryKey ||
+                   schema.PrimaryKey?.Columns.Any(c => c.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)) == true ||
+                   schema.ForeignKeys.Any(fk => fk.ColumnName.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static bool IsPrebindableRelationalCondition(ConditionInfo condition)
+        {
+            if (condition.HasSubquery ||
+                condition.IsColumnComparison ||
+                condition.Operator is ComparisonOp.Exists or ComparisonOp.NotExists or ComparisonOp.Any or ComparisonOp.All or ComparisonOp.IsNotNull)
+            {
+                return false;
+            }
+
+            return condition.Operator is
+                ComparisonOp.Equal or
+                ComparisonOp.NotEqual or
+                ComparisonOp.GreaterThan or
+                ComparisonOp.GreaterThanOrEqual or
+                ComparisonOp.LessThan or
+                ComparisonOp.LessThanOrEqual or
+                ComparisonOp.In or
+                ComparisonOp.NotIn or
+                ComparisonOp.Between or
+                ComparisonOp.Like or
+                ComparisonOp.IsNull;
+        }
+
+        private static IEnumerable<string> ResolveAliasesForTable(ParsedQuery query, string tableName)
+        {
+            var aliases = query.Tables
+                .Where(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase))
+                .Select(t => t.EffectiveName)
+                .Where(a => !string.IsNullOrWhiteSpace(a))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (aliases.Count == 0)
+                aliases.Add(tableName);
+
+            return aliases;
+        }
+
+        private void AddForcedColumnValueAndReferencedKeys(
+            Dictionary<string, object?> forcedValues,
+            Dictionary<string, TableSchema> schemas,
+            TableSchema schema,
+            ColumnSchema column,
+            object? value,
+            HashSet<string> visited)
+        {
+            var key = BuildForcedColumnKey(schema.TableName, column.ColumnName);
+            if (!visited.Add(key))
+                return;
+
+            var normalizedValue = NormalizeForcedColumnValue(column, value);
+            TryAddForcedColumnValue(forcedValues, schema.TableName, column.ColumnName, normalizedValue);
+
+            if (normalizedValue == null || normalizedValue == DBNull.Value)
+                return;
+
+            foreach (var fk in schema.ForeignKeys.Where(f =>
+                         f.ColumnName.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)))
+            {
+                if (!schemas.TryGetValue(fk.ReferencedTable, out var referencedSchema))
+                    continue;
+
+                var referencedColumn = referencedSchema.GetColumn(fk.ReferencedColumn);
+                if (referencedColumn == null)
+                    continue;
+
+                AddForcedColumnValueAndReferencedKeys(
+                    forcedValues,
+                    schemas,
+                    referencedSchema,
+                    referencedColumn,
+                    normalizedValue,
+                    visited);
+            }
+        }
+
+        private object? NormalizeForcedColumnValue(ColumnSchema column, object? value)
+        {
+            if (value == null || value == DBNull.Value)
+                return null;
+
+            var rawValue = value is string text ? UnquoteSqlLiteral(text) : value;
+            try
+            {
+                return SqlServerValueNormalizer.NormalizeValue(column, rawValue) ?? rawValue;
+            }
+            catch
+            {
+                var generator = _valueFactory.GetGenerator(column.TypeCategory);
+                var literal = Convert.ToString(rawValue, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+                var generated = generator.GenerateFromLiteral(literal, column);
+                return SqlServerValueNormalizer.NormalizeValue(column, generated) ?? generated;
+            }
+        }
+
+        private static string UnquoteSqlLiteral(string value)
+        {
+            var trimmed = value.Trim();
+            if (trimmed.StartsWith("N'", StringComparison.OrdinalIgnoreCase) && trimmed.EndsWith("'", StringComparison.Ordinal))
+            {
+                return trimmed[2..^1].Replace("''", "'", StringComparison.Ordinal);
+            }
+
+            if (trimmed.StartsWith("'", StringComparison.Ordinal) && trimmed.EndsWith("'", StringComparison.Ordinal))
+            {
+                return trimmed[1..^1].Replace("''", "'", StringComparison.Ordinal);
+            }
+
+            return trimmed;
+        }
+
+        private static bool TryAddForcedColumnValue(
+            Dictionary<string, object?> forcedValues,
+            string tableName,
+            string columnName,
+            object? value)
+        {
+            var key = BuildForcedColumnKey(tableName, columnName);
+            if (!forcedValues.TryGetValue(key, out var existing))
+            {
+                forcedValues[key] = value;
+                return true;
+            }
+
+            if ((existing == null || existing == DBNull.Value) && (value == null || value == DBNull.Value))
+                return true;
+
+            return ValuesEqual(existing, value);
+        }
+
+        private static bool TryGetForcedColumnValue(
+            Dictionary<string, object?> forcedValues,
+            string tableName,
+            string columnName,
+            out object? value)
+        {
+            return forcedValues.TryGetValue(BuildForcedColumnKey(tableName, columnName), out value);
+        }
+
+        private static string BuildForcedColumnKey(string tableName, string columnName) =>
+            $"{tableName}\u001F{columnName}";
 
         private object? GenerateColumnValue(
             BranchScenario scenario,
@@ -726,13 +955,21 @@ namespace SqlTestDataGenerator.DataGeneration
             Dictionary<string, List<int>> referenceableTableIds,
             Dictionary<string, List<int>> referencedTableIdPools,
             Dictionary<string, SelfReferencePlan> selfReferencePlans,
+            Dictionary<string, object?> forcedColumnValues,
             int rowId,
             bool satisfy, int rowIndex,
             bool includeSubqueryConditions,
             GeneratedRow? currentRow = null)
         {
             var generator = _valueFactory.GetGenerator(col.TypeCategory);
-            var currentTableName = col.TableName;
+            var currentTableName = string.IsNullOrWhiteSpace(col.TableName)
+                ? query.ResolveAlias(tableAlias)
+                : col.TableName;
+
+            if (TryGetForcedColumnValue(forcedColumnValues, currentTableName, col.ColumnName, out var forcedValue))
+            {
+                return forcedValue;
+            }
 
             // Always generate explicit values for IDENTITY columns so scripts can include full rows.
             if (col.IsIdentity)
@@ -2333,6 +2570,15 @@ namespace SqlTestDataGenerator.DataGeneration
 
             var candidates = new List<object?>();
 
+            AddRangeIntersectionCandidates(
+                scenario,
+                query,
+                currentRow,
+                col,
+                tableAlias,
+                targets,
+                candidates);
+
             foreach (var target in targets)
             {
                 var comparisonValue = target.ComparisonValue;
@@ -2384,6 +2630,154 @@ namespace SqlTestDataGenerator.DataGeneration
 
             return new ResolvedColumnValue(false, null);
         }
+
+        private void AddRangeIntersectionCandidates(
+            BranchScenario scenario,
+            ParsedQuery query,
+            GeneratedRow? currentRow,
+            ColumnSchema column,
+            string tableAlias,
+            IReadOnlyCollection<ColumnConditionTarget> targets,
+            List<object?> candidates)
+        {
+            if (column.TypeCategory is not (DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float) ||
+                targets.Count < 2)
+            {
+                return;
+            }
+
+            decimal? lower = null;
+            decimal? upper = null;
+            var step = GetNumericRangeStep(column);
+
+            foreach (var target in targets.Where(t => t.DesiredTruth))
+            {
+                var condition = target.Condition;
+                if (condition.Operator == ComparisonOp.Between)
+                {
+                    if (TryResolveConditionNumericBoundary(condition, scenario, query, currentRow, column, tableAlias, useSecondValue: false, out var betweenLower))
+                    {
+                        lower = MaxNullable(lower, betweenLower);
+                    }
+
+                    if (TryResolveConditionNumericBoundary(condition, scenario, query, currentRow, column, tableAlias, useSecondValue: true, out var betweenUpper))
+                    {
+                        upper = MinNullable(upper, betweenUpper);
+                    }
+
+                    continue;
+                }
+
+                if (!TryResolveConditionNumericBoundary(condition, scenario, query, currentRow, column, tableAlias, useSecondValue: false, out var boundary))
+                    continue;
+
+                switch (condition.Operator)
+                {
+                    case ComparisonOp.Equal:
+                        lower = MaxNullable(lower, boundary);
+                        upper = MinNullable(upper, boundary);
+                        break;
+                    case ComparisonOp.GreaterThan:
+                        lower = MaxNullable(lower, boundary + step);
+                        break;
+                    case ComparisonOp.GreaterThanOrEqual:
+                        lower = MaxNullable(lower, boundary);
+                        break;
+                    case ComparisonOp.LessThan:
+                        upper = MinNullable(upper, boundary - step);
+                        break;
+                    case ComparisonOp.LessThanOrEqual:
+                        upper = MinNullable(upper, boundary);
+                        break;
+                    case ComparisonOp.In:
+                        foreach (var value in condition.InValues)
+                        {
+                            if (TryConvertDecimal(value, out var inValue))
+                            {
+                                candidates.Add(NormalizeNumericCandidate(column, inValue));
+                            }
+                        }
+                        break;
+                }
+            }
+
+            if (lower.HasValue)
+                candidates.Add(NormalizeNumericCandidate(column, lower.Value));
+
+            if (upper.HasValue)
+                candidates.Add(NormalizeNumericCandidate(column, upper.Value));
+
+            if (lower.HasValue && upper.HasValue && lower.Value <= upper.Value)
+            {
+                candidates.Add(NormalizeNumericCandidate(column, (lower.Value + upper.Value) / 2m));
+            }
+        }
+
+        private bool TryResolveConditionNumericBoundary(
+            ConditionInfo condition,
+            BranchScenario scenario,
+            ParsedQuery query,
+            GeneratedRow? currentRow,
+            ColumnSchema column,
+            string tableAlias,
+            bool useSecondValue,
+            out decimal value)
+        {
+            object? raw = null;
+
+            if (useSecondValue)
+            {
+                raw = condition.SecondValue;
+            }
+            else if (condition.RightExpression != null)
+            {
+                raw = EvaluateScalarExpression(condition.RightExpression, null, scenario, query, currentRow, column, tableAlias, null);
+            }
+            else if (!string.IsNullOrWhiteSpace(condition.Value))
+            {
+                raw = condition.Value;
+            }
+
+            if (TryConvertDecimal(raw, out value))
+                return true;
+
+            value = 0m;
+            return false;
+        }
+
+        private static decimal GetNumericRangeStep(ColumnSchema column)
+        {
+            if (column.TypeCategory == DataTypeCategory.Integer)
+                return 1m;
+
+            var scale = column.NumericScale ?? 0;
+            if (scale <= 0)
+                return 1m;
+
+            decimal step = 1m;
+            for (var i = 0; i < scale; i++)
+            {
+                step /= 10m;
+            }
+
+            return step;
+        }
+
+        private static object? NormalizeNumericCandidate(ColumnSchema column, decimal value)
+        {
+            if (column.TypeCategory == DataTypeCategory.Integer)
+            {
+                value = decimal.Truncate(value);
+            }
+
+            return SqlServerValueNormalizer.NormalizeValue(column, value) ?? value;
+        }
+
+        private static decimal MaxNullable(decimal? current, decimal candidate) =>
+            current.HasValue ? Math.Max(current.Value, candidate) : candidate;
+
+        private static decimal MinNullable(decimal? current, decimal candidate) =>
+            current.HasValue ? Math.Min(current.Value, candidate) : candidate;
 
         private bool TryResolveFunctionAwareStringValue(
             BranchScenario scenario,
@@ -3549,7 +3943,8 @@ namespace SqlTestDataGenerator.DataGeneration
         {
             var typeName = args.ElementAtOrDefault(0)?.ToString() ?? string.Empty;
             var value = args.ElementAtOrDefault(1);
-            return ConvertUsingSqlType(value, typeName, tryMode);
+            var style = args.ElementAtOrDefault(2);
+            return ConvertUsingSqlType(value, typeName, tryMode, style);
         }
 
         private static object? EvaluateLeft(IReadOnlyList<object?> args)
@@ -3602,7 +3997,7 @@ namespace SqlTestDataGenerator.DataGeneration
             return source.Replace(oldValue, newValue, StringComparison.Ordinal);
         }
 
-        private static object? ConvertUsingSqlType(object? value, string sqlType, bool tryMode)
+        private static object? ConvertUsingSqlType(object? value, string sqlType, bool tryMode, object? style = null)
         {
             if (value == null)
                 return null;
@@ -3636,7 +4031,7 @@ namespace SqlTestDataGenerator.DataGeneration
                             Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty,
                             System.Globalization.CultureInfo.InvariantCulture),
                     "CHAR" or "NCHAR" or "VARCHAR" or "NVARCHAR" or "TEXT" or "NTEXT" =>
-                        Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture),
+                        ConvertToSqlString(value, style),
                     _ => Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture)
                 };
             }
@@ -3659,6 +4054,68 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             return trimmed.Trim().ToUpperInvariant();
+        }
+
+        private static string ConvertToSqlString(object value, object? style)
+        {
+            if (value is DateTimeOffset offset)
+            {
+                var styleNumber = TryConvertInt(style, out var parsedStyle) ? parsedStyle : (int?)null;
+                return FormatSqlDateTimeString(offset.DateTime, styleNumber, offset);
+            }
+
+            if (value is DateTime dateTime)
+            {
+                var styleNumber = TryConvertInt(style, out var parsedStyle) ? parsedStyle : (int?)null;
+                return FormatSqlDateTimeString(dateTime, styleNumber, null);
+            }
+
+            if (value is TimeSpan timeSpan)
+            {
+                return timeSpan.ToString(@"hh\:mm\:ss", System.Globalization.CultureInfo.InvariantCulture);
+            }
+
+            return Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+        }
+
+        private static string FormatSqlDateTimeString(DateTime value, int? style, DateTimeOffset? offset)
+        {
+            var dateTime = DateTime.SpecifyKind(value, DateTimeKind.Unspecified);
+            return style switch
+            {
+                23 => dateTime.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+                101 => dateTime.ToString("MM/dd/yyyy", System.Globalization.CultureInfo.InvariantCulture),
+                102 => dateTime.ToString("yyyy.MM.dd", System.Globalization.CultureInfo.InvariantCulture),
+                103 => dateTime.ToString("dd/MM/yyyy", System.Globalization.CultureInfo.InvariantCulture),
+                104 => dateTime.ToString("dd.MM.yyyy", System.Globalization.CultureInfo.InvariantCulture),
+                105 => dateTime.ToString("dd-MM-yyyy", System.Globalization.CultureInfo.InvariantCulture),
+                110 => dateTime.ToString("MM-dd-yyyy", System.Globalization.CultureInfo.InvariantCulture),
+                111 => dateTime.ToString("yyyy/MM/dd", System.Globalization.CultureInfo.InvariantCulture),
+                112 => dateTime.ToString("yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture),
+                120 => dateTime.ToString("yyyy-MM-dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture),
+                121 => dateTime.ToString("yyyy-MM-dd HH:mm:ss.fff", System.Globalization.CultureInfo.InvariantCulture),
+                126 => TrimFractionalSeconds(dateTime.ToString("yyyy-MM-ddTHH:mm:ss.fffffff", System.Globalization.CultureInfo.InvariantCulture)),
+                127 when offset.HasValue => TrimFractionalSeconds(offset.Value.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss.fffffff", System.Globalization.CultureInfo.InvariantCulture)) + "Z",
+                127 => TrimFractionalSeconds(dateTime.ToString("yyyy-MM-ddTHH:mm:ss.fffffff", System.Globalization.CultureInfo.InvariantCulture)),
+                _ => TrimFractionalSeconds(dateTime.ToString("yyyy-MM-dd HH:mm:ss.fffffff", System.Globalization.CultureInfo.InvariantCulture))
+            };
+        }
+
+        private static string TrimFractionalSeconds(string value)
+        {
+            var dotIndex = value.LastIndexOf('.');
+            if (dotIndex < 0)
+                return value;
+
+            var end = value.Length - 1;
+            while (end > dotIndex && value[end] == '0')
+            {
+                end--;
+            }
+
+            return end == dotIndex
+                ? value[..dotIndex]
+                : value[..(end + 1)];
         }
 
         private static object? ResolveNonTargetPlaceholder(ColumnScalarExpressionInfo expression)
@@ -4625,7 +5082,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 }
 
                 scenario.AddRow(tableName, row);
-                RegisterGeneratedIds(tableRowIds, tableName, rowId, 1);
+                RegisterGeneratedIds(tableRowIds, tableName, scenario, schema, rowId, 1);
             }
 
             // Handle nested subqueries recursively
@@ -5793,24 +6250,24 @@ namespace SqlTestDataGenerator.DataGeneration
         private static void RegisterGeneratedIds(
             Dictionary<string, List<int>> tableRowIds,
             string tableName,
+            BranchScenario scenario,
+            TableSchema schema,
             int startId,
             int rowCount)
         {
-            tableRowIds[tableName] = Enumerable
-                .Range(startId, Math.Max(0, rowCount))
-                .ToList();
+            tableRowIds[tableName] = ResolveGeneratedNumericKeyValues(scenario, schema, tableName, startId, rowCount);
         }
 
         private static void RegisterReferenceableIds(
             Dictionary<string, List<int>> tableRowIds,
             string tableName,
+            BranchScenario scenario,
+            TableSchema schema,
             int startId,
             int rowCount,
             Dictionary<string, SelfReferencePlan> selfReferencePlans)
         {
-            var generatedIds = Enumerable
-                .Range(startId, Math.Max(0, rowCount))
-                .ToList();
+            var generatedIds = ResolveGeneratedNumericKeyValues(scenario, schema, tableName, startId, rowCount);
 
             if (!selfReferencePlans.TryGetValue(tableName, out var plan) ||
                 plan.ChainLength <= 1)
@@ -5833,6 +6290,42 @@ namespace SqlTestDataGenerator.DataGeneration
             tableRowIds[tableName] = referenceableIds.Count > 0
                 ? referenceableIds
                 : generatedIds;
+        }
+
+        private static List<int> ResolveGeneratedNumericKeyValues(
+            BranchScenario scenario,
+            TableSchema schema,
+            string tableName,
+            int fallbackStartId,
+            int rowCount)
+        {
+            if (rowCount <= 0)
+                return new List<int>();
+
+            if (schema.PrimaryKey?.Columns.Count == 1 &&
+                scenario.TableRows.TryGetValue(tableName, out var rows) &&
+                rows.Count > 0)
+            {
+                var keyColumn = schema.PrimaryKey.Columns[0];
+                var currentRows = rows
+                    .Skip(Math.Max(0, rows.Count - rowCount))
+                    .Take(rowCount)
+                    .ToList();
+                var ids = currentRows
+                    .Select(r => r.GetValue(keyColumn))
+                    .Where(v => v != null && v != DBNull.Value)
+                    .Select(v => Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture))
+                    .Where(v => int.TryParse(v, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out _))
+                    .Select(v => int.Parse(v!, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture))
+                    .ToList();
+
+                if (ids.Count == rowCount)
+                    return ids;
+            }
+
+            return Enumerable
+                .Range(fallbackStartId, Math.Max(0, rowCount))
+                .ToList();
         }
 
         private static bool TryResolveRelatedRowId(
