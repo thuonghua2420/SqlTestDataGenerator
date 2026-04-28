@@ -11,7 +11,7 @@ namespace SqlTestDataGenerator.Database
     /// - .csv extension
     /// - comma delimiter
     /// - header row at top
-    /// - header labels as-is
+    /// - header labels as-is and always quoted
     /// - quote escaping with double quotes
     /// - always quote string-like values
     /// - nulls as empty fields
@@ -96,7 +96,7 @@ namespace SqlTestDataGenerator.Database
                 .Select(name => schema?.GetColumn(name))
                 .ToArray();
 
-            await writer.WriteLineAsync(BuildCsvLine(columnNames.Select((name, index) => EscapeCsv(name, shouldQuoteAlways: false)).ToArray()));
+            await writer.WriteLineAsync(BuildCsvLine(columnNames.Select(name => EscapeCsv(name, shouldQuoteAlways: true)).ToArray()));
 
             int rowCount = 0;
             while (await reader.ReadAsync(cancellationToken))
