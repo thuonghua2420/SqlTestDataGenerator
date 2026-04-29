@@ -36,6 +36,20 @@ namespace SqlTestDataGenerator.Parsing.Models
         public ScalarExpressionInfo? Operand { get; set; }
     }
 
+    public sealed class CaseScalarExpressionInfo : ScalarExpressionInfo
+    {
+        public ScalarExpressionInfo? InputExpression { get; set; }
+        public List<CaseWhenClauseInfo> WhenClauses { get; set; } = new();
+        public ScalarExpressionInfo? ElseExpression { get; set; }
+    }
+
+    public sealed class CaseWhenClauseInfo
+    {
+        public PredicateExpression? Predicate { get; set; }
+        public ScalarExpressionInfo? WhenExpression { get; set; }
+        public ScalarExpressionInfo? ThenExpression { get; set; }
+    }
+
     public enum ScalarLiteralKind
     {
         String,

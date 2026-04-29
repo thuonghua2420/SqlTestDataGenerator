@@ -92,6 +92,75 @@ namespace SqlTestDataGenerator.Parsing
             return CreateLeafExpression(condition, GetFragmentText(node), scope);
         }
 
+        private PredicateExpression BuildDetachedPredicateExpression(BooleanExpression expression)
+        {
+            return expression switch
+            {
+                BooleanBinaryExpression binary => new PredicateBinaryExpression
+                {
+                    Operator = binary.BinaryExpressionType == BooleanBinaryExpressionType.And
+                        ? LogicalOp.And
+                        : LogicalOp.Or,
+                    Left = BuildDetachedPredicateExpression(binary.FirstExpression),
+                    Right = BuildDetachedPredicateExpression(binary.SecondExpression),
+                    Text = GetFragmentText(binary)
+                },
+                BooleanParenthesisExpression paren => BuildDetachedPredicateExpression(paren.Expression),
+                BooleanNotExpression notExpr => BuildDetachedNotExpression(notExpr),
+                _ => CreateDetachedLeafExpression(expression)
+            };
+        }
+
+        private PredicateExpression BuildDetachedNotExpression(BooleanNotExpression notExpr)
+        {
+            if (notExpr.Expression is ExistsPredicate existsPred)
+            {
+                return CreateDetachedLeafExpression(
+                    BuildExistsCondition(existsPred, new PredicateScope(), ComparisonOp.NotExists, GetFragmentText(existsPred.Subquery)),
+                    GetFragmentText(notExpr));
+            }
+
+            if (notExpr.Expression is InPredicate inPred && inPred.Subquery != null)
+            {
+                return CreateDetachedLeafExpression(
+                    BuildInCondition(inPred, new PredicateScope(), forceOperator: ComparisonOp.NotIn, subquerySql: GetFragmentText(inPred.Subquery)),
+                    GetFragmentText(notExpr));
+            }
+
+            return new PredicateNotExpression
+            {
+                Inner = BuildDetachedPredicateExpression(notExpr.Expression),
+                Text = GetFragmentText(notExpr)
+            };
+        }
+
+        private PredicateLeafExpression CreateDetachedLeafExpression(BooleanExpression node)
+        {
+            var condition = node switch
+            {
+                BooleanComparisonExpression comparison => BuildComparisonCondition(comparison, new PredicateScope()),
+                InPredicate inPredicate => BuildInCondition(inPredicate, new PredicateScope(), forceOperator: null, subquerySql: inPredicate.Subquery != null ? GetFragmentText(inPredicate.Subquery) : string.Empty),
+                BooleanTernaryExpression ternary when ternary.TernaryExpressionType is BooleanTernaryExpressionType.Between or BooleanTernaryExpressionType.NotBetween
+                    => BuildBetweenCondition(ternary, new PredicateScope()),
+                LikePredicate like => BuildLikeCondition(like, new PredicateScope()),
+                BooleanIsNullExpression isNull => BuildNullCondition(isNull, new PredicateScope()),
+                ExistsPredicate exists => BuildExistsCondition(exists, new PredicateScope(), ComparisonOp.Exists, GetFragmentText(exists.Subquery)),
+                _ => BuildFallbackCondition(node, new PredicateScope())
+            };
+
+            return CreateDetachedLeafExpression(condition, GetFragmentText(node));
+        }
+
+        private static PredicateLeafExpression CreateDetachedLeafExpression(ConditionInfo condition, string text)
+        {
+            condition.ExpressionText = string.IsNullOrWhiteSpace(text) ? condition.ExpressionText : text;
+            return new PredicateLeafExpression
+            {
+                Condition = condition,
+                Text = condition.ExpressionText
+            };
+        }
+
         private PredicateLeafExpression CreateLeafExpression(ConditionInfo condition, string text, PredicateScope scope)
         {
             condition.ScopeId = scope.ScopeId;
@@ -361,6 +430,50 @@ namespace SqlTestDataGenerator.Parsing
                 return;
             }
 
+            if (expr is SearchedCaseExpression searchedCase)
+            {
+                foreach (var whenClause in searchedCase.WhenClauses)
+                {
+                    ExtractColumnReference(whenClause.WhenExpression, condition, isLeft);
+                    if (HasResolvedConditionColumn(condition, isLeft))
+                        return;
+
+                    ExtractColumnReference(whenClause.ThenExpression, condition, isLeft);
+                    if (HasResolvedConditionColumn(condition, isLeft))
+                        return;
+                }
+
+                if (searchedCase.ElseExpression != null)
+                {
+                    ExtractColumnReference(searchedCase.ElseExpression, condition, isLeft);
+                }
+                return;
+            }
+
+            if (expr is SimpleCaseExpression simpleCase)
+            {
+                ExtractColumnReference(simpleCase.InputExpression, condition, isLeft);
+                if (HasResolvedConditionColumn(condition, isLeft))
+                    return;
+
+                foreach (var whenClause in simpleCase.WhenClauses)
+                {
+                    ExtractColumnReference(whenClause.WhenExpression, condition, isLeft);
+                    if (HasResolvedConditionColumn(condition, isLeft))
+                        return;
+
+                    ExtractColumnReference(whenClause.ThenExpression, condition, isLeft);
+                    if (HasResolvedConditionColumn(condition, isLeft))
+                        return;
+                }
+
+                if (simpleCase.ElseExpression != null)
+                {
+                    ExtractColumnReference(simpleCase.ElseExpression, condition, isLeft);
+                }
+                return;
+            }
+
             if (expr is BinaryExpression binary)
             {
                 if (isLeft)
@@ -385,6 +498,73 @@ namespace SqlTestDataGenerator.Parsing
             if (expr is UnaryExpression unary)
             {
                 ExtractColumnReference(unary.Expression, condition, isLeft);
+                return;
+            }
+
+            if (TryGetFirstColumnReference(expr, out var fallbackColumn))
+            {
+                AssignConditionColumnReference(fallbackColumn, condition, isLeft);
+            }
+        }
+
+        private void ExtractColumnReference(BooleanExpression expr, ConditionInfo condition, bool isLeft)
+        {
+            switch (expr)
+            {
+                case BooleanComparisonExpression comparison:
+                    ExtractColumnReference(comparison.FirstExpression, condition, isLeft);
+                    if (HasResolvedConditionColumn(condition, isLeft))
+                        return;
+                    ExtractColumnReference(comparison.SecondExpression, condition, isLeft);
+                    return;
+
+                case InPredicate inPredicate:
+                    ExtractColumnReference(inPredicate.Expression, condition, isLeft);
+                    if (HasResolvedConditionColumn(condition, isLeft))
+                        return;
+                    foreach (var value in inPredicate.Values)
+                    {
+                        ExtractColumnReference(value, condition, isLeft);
+                        if (HasResolvedConditionColumn(condition, isLeft))
+                            return;
+                    }
+                    return;
+
+                case BooleanTernaryExpression ternary:
+                    ExtractColumnReference(ternary.FirstExpression, condition, isLeft);
+                    if (HasResolvedConditionColumn(condition, isLeft))
+                        return;
+                    ExtractColumnReference(ternary.SecondExpression, condition, isLeft);
+                    if (HasResolvedConditionColumn(condition, isLeft))
+                        return;
+                    ExtractColumnReference(ternary.ThirdExpression, condition, isLeft);
+                    return;
+
+                case LikePredicate like:
+                    ExtractColumnReference(like.FirstExpression, condition, isLeft);
+                    if (HasResolvedConditionColumn(condition, isLeft))
+                        return;
+                    ExtractColumnReference(like.SecondExpression, condition, isLeft);
+                    return;
+
+                case BooleanIsNullExpression isNull:
+                    ExtractColumnReference(isNull.Expression, condition, isLeft);
+                    return;
+
+                case BooleanBinaryExpression binary:
+                    ExtractColumnReference(binary.FirstExpression, condition, isLeft);
+                    if (HasResolvedConditionColumn(condition, isLeft))
+                        return;
+                    ExtractColumnReference(binary.SecondExpression, condition, isLeft);
+                    return;
+
+                case BooleanParenthesisExpression paren:
+                    ExtractColumnReference(paren.Expression, condition, isLeft);
+                    return;
+
+                case BooleanNotExpression not:
+                    ExtractColumnReference(not.Expression, condition, isLeft);
+                    return;
             }
         }
 
@@ -399,6 +579,9 @@ namespace SqlTestDataGenerator.Parsing
         {
             if (expr == null)
                 return null;
+
+            if (TryBuildKnownTextualFunctionExpression(expr, out var textualFunction))
+                return textualFunction;
 
             return expr switch
             {
@@ -523,6 +706,31 @@ namespace SqlTestDataGenerator.Parsing
                     Arguments = BuildParseArguments(tryParse.DataType, tryParse.StringValue, tryParse.Culture),
                     Text = GetFragmentText(tryParse)
                 },
+                SearchedCaseExpression searchedCase => new CaseScalarExpressionInfo
+                {
+                    WhenClauses = searchedCase.WhenClauses
+                        .Select(w => new CaseWhenClauseInfo
+                        {
+                            Predicate = BuildDetachedPredicateExpression(w.WhenExpression),
+                            ThenExpression = BuildScalarExpression(w.ThenExpression)
+                        })
+                        .ToList(),
+                    ElseExpression = searchedCase.ElseExpression == null ? null : BuildScalarExpression(searchedCase.ElseExpression),
+                    Text = GetFragmentText(searchedCase)
+                },
+                SimpleCaseExpression simpleCase => new CaseScalarExpressionInfo
+                {
+                    InputExpression = BuildScalarExpression(simpleCase.InputExpression),
+                    WhenClauses = simpleCase.WhenClauses
+                        .Select(w => new CaseWhenClauseInfo
+                        {
+                            WhenExpression = BuildScalarExpression(w.WhenExpression),
+                            ThenExpression = BuildScalarExpression(w.ThenExpression)
+                        })
+                        .ToList(),
+                    ElseExpression = simpleCase.ElseExpression == null ? null : BuildScalarExpression(simpleCase.ElseExpression),
+                    Text = GetFragmentText(simpleCase)
+                },
                 OdbcLiteral odbc => new LiteralScalarExpressionInfo
                 {
                     Value = GetFragmentText(odbc),
@@ -543,6 +751,34 @@ namespace SqlTestDataGenerator.Parsing
                     Text = GetFragmentText(expr)
                 }
             };
+        }
+
+        private bool TryBuildKnownTextualFunctionExpression(
+            ScalarExpression expr,
+            out ScalarExpressionInfo expression)
+        {
+            expression = null!;
+            if (expr is FunctionCall)
+                return false;
+
+            var text = GetFragmentText(expr);
+            var match = System.Text.RegularExpressions.Regex.Match(
+                text,
+                @"^\s*(?<name>TRIM|LTRIM|RTRIM)\s*\(",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (!match.Success)
+                return false;
+
+            if (!TryGetFirstColumnReference(expr, out var columnRef))
+                return false;
+
+            expression = new FunctionScalarExpressionInfo
+            {
+                Name = match.Groups["name"].Value.ToUpperInvariant(),
+                Arguments = new List<ScalarExpressionInfo> { BuildColumnExpression(columnRef) },
+                Text = text
+            };
+            return true;
         }
 
         private static ColumnScalarExpressionInfo BuildColumnExpression(ColumnReferenceExpression colRef)
@@ -635,6 +871,31 @@ namespace SqlTestDataGenerator.Parsing
                     }
                     break;
 
+                case SearchedCaseExpression searchedCase:
+                    foreach (var whenClause in searchedCase.WhenClauses)
+                    {
+                        CollectReferencedColumns(whenClause.WhenExpression, condition, isRightSide);
+                        CollectReferencedColumns(whenClause.ThenExpression, condition, isRightSide);
+                    }
+                    if (searchedCase.ElseExpression != null)
+                    {
+                        CollectReferencedColumns(searchedCase.ElseExpression, condition, isRightSide);
+                    }
+                    break;
+
+                case SimpleCaseExpression simpleCase:
+                    CollectReferencedColumns(simpleCase.InputExpression, condition, isRightSide);
+                    foreach (var whenClause in simpleCase.WhenClauses)
+                    {
+                        CollectReferencedColumns(whenClause.WhenExpression, condition, isRightSide);
+                        CollectReferencedColumns(whenClause.ThenExpression, condition, isRightSide);
+                    }
+                    if (simpleCase.ElseExpression != null)
+                    {
+                        CollectReferencedColumns(simpleCase.ElseExpression, condition, isRightSide);
+                    }
+                    break;
+
                 case BinaryExpression binary:
                     CollectReferencedColumns(binary.FirstExpression, condition, isRightSide);
                     CollectReferencedColumns(binary.SecondExpression, condition, isRightSide);
@@ -646,6 +907,60 @@ namespace SqlTestDataGenerator.Parsing
 
                 case UnaryExpression unary:
                     CollectReferencedColumns(unary.Expression, condition, isRightSide);
+                    break;
+
+                default:
+                    foreach (var columnRef in CollectColumnReferences(expr))
+                    {
+                        AddReferencedColumn(columnRef, condition, isRightSide);
+                    }
+                    break;
+            }
+        }
+
+        private void CollectReferencedColumns(BooleanExpression expr, ConditionInfo condition, bool isRightSide)
+        {
+            switch (expr)
+            {
+                case BooleanComparisonExpression comparison:
+                    CollectReferencedColumns(comparison.FirstExpression, condition, isRightSide);
+                    CollectReferencedColumns(comparison.SecondExpression, condition, isRightSide);
+                    break;
+
+                case InPredicate inPredicate:
+                    CollectReferencedColumns(inPredicate.Expression, condition, isRightSide);
+                    foreach (var value in inPredicate.Values)
+                    {
+                        CollectReferencedColumns(value, condition, isRightSide);
+                    }
+                    break;
+
+                case BooleanTernaryExpression ternary:
+                    CollectReferencedColumns(ternary.FirstExpression, condition, isRightSide);
+                    CollectReferencedColumns(ternary.SecondExpression, condition, isRightSide);
+                    CollectReferencedColumns(ternary.ThirdExpression, condition, isRightSide);
+                    break;
+
+                case LikePredicate like:
+                    CollectReferencedColumns(like.FirstExpression, condition, isRightSide);
+                    CollectReferencedColumns(like.SecondExpression, condition, isRightSide);
+                    break;
+
+                case BooleanIsNullExpression isNull:
+                    CollectReferencedColumns(isNull.Expression, condition, isRightSide);
+                    break;
+
+                case BooleanBinaryExpression binary:
+                    CollectReferencedColumns(binary.FirstExpression, condition, isRightSide);
+                    CollectReferencedColumns(binary.SecondExpression, condition, isRightSide);
+                    break;
+
+                case BooleanParenthesisExpression paren:
+                    CollectReferencedColumns(paren.Expression, condition, isRightSide);
+                    break;
+
+                case BooleanNotExpression not:
+                    CollectReferencedColumns(not.Expression, condition, isRightSide);
                     break;
             }
         }
@@ -676,6 +991,77 @@ namespace SqlTestDataGenerator.Parsing
                 ColumnName = column,
                 IsRightSide = isRightSide
             });
+        }
+
+        private static bool TryGetFirstColumnReference(
+            TSqlFragment fragment,
+            out ColumnReferenceExpression column)
+        {
+            column = null!;
+            var columns = CollectColumnReferences(fragment);
+            if (columns.Count == 0)
+                return false;
+
+            column = columns[0];
+            return true;
+        }
+
+        private static List<ColumnReferenceExpression> CollectColumnReferences(TSqlFragment fragment)
+        {
+            var visitor = new ColumnReferenceCollector();
+            fragment.Accept(visitor);
+            return visitor.Columns;
+        }
+
+        private static void AssignConditionColumnReference(
+            ColumnReferenceExpression colRef,
+            ConditionInfo condition,
+            bool isLeft)
+        {
+            if (IsCurrentDateTimeKeyword(colRef))
+                return;
+
+            var parts = colRef.MultiPartIdentifier?.Identifiers;
+            if (parts == null || parts.Count == 0)
+                return;
+
+            if (isLeft)
+            {
+                if (parts.Count >= 2)
+                {
+                    condition.TableAlias = parts[0].Value;
+                    condition.ColumnName = parts[1].Value;
+                }
+                else if (parts.Count == 1)
+                {
+                    condition.ColumnName = parts[0].Value;
+                }
+            }
+            else
+            {
+                if (parts.Count >= 2)
+                {
+                    condition.RightTableAlias = parts[0].Value;
+                    condition.RightColumnName = parts[1].Value;
+                }
+                else if (parts.Count == 1)
+                {
+                    condition.RightColumnName = parts[0].Value;
+                }
+            }
+        }
+
+        private sealed class ColumnReferenceCollector : TSqlFragmentVisitor
+        {
+            public List<ColumnReferenceExpression> Columns { get; } = new();
+
+            public override void ExplicitVisit(ColumnReferenceExpression node)
+            {
+                if (!IsCurrentDateTimeKeyword(node))
+                {
+                    Columns.Add(node);
+                }
+            }
         }
 
         private static AggregateFunction? ParseAggregateFunction(string name)

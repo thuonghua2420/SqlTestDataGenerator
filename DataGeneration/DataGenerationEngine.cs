@@ -355,6 +355,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         row.SetValue(col.ColumnName, value);
                     }
 
+                    ApplyRowLevelPredicateAdjustments(query, scenario, schema, row);
                     ApplySemanticRowAdjustments(query, scenario, schema, row, rowIdx);
                     scenario.AddRow(tableName, row);
                 }
@@ -405,6 +406,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         row.SetValue(col.ColumnName, value);
                     }
 
+                    ApplyRowLevelPredicateAdjustments(query, scenario, schema, row);
                     scenario.AddRow(tableName, row);
                 }
 
@@ -491,6 +493,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         row.SetValue(col.ColumnName, value);
                     }
 
+                    ApplyRowLevelPredicateAdjustments(query, scenario, schema, row);
                     scenario.AddRow(tableName, row);
                 }
 
@@ -567,6 +570,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         row.SetValue(col.ColumnName, value);
                     }
 
+                    ApplyRowLevelPredicateAdjustments(query, scenario, schema, row);
                     scenario.AddRow(tableName, row);
                 }
 
@@ -615,6 +619,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         row.SetValue(col.ColumnName, value);
                     }
 
+                    ApplyRowLevelPredicateAdjustments(query, scenario, schema, row);
                     scenario.AddRow(tableName, row);
                 }
 
@@ -711,6 +716,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         row.SetValue(col.ColumnName, value);
                     }
 
+                    ApplyRowLevelPredicateAdjustments(query, scenario, schema, row);
                     ApplySemanticRowAdjustments(query, scenario, schema, row, rowIdx);
                     scenario.AddRow(tableName, row);
                 }
@@ -2490,7 +2496,7 @@ namespace SqlTestDataGenerator.DataGeneration
                             out comparisonValue);
                     }
 
-                    targets.Add(new ColumnConditionTarget(condition, desiredTruth, comparisonValue));
+                    targets.Add(new ColumnConditionTarget(condition, desiredTruth, comparisonValue, localAliasMap));
                 }
 
                 CollectSubqueryConditionTargets(
@@ -2847,6 +2853,26 @@ namespace SqlTestDataGenerator.DataGeneration
                 AddCandidate($"{trimmedHint} {baseCandidate}");
                 AddCandidate($"{trimmedHint}-{baseCandidate}");
                 AddCandidate($"{trimmedHint}{baseCandidate}Z");
+            }
+
+            foreach (var target in targets)
+            {
+                if (target.Condition.LeftExpression == null) continue;
+                var solverValue = target.Condition.Operator == ComparisonOp.Like
+                    ? target.Condition.LikePattern
+                    : target.Condition.Value;
+                var constraintHints = ExpressionConstraintSolver.Solve(
+                    target.Condition.LeftExpression,
+                    target.Condition.Operator,
+                    string.IsNullOrEmpty(solverValue) ? null : solverValue,
+                    string.IsNullOrEmpty(target.Condition.SecondValue) ? null : target.Condition.SecondValue,
+                    column,
+                    tableAlias,
+                    target.SubqueryAliasMap);
+                if (constraintHints?.HasAnyHint != true) continue;
+                var solvedCandidate = constraintHints.BuildCandidate(baseCandidate);
+                if (!string.IsNullOrEmpty(solvedCandidate))
+                    AddCandidate(solvedCandidate);
             }
 
             foreach (var candidate in DeduplicateCandidates(candidates).OfType<string>())
@@ -3278,6 +3304,9 @@ namespace SqlTestDataGenerator.DataGeneration
                 if (!string.IsNullOrWhiteSpace(target.Condition.Value))
                     hints.Add(target.Condition.Value);
 
+                if (!string.IsNullOrWhiteSpace(target.Condition.SecondValue))
+                    hints.Add(target.Condition.SecondValue);
+
                 foreach (var dynamicValue in target.Condition.DynamicStringValues)
                 {
                     if (!string.IsNullOrWhiteSpace(dynamicValue))
@@ -3457,7 +3486,7 @@ namespace SqlTestDataGenerator.DataGeneration
             GeneratedRow? currentRow)
         {
             if (RequiresExpressionEvaluation(target.Condition) &&
-                TryEvaluateExpressionConditionTarget(candidate, target.Condition, scenario, query, currentRow, col, tableAlias, out var expressionTruth))
+                TryEvaluateExpressionConditionTarget(candidate, target.Condition, scenario, query, currentRow, col, tableAlias, target.SubqueryAliasMap, out var expressionTruth))
                 return expressionTruth == target.DesiredTruth;
 
             var actualTruth = EvaluateCondition(candidate, target.Condition, target.ComparisonValue, col, generator);
@@ -3486,6 +3515,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 FunctionScalarExpressionInfo => true,
                 BinaryScalarExpressionInfo => true,
                 UnaryScalarExpressionInfo => true,
+                CaseScalarExpressionInfo => true,
                 _ => false
             };
         }
@@ -3508,6 +3538,30 @@ namespace SqlTestDataGenerator.DataGeneration
                     ExpressionReferencesTargetColumn(binary.Left, targetColumn, tableAlias) ||
                     ExpressionReferencesTargetColumn(binary.Right, targetColumn, tableAlias),
                 UnaryScalarExpressionInfo unary => ExpressionReferencesTargetColumn(unary.Operand, targetColumn, tableAlias),
+                CaseScalarExpressionInfo caseExpression =>
+                    ExpressionReferencesTargetColumn(caseExpression.InputExpression, targetColumn, tableAlias) ||
+                    ExpressionReferencesTargetColumn(caseExpression.ElseExpression, targetColumn, tableAlias) ||
+                    caseExpression.WhenClauses.Any(w =>
+                        PredicateExpressionReferencesTargetColumn(w.Predicate, targetColumn, tableAlias) ||
+                        ExpressionReferencesTargetColumn(w.WhenExpression, targetColumn, tableAlias) ||
+                        ExpressionReferencesTargetColumn(w.ThenExpression, targetColumn, tableAlias)),
+                _ => false
+            };
+        }
+
+        private static bool PredicateExpressionReferencesTargetColumn(
+            PredicateExpression? expression,
+            ColumnSchema targetColumn,
+            string tableAlias)
+        {
+            return expression switch
+            {
+                null => false,
+                PredicateLeafExpression leaf => ConditionReferencesTargetColumn(leaf.Condition, targetColumn, tableAlias),
+                PredicateBinaryExpression binary =>
+                    PredicateExpressionReferencesTargetColumn(binary.Left, targetColumn, tableAlias) ||
+                    PredicateExpressionReferencesTargetColumn(binary.Right, targetColumn, tableAlias),
+                PredicateNotExpression not => PredicateExpressionReferencesTargetColumn(not.Inner, targetColumn, tableAlias),
                 _ => false
             };
         }
@@ -3529,12 +3583,13 @@ namespace SqlTestDataGenerator.DataGeneration
             GeneratedRow? currentRow,
             ColumnSchema column,
             string tableAlias,
+            IReadOnlyDictionary<string, string>? aliasMap,
             out bool truth)
         {
             truth = false;
             if (condition.IsColumnComparison ||
                 condition.LeftExpression == null ||
-                !ConditionReferencesTargetColumn(condition, column, tableAlias))
+                !ConditionReferencesTargetColumn(condition, column, tableAlias, aliasMap))
             {
                 return false;
             }
@@ -3545,7 +3600,7 @@ namespace SqlTestDataGenerator.DataGeneration
             {
                 foreach (var dynamicValue in condition.DynamicStringValues)
                 {
-                    if (TryEvaluateExpressionConditionTarget(candidate, condition, scenario, query, currentRow, column, tableAlias, dynamicValue, out truth) &&
+                    if (TryEvaluateExpressionConditionTarget(candidate, condition, scenario, query, currentRow, column, tableAlias, aliasMap, dynamicValue, out truth) &&
                         truth)
                     {
                         return true;
@@ -3556,7 +3611,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 return true;
             }
 
-            return TryEvaluateExpressionConditionTarget(candidate, condition, scenario, query, currentRow, column, tableAlias, null, out truth);
+            return TryEvaluateExpressionConditionTarget(candidate, condition, scenario, query, currentRow, column, tableAlias, aliasMap, null, out truth);
         }
 
         private bool TryEvaluateExpressionConditionTarget(
@@ -3567,6 +3622,7 @@ namespace SqlTestDataGenerator.DataGeneration
             GeneratedRow? currentRow,
             ColumnSchema column,
             string tableAlias,
+            IReadOnlyDictionary<string, string>? aliasMap,
             string? dynamicValue,
             out bool truth)
         {
@@ -3574,7 +3630,7 @@ namespace SqlTestDataGenerator.DataGeneration
             if (condition.LeftExpression == null)
                 return false;
 
-            var leftValue = EvaluateScalarExpression(condition.LeftExpression, candidate, scenario, query, currentRow, column, tableAlias, dynamicValue);
+            var leftValue = EvaluateScalarExpression(condition.LeftExpression, candidate, scenario, query, currentRow, column, tableAlias, dynamicValue, aliasMap);
 
             switch (condition.Operator)
             {
@@ -3589,7 +3645,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 case ComparisonOp.Like:
                 {
                     var patternValue = condition.RightExpression != null
-                        ? EvaluateScalarExpression(condition.RightExpression, candidate, scenario, query, currentRow, column, tableAlias, dynamicValue)
+                        ? EvaluateScalarExpression(condition.RightExpression, candidate, scenario, query, currentRow, column, tableAlias, dynamicValue, aliasMap)
                         : condition.LikePattern;
                     truth = EvaluateLike(leftValue?.ToString() ?? string.Empty, patternValue?.ToString() ?? string.Empty);
                     if (condition.IsNegated)
@@ -3610,7 +3666,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 case ComparisonOp.Between:
                 {
                     var lower = condition.RightExpression != null
-                        ? EvaluateScalarExpression(condition.RightExpression, candidate, scenario, query, currentRow, column, tableAlias, dynamicValue)
+                        ? EvaluateScalarExpression(condition.RightExpression, candidate, scenario, query, currentRow, column, tableAlias, dynamicValue, aliasMap)
                         : (string.IsNullOrEmpty(condition.Value) ? null : condition.Value);
                     var upper = string.IsNullOrEmpty(condition.SecondValue) ? null : condition.SecondValue;
                     truth = CompareExpressionValues(leftValue, lower) >= 0 &&
@@ -3630,7 +3686,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 case ComparisonOp.LessThanOrEqual:
                 {
                     var rightValue = condition.RightExpression != null
-                        ? EvaluateScalarExpression(condition.RightExpression, candidate, scenario, query, currentRow, column, tableAlias, dynamicValue)
+                        ? EvaluateScalarExpression(condition.RightExpression, candidate, scenario, query, currentRow, column, tableAlias, dynamicValue, aliasMap)
                         : (string.IsNullOrEmpty(condition.Value) ? null : condition.Value);
                     if (IsScalarSubqueryPlaceholder(rightValue) &&
                         TryResolveScalarSubqueryComparisonValue(query, condition, column, out var scalarSubqueryValue))
@@ -3659,13 +3715,35 @@ namespace SqlTestDataGenerator.DataGeneration
         private static bool ConditionReferencesTargetColumn(
             ConditionInfo condition,
             ColumnSchema column,
-            string tableAlias)
+            string tableAlias,
+            IReadOnlyDictionary<string, string>? aliasMap = null)
         {
             return condition.ReferencedColumns.Any(r =>
                 r.ColumnName.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase) &&
-                (string.IsNullOrWhiteSpace(r.TableAlias) ||
-                 r.TableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase) ||
-                 r.TableAlias.Equals(column.TableName, StringComparison.OrdinalIgnoreCase)));
+                TableAliasMatchesTarget(r.TableAlias, tableAlias, column.TableName, aliasMap));
+        }
+
+        private static bool TableAliasMatchesTarget(
+            string refAlias,
+            string tableAlias,
+            string tableName,
+            IReadOnlyDictionary<string, string>? aliasMap)
+        {
+            if (string.IsNullOrWhiteSpace(refAlias))
+                return true;
+            if (refAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (refAlias.Equals(tableName, StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (aliasMap == null)
+                return false;
+            // Resolve both aliases to table names and compare
+            if (!aliasMap.TryGetValue(refAlias, out var refTable))
+                return false;
+            if (aliasMap.TryGetValue(tableAlias, out var targetTable))
+                return refTable.Equals(targetTable, StringComparison.OrdinalIgnoreCase);
+            return refTable.Equals(tableName, StringComparison.OrdinalIgnoreCase) ||
+                   refTable.TrimStart('[').TrimEnd(']').Equals(tableName.TrimStart('[').TrimEnd(']'), StringComparison.OrdinalIgnoreCase);
         }
 
         private object? EvaluateScalarExpression(
@@ -3676,7 +3754,8 @@ namespace SqlTestDataGenerator.DataGeneration
             GeneratedRow? currentRow,
             ColumnSchema targetColumn,
             string tableAlias,
-            string? dynamicValue)
+            string? dynamicValue,
+            IReadOnlyDictionary<string, string>? aliasMap = null)
         {
             switch (expression)
             {
@@ -3695,9 +3774,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     }
 
                     if (columnExpr.ColumnName.Equals(targetColumn.ColumnName, StringComparison.OrdinalIgnoreCase) &&
-                        (string.IsNullOrWhiteSpace(columnExpr.TableAlias) ||
-                         columnExpr.TableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase) ||
-                         columnExpr.TableAlias.Equals(targetColumn.TableName, StringComparison.OrdinalIgnoreCase)))
+                        TableAliasMatchesTarget(columnExpr.TableAlias, tableAlias, targetColumn.TableName, aliasMap))
                     {
                         return candidate;
                     }
@@ -3726,7 +3803,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 case UnaryScalarExpressionInfo unary:
                 {
-                    var operand = EvaluateScalarExpression(unary.Operand, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue);
+                    var operand = EvaluateScalarExpression(unary.Operand, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap);
                     return unary.Operator switch
                     {
                         "Negative" when TryConvertDecimal(operand, out var decimalValue) => -decimalValue,
@@ -3736,16 +3813,155 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 case BinaryScalarExpressionInfo binary:
                 {
-                    var left = EvaluateScalarExpression(binary.Left, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue);
-                    var right = EvaluateScalarExpression(binary.Right, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue);
+                    var left = EvaluateScalarExpression(binary.Left, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap);
+                    var right = EvaluateScalarExpression(binary.Right, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap);
                     return EvaluateBinaryExpression(binary.Operator, left, right);
                 }
 
                 case FunctionScalarExpressionInfo func:
-                    return EvaluateFunctionExpression(func, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue);
+                    return EvaluateFunctionExpression(func, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap);
+
+                case CaseScalarExpressionInfo caseExpression:
+                    return EvaluateCaseExpression(caseExpression, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap);
             }
 
             return null;
+        }
+
+        private object? EvaluateCaseExpression(
+            CaseScalarExpressionInfo caseExpression,
+            object? candidate,
+            BranchScenario scenario,
+            ParsedQuery query,
+            GeneratedRow? currentRow,
+            ColumnSchema targetColumn,
+            string tableAlias,
+            string? dynamicValue,
+            IReadOnlyDictionary<string, string>? aliasMap)
+        {
+            var inputValue = caseExpression.InputExpression == null
+                ? null
+                : EvaluateScalarExpression(caseExpression.InputExpression, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap);
+
+            foreach (var whenClause in caseExpression.WhenClauses)
+            {
+                var matched = whenClause.Predicate != null
+                    ? EvaluatePredicateExpression(whenClause.Predicate, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap)
+                    : CompareExpressionValues(
+                        inputValue,
+                        EvaluateScalarExpression(whenClause.WhenExpression, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap)) == 0;
+
+                if (matched)
+                {
+                    return EvaluateScalarExpression(whenClause.ThenExpression, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap);
+                }
+            }
+
+            return EvaluateScalarExpression(caseExpression.ElseExpression, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap);
+        }
+
+        private bool EvaluatePredicateExpression(
+            PredicateExpression? expression,
+            object? candidate,
+            BranchScenario scenario,
+            ParsedQuery query,
+            GeneratedRow? currentRow,
+            ColumnSchema targetColumn,
+            string tableAlias,
+            string? dynamicValue,
+            IReadOnlyDictionary<string, string>? aliasMap)
+        {
+            return expression switch
+            {
+                null => false,
+                PredicateLeafExpression leaf => EvaluatePredicateCondition(leaf.Condition, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap),
+                PredicateBinaryExpression binary when binary.Operator == LogicalOp.And =>
+                    EvaluatePredicateExpression(binary.Left, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap) &&
+                    EvaluatePredicateExpression(binary.Right, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap),
+                PredicateBinaryExpression binary when binary.Operator == LogicalOp.Or =>
+                    EvaluatePredicateExpression(binary.Left, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap) ||
+                    EvaluatePredicateExpression(binary.Right, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap),
+                PredicateNotExpression not =>
+                    !EvaluatePredicateExpression(not.Inner, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap),
+                _ => false
+            };
+        }
+
+        private bool EvaluatePredicateCondition(
+            ConditionInfo condition,
+            object? candidate,
+            BranchScenario scenario,
+            ParsedQuery query,
+            GeneratedRow? currentRow,
+            ColumnSchema targetColumn,
+            string tableAlias,
+            string? dynamicValue,
+            IReadOnlyDictionary<string, string>? aliasMap)
+        {
+            var leftValue = condition.LeftExpression == null
+                ? null
+                : EvaluateScalarExpression(condition.LeftExpression, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap);
+
+            switch (condition.Operator)
+            {
+                case ComparisonOp.IsNull:
+                    return leftValue == null;
+
+                case ComparisonOp.IsNotNull:
+                    return leftValue != null;
+
+                case ComparisonOp.Like:
+                {
+                    var patternValue = condition.RightExpression != null
+                        ? EvaluateScalarExpression(condition.RightExpression, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap)
+                        : condition.LikePattern;
+                    var truth = EvaluateLike(leftValue?.ToString() ?? string.Empty, patternValue?.ToString() ?? string.Empty);
+                    return condition.IsNegated ? !truth : truth;
+                }
+
+                case ComparisonOp.In:
+                    return condition.InValues.Any(v => CompareExpressionValues(leftValue, v) == 0);
+
+                case ComparisonOp.NotIn:
+                    return condition.InValues.All(v => CompareExpressionValues(leftValue, v) != 0);
+
+                case ComparisonOp.Between:
+                {
+                    var lower = condition.RightExpression != null
+                        ? EvaluateScalarExpression(condition.RightExpression, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap)
+                        : (string.IsNullOrEmpty(condition.Value) ? null : condition.Value);
+                    var upper = string.IsNullOrEmpty(condition.SecondValue) ? null : condition.SecondValue;
+                    var truth = CompareExpressionValues(leftValue, lower) >= 0 &&
+                                CompareExpressionValues(leftValue, upper) <= 0;
+                    return condition.IsNegated ? !truth : truth;
+                }
+
+                case ComparisonOp.Equal:
+                case ComparisonOp.NotEqual:
+                case ComparisonOp.GreaterThan:
+                case ComparisonOp.GreaterThanOrEqual:
+                case ComparisonOp.LessThan:
+                case ComparisonOp.LessThanOrEqual:
+                {
+                    var rightValue = condition.RightExpression != null
+                        ? EvaluateScalarExpression(condition.RightExpression, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap)
+                        : (string.IsNullOrEmpty(condition.Value) ? null : condition.Value);
+                    var comparison = CompareExpressionValues(leftValue, rightValue);
+                    return condition.Operator switch
+                    {
+                        ComparisonOp.Equal => comparison == 0,
+                        ComparisonOp.NotEqual => comparison != 0,
+                        ComparisonOp.GreaterThan => comparison > 0,
+                        ComparisonOp.GreaterThanOrEqual => comparison >= 0,
+                        ComparisonOp.LessThan => comparison < 0,
+                        ComparisonOp.LessThanOrEqual => comparison <= 0,
+                        _ => false
+                    };
+                }
+
+                default:
+                    return false;
+            }
         }
 
         private object? EvaluateLiteralExpression(LiteralScalarExpressionInfo literal)
@@ -3805,10 +4021,11 @@ namespace SqlTestDataGenerator.DataGeneration
             GeneratedRow? currentRow,
             ColumnSchema targetColumn,
             string tableAlias,
-            string? dynamicValue)
+            string? dynamicValue,
+            IReadOnlyDictionary<string, string>? aliasMap = null)
         {
             var args = function.Arguments
-                .Select(a => EvaluateScalarExpression(a, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue))
+                .Select(a => EvaluateScalarExpression(a, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap))
                 .ToList();
 
             return function.Name.ToUpperInvariant() switch
@@ -4906,16 +5123,19 @@ namespace SqlTestDataGenerator.DataGeneration
             public ColumnConditionTarget(
                 ConditionInfo condition,
                 bool desiredTruth,
-                object? comparisonValue = null)
+                object? comparisonValue = null,
+                IReadOnlyDictionary<string, string>? subqueryAliasMap = null)
             {
                 Condition = condition;
                 DesiredTruth = desiredTruth;
                 ComparisonValue = comparisonValue;
+                SubqueryAliasMap = subqueryAliasMap;
             }
 
             public ConditionInfo Condition { get; }
             public bool DesiredTruth { get; }
             public object? ComparisonValue { get; }
+            public IReadOnlyDictionary<string, string>? SubqueryAliasMap { get; }
         }
 
         private readonly struct ResolvedColumnValue
@@ -5081,6 +5301,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     row.SetValue(col.ColumnName, value);
                 }
 
+                ApplyRowLevelPredicateAdjustments(query, scenario, schema, row);
                 scenario.AddRow(tableName, row);
                 RegisterGeneratedIds(tableRowIds, tableName, scenario, schema, rowId, 1);
             }
@@ -5391,6 +5612,311 @@ namespace SqlTestDataGenerator.DataGeneration
         // ═════════════════════════════════════════════════════════════════
         // Helpers
         // ═════════════════════════════════════════════════════════════════
+
+        private void ApplyRowLevelPredicateAdjustments(
+            ParsedQuery query,
+            BranchScenario scenario,
+            TableSchema schema,
+            GeneratedRow row)
+        {
+            foreach (var target in EnumerateRowColumnComparisonTargets(query, scenario, schema.TableName))
+            {
+                var condition = target.Condition;
+                if (string.IsNullOrWhiteSpace(condition.ColumnName) ||
+                    string.IsNullOrWhiteSpace(condition.RightColumnName))
+                {
+                    continue;
+                }
+
+                if (!IsSameGeneratedRowComparison(condition))
+                    continue;
+
+                var leftColumn = schema.GetColumn(condition.ColumnName);
+                var rightColumn = schema.GetColumn(condition.RightColumnName);
+                if (leftColumn == null || rightColumn == null)
+                    continue;
+
+                var leftValue = row.GetValue(leftColumn.ColumnName);
+                var rightValue = row.GetValue(rightColumn.ColumnName);
+                var currentTruth = EvaluateColumnComparison(leftValue, rightValue, condition.Operator);
+                if (currentTruth == target.DesiredTruth)
+                    continue;
+
+                if (CanAdjustComparisonColumn(schema, rightColumn) &&
+                    TryBuildColumnComparisonAdjustment(rightColumn, leftValue, condition.Operator, adjustRightSide: true, target.DesiredTruth, out var adjustedRight))
+                {
+                    row.SetValue(rightColumn.ColumnName, adjustedRight);
+                    continue;
+                }
+
+                if (CanAdjustComparisonColumn(schema, leftColumn) &&
+                    TryBuildColumnComparisonAdjustment(leftColumn, rightValue, condition.Operator, adjustRightSide: false, target.DesiredTruth, out var adjustedLeft))
+                {
+                    row.SetValue(leftColumn.ColumnName, adjustedLeft);
+                }
+            }
+        }
+
+        private IEnumerable<RowColumnComparisonTarget> EnumerateRowColumnComparisonTargets(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableName)
+        {
+            foreach (var scope in query.PredicateScopes)
+            {
+                foreach (var condition in scope.Conditions.Where(c => c.IsColumnComparison))
+                {
+                    if (ColumnComparisonTargetsTable(condition, query.AliasToTableMap, tableName))
+                    {
+                        yield return new RowColumnComparisonTarget(
+                            condition,
+                            GetDesiredTruthForCondition(scenario, condition, defaultTruth: true));
+                    }
+                }
+            }
+
+            foreach (var target in EnumerateSubqueryRowColumnComparisonTargets(
+                         query.Subqueries,
+                         scenario,
+                         query.AliasToTableMap,
+                         parentTruthMap: null,
+                         tableName))
+            {
+                yield return target;
+            }
+        }
+
+        private IEnumerable<RowColumnComparisonTarget> EnumerateSubqueryRowColumnComparisonTargets(
+            IEnumerable<SubqueryInfo> subqueries,
+            BranchScenario scenario,
+            IReadOnlyDictionary<string, string> aliasMap,
+            IReadOnlyDictionary<string, bool>? parentTruthMap,
+            string tableName)
+        {
+            foreach (var subquery in subqueries)
+            {
+                var predicateTruth = ResolveSubqueryPredicateTruth(scenario, subquery, parentTruthMap);
+                var internalTruthMap = BuildSubqueryInternalTruthMap(subquery, predicateTruth);
+                var localAliasMap = ExtendAliasMap(
+                    new Dictionary<string, string>(aliasMap, StringComparer.OrdinalIgnoreCase),
+                    subquery.Tables);
+
+                foreach (var condition in subquery.Conditions.Where(c => c.IsColumnComparison))
+                {
+                    if (!ColumnComparisonTargetsTable(condition, localAliasMap, tableName))
+                        continue;
+
+                    var desiredTruth = internalTruthMap.TryGetValue(condition.Key, out var mappedTruth)
+                        ? mappedTruth
+                        : true;
+                    yield return new RowColumnComparisonTarget(condition, desiredTruth);
+                }
+
+                foreach (var nestedTarget in EnumerateSubqueryRowColumnComparisonTargets(
+                             subquery.NestedSubqueries,
+                             scenario,
+                             localAliasMap,
+                             internalTruthMap,
+                             tableName))
+                {
+                    yield return nestedTarget;
+                }
+            }
+        }
+
+        private static bool ColumnComparisonTargetsTable(
+            ConditionInfo condition,
+            IReadOnlyDictionary<string, string> aliasMap,
+            string tableName)
+        {
+            if (!condition.IsColumnComparison)
+                return false;
+
+            var leftTable = ResolveAliasFromMap(aliasMap, condition.TableAlias, tableName);
+            var rightTable = ResolveAliasFromMap(aliasMap, condition.RightTableAlias, tableName);
+            return leftTable.Equals(tableName, StringComparison.OrdinalIgnoreCase) &&
+                   rightTable.Equals(tableName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string ResolveAliasFromMap(
+            IReadOnlyDictionary<string, string> aliasMap,
+            string aliasOrName,
+            string fallbackTableName)
+        {
+            if (string.IsNullOrWhiteSpace(aliasOrName))
+                return fallbackTableName;
+
+            return aliasMap.TryGetValue(aliasOrName, out var resolved)
+                ? resolved
+                : aliasOrName;
+        }
+
+        private static bool IsSameGeneratedRowComparison(ConditionInfo condition)
+        {
+            if (string.IsNullOrWhiteSpace(condition.TableAlias) ||
+                string.IsNullOrWhiteSpace(condition.RightTableAlias))
+            {
+                return true;
+            }
+
+            return condition.TableAlias.Equals(condition.RightTableAlias, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool EvaluateColumnComparison(object? leftValue, object? rightValue, ComparisonOp op)
+        {
+            var comparison = CompareExpressionValues(leftValue, rightValue);
+            return op switch
+            {
+                ComparisonOp.Equal => comparison == 0,
+                ComparisonOp.NotEqual => comparison != 0,
+                ComparisonOp.GreaterThan => comparison > 0,
+                ComparisonOp.GreaterThanOrEqual => comparison >= 0,
+                ComparisonOp.LessThan => comparison < 0,
+                ComparisonOp.LessThanOrEqual => comparison <= 0,
+                _ => true
+            };
+        }
+
+        private static bool CanAdjustComparisonColumn(TableSchema schema, ColumnSchema column)
+        {
+            if (column.IsComputed || column.IsIdentity || column.IsPrimaryKey)
+                return false;
+
+            if (schema.PrimaryKey?.Columns.Any(c => c.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)) == true)
+                return false;
+
+            return !schema.ForeignKeys.Any(fk => fk.ColumnName.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static bool TryBuildColumnComparisonAdjustment(
+            ColumnSchema targetColumn,
+            object? referenceValue,
+            ComparisonOp op,
+            bool adjustRightSide,
+            bool desiredTruth,
+            out object? adjustedValue)
+        {
+            adjustedValue = null;
+            if (referenceValue == null || referenceValue == DBNull.Value)
+                return false;
+
+            if (!desiredTruth)
+            {
+                op = NegateComparisonOperator(op);
+            }
+
+            adjustedValue = adjustRightSide
+                ? BuildRightSideComparisonValue(targetColumn, referenceValue, op)
+                : BuildLeftSideComparisonValue(targetColumn, referenceValue, op);
+
+            if (adjustedValue == null || adjustedValue == DBNull.Value)
+                return false;
+
+            adjustedValue = SqlServerValueNormalizer.NormalizeValue(targetColumn, adjustedValue) ?? adjustedValue;
+            return true;
+        }
+
+        private static object? BuildRightSideComparisonValue(
+            ColumnSchema targetColumn,
+            object referenceValue,
+            ComparisonOp op)
+        {
+            return op switch
+            {
+                ComparisonOp.Equal => referenceValue,
+                ComparisonOp.NotEqual => BuildDifferentComparisonValue(targetColumn, referenceValue, preferGreater: true),
+                ComparisonOp.GreaterThan => BuildOffsetComparisonValue(targetColumn, referenceValue, -1),
+                ComparisonOp.GreaterThanOrEqual => referenceValue,
+                ComparisonOp.LessThan => BuildOffsetComparisonValue(targetColumn, referenceValue, 1),
+                ComparisonOp.LessThanOrEqual => referenceValue,
+                _ => null
+            };
+        }
+
+        private static object? BuildLeftSideComparisonValue(
+            ColumnSchema targetColumn,
+            object referenceValue,
+            ComparisonOp op)
+        {
+            return op switch
+            {
+                ComparisonOp.Equal => referenceValue,
+                ComparisonOp.NotEqual => BuildDifferentComparisonValue(targetColumn, referenceValue, preferGreater: true),
+                ComparisonOp.GreaterThan => BuildOffsetComparisonValue(targetColumn, referenceValue, 1),
+                ComparisonOp.GreaterThanOrEqual => referenceValue,
+                ComparisonOp.LessThan => BuildOffsetComparisonValue(targetColumn, referenceValue, -1),
+                ComparisonOp.LessThanOrEqual => referenceValue,
+                _ => null
+            };
+        }
+
+        private static ComparisonOp NegateComparisonOperator(ComparisonOp op) => op switch
+        {
+            ComparisonOp.Equal => ComparisonOp.NotEqual,
+            ComparisonOp.NotEqual => ComparisonOp.Equal,
+            ComparisonOp.GreaterThan => ComparisonOp.LessThanOrEqual,
+            ComparisonOp.GreaterThanOrEqual => ComparisonOp.LessThan,
+            ComparisonOp.LessThan => ComparisonOp.GreaterThanOrEqual,
+            ComparisonOp.LessThanOrEqual => ComparisonOp.GreaterThan,
+            _ => op
+        };
+
+        private static object? BuildDifferentComparisonValue(
+            ColumnSchema targetColumn,
+            object referenceValue,
+            bool preferGreater)
+        {
+            if (targetColumn.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float ||
+                TryConvertDecimal(referenceValue, out _))
+            {
+                return BuildOffsetComparisonValue(targetColumn, referenceValue, preferGreater ? 1 : -1);
+            }
+
+            if (targetColumn.TypeCategory is DataTypeCategory.DateTime or DataTypeCategory.DateTimeOffset &&
+                TryConvertToDateTimeValue(referenceValue, out var dateTime))
+            {
+                return dateTime.AddDays(preferGreater ? 1 : -1);
+            }
+
+            return $"{referenceValue}_alt";
+        }
+
+        private static object? BuildOffsetComparisonValue(
+            ColumnSchema targetColumn,
+            object referenceValue,
+            int direction)
+        {
+            if (targetColumn.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float ||
+                TryConvertDecimal(referenceValue, out _))
+            {
+                if (!TryConvertDecimal(referenceValue, out var numeric))
+                    return null;
+
+                return numeric + (direction * GetNumericRangeStep(targetColumn));
+            }
+
+            if (targetColumn.TypeCategory is DataTypeCategory.DateTime or DataTypeCategory.DateTimeOffset &&
+                TryConvertToDateTimeValue(referenceValue, out var dateTime))
+            {
+                return dateTime.AddDays(direction);
+            }
+
+            return direction >= 0
+                ? $"{referenceValue}_z"
+                : string.Empty;
+        }
+
+        private sealed class RowColumnComparisonTarget
+        {
+            public RowColumnComparisonTarget(ConditionInfo condition, bool desiredTruth)
+            {
+                Condition = condition;
+                DesiredTruth = desiredTruth;
+            }
+
+            public ConditionInfo Condition { get; }
+            public bool DesiredTruth { get; }
+        }
 
         private void ApplySemanticRowAdjustments(
             ParsedQuery query,
