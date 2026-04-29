@@ -991,7 +991,7 @@ namespace SqlTestDataGenerator.Parsing
                 if (string.IsNullOrWhiteSpace(alias))
                     continue;
 
-                var bindings = BuildDerivedColumnBindings(alias, spec);
+                var bindings = BuildDerivedColumnBindings(alias, spec, mappings);
                 if (bindings.Count > 0)
                 {
                     mappings[alias] = bindings;
@@ -1004,17 +1004,21 @@ namespace SqlTestDataGenerator.Parsing
                 if (string.IsNullOrWhiteSpace(alias))
                     continue;
 
-                var bindings = BuildDerivedColumnBindings(alias, derivedTable.QueryExpression);
+                var bindings = BuildDerivedColumnBindings(alias, derivedTable.QueryExpression, mappings);
                 if (bindings.Count > 0)
                 {
                     mappings[alias] = bindings;
                 }
             }
 
+            AddNamedDerivedReferenceAliases(fragment, mappings);
             return mappings;
         }
 
-        private Dictionary<string, DerivedColumnBinding> BuildDerivedColumnBindings(string derivedAlias, QueryExpression? expression)
+        private Dictionary<string, DerivedColumnBinding> BuildDerivedColumnBindings(
+            string derivedAlias,
+            QueryExpression? expression,
+            IReadOnlyDictionary<string, Dictionary<string, DerivedColumnBinding>> outerDerivedMappings)
         {
             var bindings = new Dictionary<string, DerivedColumnBinding>(StringComparer.OrdinalIgnoreCase);
             var spec = EnumerateQuerySpecifications(expression).FirstOrDefault();
@@ -1026,7 +1030,25 @@ namespace SqlTestDataGenerator.Parsing
             {
                 foreach (var tableReference in spec.FromClause.TableReferences)
                 {
-                    CollectDerivedMappingsFromTableReference(tableReference, localDerivedMappings);
+                    CollectDerivedMappingsFromTableReference(tableReference, localDerivedMappings, outerDerivedMappings);
+                }
+            }
+
+            foreach (var star in spec.SelectElements.OfType<SelectStarExpression>())
+            {
+                foreach (var sourceBinding in ResolveStarSourceBindings(star, localDerivedMappings))
+                {
+                    if (bindings.ContainsKey(sourceBinding.OutputColumn))
+                        continue;
+
+                    bindings[sourceBinding.OutputColumn] = new DerivedColumnBinding
+                    {
+                        DerivedAlias = derivedAlias,
+                        OutputColumn = sourceBinding.OutputColumn,
+                        SourceAlias = sourceBinding.SourceAlias,
+                        SourceColumn = sourceBinding.SourceColumn,
+                        SourceExpression = sourceBinding.SourceExpression
+                    };
                 }
             }
 
@@ -1060,16 +1082,21 @@ namespace SqlTestDataGenerator.Parsing
 
         private void CollectDerivedMappingsFromTableReference(
             TableReference tableReference,
-            Dictionary<string, Dictionary<string, DerivedColumnBinding>> mappings)
+            Dictionary<string, Dictionary<string, DerivedColumnBinding>> mappings,
+            IReadOnlyDictionary<string, Dictionary<string, DerivedColumnBinding>> outerDerivedMappings)
         {
             switch (tableReference)
             {
+                case NamedTableReference namedTable:
+                    AddNamedDerivedReferenceMapping(namedTable, mappings, outerDerivedMappings);
+                    break;
+
                 case QueryDerivedTable derivedTable:
                 {
                     var alias = derivedTable.Alias?.Value ?? string.Empty;
                     if (!string.IsNullOrWhiteSpace(alias))
                     {
-                        var bindings = BuildDerivedColumnBindings(alias, derivedTable.QueryExpression);
+                        var bindings = BuildDerivedColumnBindings(alias, derivedTable.QueryExpression, outerDerivedMappings);
                         if (bindings.Count > 0)
                         {
                             mappings[alias] = bindings;
@@ -1079,14 +1106,98 @@ namespace SqlTestDataGenerator.Parsing
                 }
 
                 case QualifiedJoin qualifiedJoin:
-                    CollectDerivedMappingsFromTableReference(qualifiedJoin.FirstTableReference, mappings);
-                    CollectDerivedMappingsFromTableReference(qualifiedJoin.SecondTableReference, mappings);
+                    CollectDerivedMappingsFromTableReference(qualifiedJoin.FirstTableReference, mappings, outerDerivedMappings);
+                    CollectDerivedMappingsFromTableReference(qualifiedJoin.SecondTableReference, mappings, outerDerivedMappings);
+                    break;
+
+                case UnqualifiedJoin unqualifiedJoin:
+                    CollectDerivedMappingsFromTableReference(unqualifiedJoin.FirstTableReference, mappings, outerDerivedMappings);
+                    CollectDerivedMappingsFromTableReference(unqualifiedJoin.SecondTableReference, mappings, outerDerivedMappings);
                     break;
 
                 case JoinParenthesisTableReference joinParen:
-                    CollectDerivedMappingsFromTableReference(joinParen.Join, mappings);
+                    CollectDerivedMappingsFromTableReference(joinParen.Join, mappings, outerDerivedMappings);
                     break;
             }
+        }
+
+        private static IEnumerable<DerivedColumnBinding> ResolveStarSourceBindings(
+            SelectStarExpression star,
+            IReadOnlyDictionary<string, Dictionary<string, DerivedColumnBinding>> localDerivedMappings)
+        {
+            var qualifier = star.Qualifier?.Identifiers.LastOrDefault()?.Value ?? string.Empty;
+            if (!string.IsNullOrWhiteSpace(qualifier))
+            {
+                if (localDerivedMappings.TryGetValue(qualifier, out var qualifiedColumns))
+                {
+                    foreach (var binding in qualifiedColumns.Values)
+                    {
+                        yield return binding;
+                    }
+                }
+
+                yield break;
+            }
+
+            foreach (var source in localDerivedMappings.Values)
+            {
+                foreach (var binding in source.Values)
+                {
+                    yield return binding;
+                }
+            }
+        }
+
+        private void AddNamedDerivedReferenceAliases(
+            TSqlFragment fragment,
+            Dictionary<string, Dictionary<string, DerivedColumnBinding>> mappings)
+        {
+            var visitor = new NamedTableReferenceCollectorVisitor();
+            fragment.Accept(visitor);
+
+            foreach (var namedTable in visitor.NamedTableReferences)
+            {
+                AddNamedDerivedReferenceMapping(namedTable, mappings, mappings);
+            }
+        }
+
+        private static void AddNamedDerivedReferenceMapping(
+            NamedTableReference namedTable,
+            Dictionary<string, Dictionary<string, DerivedColumnBinding>> targetMappings,
+            IReadOnlyDictionary<string, Dictionary<string, DerivedColumnBinding>> sourceMappings)
+        {
+            var sourceName = namedTable.SchemaObject.BaseIdentifier?.Value ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(sourceName) ||
+                !sourceMappings.TryGetValue(sourceName, out var sourceColumns))
+            {
+                return;
+            }
+
+            var alias = namedTable.Alias?.Value ?? sourceName;
+            if (string.IsNullOrWhiteSpace(alias))
+                return;
+
+            targetMappings[alias] = CloneDerivedBindings(alias, sourceColumns);
+        }
+
+        private static Dictionary<string, DerivedColumnBinding> CloneDerivedBindings(
+            string derivedAlias,
+            IReadOnlyDictionary<string, DerivedColumnBinding> sourceColumns)
+        {
+            var clone = new Dictionary<string, DerivedColumnBinding>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (columnName, binding) in sourceColumns)
+            {
+                clone[columnName] = new DerivedColumnBinding
+                {
+                    DerivedAlias = derivedAlias,
+                    OutputColumn = binding.OutputColumn,
+                    SourceAlias = binding.SourceAlias,
+                    SourceColumn = binding.SourceColumn,
+                    SourceExpression = binding.SourceExpression
+                };
+            }
+
+            return clone;
         }
 
         private bool TryResolveExpressionSource(
@@ -1127,12 +1238,16 @@ namespace SqlTestDataGenerator.Parsing
                     return TryResolveExpressionSource(paren.Expression, localDerivedMappings, out sourceAlias, out sourceColumn);
 
                 case FunctionCall func when IsAggregateFunction(func.FunctionName?.Value ?? string.Empty) &&
+                                            !IsCountAggregateFunction(func.FunctionName?.Value ?? string.Empty) &&
                                             func.Parameters.Count > 0:
                     return TryResolveExpressionSource(func.Parameters[0], localDerivedMappings, out sourceAlias, out sourceColumn);
             }
 
             return false;
         }
+
+        private static bool IsCountAggregateFunction(string functionName) =>
+            functionName.Equals("COUNT", StringComparison.OrdinalIgnoreCase);
 
         private static IEnumerable<QualifiedJoin> EnumerateQualifiedJoins(IEnumerable<TableReference> tableReferences)
         {
@@ -1215,6 +1330,17 @@ namespace SqlTestDataGenerator.Parsing
             public override void Visit(QueryDerivedTable node)
             {
                 DerivedTables.Add(node);
+                base.Visit(node);
+            }
+        }
+
+        private sealed class NamedTableReferenceCollectorVisitor : TSqlFragmentVisitor
+        {
+            public List<NamedTableReference> NamedTableReferences { get; } = new();
+
+            public override void Visit(NamedTableReference node)
+            {
+                NamedTableReferences.Add(node);
                 base.Visit(node);
             }
         }
