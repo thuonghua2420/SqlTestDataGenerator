@@ -55,6 +55,9 @@ namespace SqlTestDataGenerator.Parsing.Models
         /// <summary>For LIKE: the pattern</summary>
         public string LikePattern { get; set; } = string.Empty;
 
+        /// <summary>For LIKE ESCAPE: the escape character</summary>
+        public string LikeEscape { get; set; } = string.Empty;
+
         /// <summary>If this is part of an aggregate function (for HAVING)</summary>
         public AggregateFunction? AggregateFunc { get; set; }
 
@@ -94,7 +97,7 @@ namespace SqlTestDataGenerator.Parsing.Models
             {
                 ComparisonOp.In => $"{neg}{alias}{ColumnName} IN ({string.Join(", ", InValues)})",
                 ComparisonOp.Between => $"{neg}{alias}{ColumnName} BETWEEN {Value} AND {SecondValue}",
-                ComparisonOp.Like => $"{neg}{alias}{ColumnName} LIKE '{LikePattern}'",
+                ComparisonOp.Like => $"{neg}{alias}{ColumnName} LIKE '{LikePattern}'{(string.IsNullOrEmpty(LikeEscape) ? string.Empty : $" ESCAPE '{LikeEscape}'")}",
                 ComparisonOp.IsNull => $"{alias}{ColumnName} IS {(IsNegated ? "NOT " : "")}NULL",
                 ComparisonOp.Exists => $"{neg}EXISTS (subquery)",
                 _ when IsColumnComparison => $"{prefix}{alias}{ColumnName}{suffix} {OperatorToString()} {RightTableAlias}.{RightColumnName}",

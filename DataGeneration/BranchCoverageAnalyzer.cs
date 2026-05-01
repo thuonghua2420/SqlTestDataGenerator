@@ -22,8 +22,8 @@ namespace SqlTestDataGenerator.DataGeneration
                 .GroupBy(c => c.Key, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
 
-            var positiveTruthMap = BuildGlobalPositiveTruthMap(query.PredicateScopes);
-            scenarios.Add(CreatePositiveScenario(positiveTruthMap));
+            var positiveTruthMap = BuildGlobalPositiveTruthMap(query.PredicateScopes, conditionByKey);
+            scenarios.Add(CreatePositiveScenario(positiveTruthMap, conditionByKey));
 
             foreach (var scope in query.PredicateScopes.Where(s => s.Root != null))
             {
@@ -49,16 +49,31 @@ namespace SqlTestDataGenerator.DataGeneration
             return DeduplicateAndRenumber(scenarios);
         }
 
-        private BranchScenario CreatePositiveScenario(Dictionary<string, bool> truthMap)
+        private BranchScenario CreatePositiveScenario(
+            Dictionary<string, bool> truthMap,
+            IReadOnlyDictionary<string, ConditionInfo> conditionByKey)
         {
+            var testedConditions = truthMap
+                .OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(kvp => new ScenarioAssignment(
+                    kvp.Key,
+                    kvp.Value,
+                    conditionByKey.TryGetValue(kvp.Key, out var condition) ? condition : null))
+                .Select(BuildReadableAssignment)
+                .ToList();
+
             return new BranchScenario
             {
                 Id = _nextId++,
                 Name = "Positive: query returns rows",
-                Description = "Canonical positive path. Every required WHERE, HAVING, and subquery predicate is satisfied so the query should return rows.",
+                Description = testedConditions.Count == 0
+                    ? "Canonical positive path. Every required WHERE, HAVING, and subquery predicate is satisfied so the query should return rows."
+                    : $"Canonical positive path uses these exact predicate assignments: {string.Join("; ", testedConditions)}.",
                 Type = ScenarioType.Positive,
                 ExpectedToReturnRows = true,
-                PredicateTruthMap = truthMap
+                PredicateTruthMap = truthMap,
+                TestedCondition = string.Join(" | ", testedConditions),
+                TestedConditions = testedConditions
             };
         }
 
@@ -182,18 +197,75 @@ namespace SqlTestDataGenerator.DataGeneration
             return ScenarioType.WhereNegative;
         }
 
-        private static Dictionary<string, bool> BuildGlobalPositiveTruthMap(IEnumerable<PredicateScope> scopes)
+        private static Dictionary<string, bool> BuildGlobalPositiveTruthMap(
+            IEnumerable<PredicateScope> scopes,
+            IReadOnlyDictionary<string, ConditionInfo> conditionByKey)
         {
             var map = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
             foreach (var scope in scopes.Where(s => s.Root != null))
             {
-                foreach (var kvp in PredicateTruthPlanner.ChooseCanonicalAssignment(scope.Root, desiredTruth: true))
+                foreach (var kvp in ChoosePositiveAssignment(scope, conditionByKey))
                 {
                     map[kvp.Key] = kvp.Value;
                 }
             }
 
             return map;
+        }
+
+        private static Dictionary<string, bool> ChoosePositiveAssignment(
+            PredicateScope scope,
+            IReadOnlyDictionary<string, ConditionInfo> conditionByKey)
+        {
+            return PredicateTruthPlanner.GetMinimalAssignments(scope.Root, desiredTruth: true)
+                .OrderBy(a => ScorePositiveAssignment(a, conditionByKey))
+                .ThenBy(a => a.Count)
+                .ThenBy(BuildAssignmentKey, StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault() ?? new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        private static int ScorePositiveAssignment(
+            IReadOnlyDictionary<string, bool> assignment,
+            IReadOnlyDictionary<string, ConditionInfo> conditionByKey)
+        {
+            var score = 0;
+            foreach (var (key, desiredTruth) in assignment)
+            {
+                if (!conditionByKey.TryGetValue(key, out var condition))
+                    continue;
+
+                if (desiredTruth &&
+                    condition.Operator == ComparisonOp.IsNull)
+                {
+                    score += 100;
+                }
+
+                if (desiredTruth &&
+                    condition.Operator is ComparisonOp.GreaterThan or ComparisonOp.GreaterThanOrEqual &&
+                    (condition.Value.Contains("SELECT", StringComparison.OrdinalIgnoreCase) ||
+                     condition.RightExpression?.Text.Contains("SELECT", StringComparison.OrdinalIgnoreCase) == true))
+                {
+                    score -= 25;
+                }
+
+                if (desiredTruth &&
+                    condition.Operator is ComparisonOp.Between or ComparisonOp.In or ComparisonOp.Like or
+                        ComparisonOp.Equal or ComparisonOp.GreaterThan or ComparisonOp.GreaterThanOrEqual or
+                        ComparisonOp.LessThan or ComparisonOp.LessThanOrEqual)
+                {
+                    score -= 1;
+                }
+            }
+
+            return score;
+        }
+
+        private static string BuildAssignmentKey(IReadOnlyDictionary<string, bool> assignment)
+        {
+            return string.Join("|",
+                assignment
+                    .OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase)
+                    .Select(kvp => $"{kvp.Key}:{(kvp.Value ? "1" : "0")}"));
         }
 
         private static Dictionary<string, bool> MergeTruthMaps(

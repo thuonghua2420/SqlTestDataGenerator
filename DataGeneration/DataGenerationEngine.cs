@@ -97,6 +97,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 var workingScenario = CloneScenarioDescriptor(scenario);
                 workingScenario.InsertOrder = new List<string>(insertOrder);
                 GenerateScenarioData(workingScenario, query, schemas, insertOrder, nextTableIds);
+                ApplyScenarioScalarAggregateComparisonAdjustments(query, workingScenario, schemas);
                 EnforceScenarioForeignKeyClosure(workingScenario, schemas);
                 ValidateScenarioLocalForeignKeys(workingScenario, schemas);
                 dataSet.Scenarios.Add(workingScenario);
@@ -428,7 +429,9 @@ namespace SqlTestDataGenerator.DataGeneration
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
 
             var testedConditions = query.EnumerateScopeConditions(ConditionSource.Having)
-                .Where(c => !GetDesiredTruthForCondition(scenario, c, true))
+                .Where(c =>
+                    TryGetDesiredTruthForCondition(scenario, c, true, out var desiredTruth) &&
+                    !desiredTruth)
                 .ToList();
 
             var countRowOverrides = BuildCountNegativeRowOverrides(query, schemas, testedConditions);
@@ -1413,6 +1416,13 @@ namespace SqlTestDataGenerator.DataGeneration
             if (condition.Operator == ComparisonOp.Like)
             {
                 var shouldMatchLike = condition.IsNegated ? !satisfy : satisfy;
+                if (col.TypeCategory == DataTypeCategory.String)
+                {
+                    return shouldMatchLike
+                        ? SqlLikePattern.GenerateMatchingValue(condition.LikePattern, col, condition.LikeEscape)
+                        : SqlLikePattern.GenerateNonMatchingValue(condition.LikePattern, col, condition.LikeEscape);
+                }
+
                 return shouldMatchLike
                     ? generator.GenerateSatisfying(col, "LIKE", condition.LikePattern)
                     : generator.GenerateViolating(col, "LIKE", condition.LikePattern);
@@ -2412,9 +2422,10 @@ namespace SqlTestDataGenerator.DataGeneration
                 if (excludeHasSubquery && condition.HasSubquery)
                     continue;
 
-                targets.Add(new ColumnConditionTarget(
-                    condition,
-                    GetDesiredTruthForCondition(scenario, condition, defaultTruth: true)));
+                if (!TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth))
+                    continue;
+
+                targets.Add(new ColumnConditionTarget(condition, desiredTruth));
             }
 
             return targets;
@@ -2426,15 +2437,21 @@ namespace SqlTestDataGenerator.DataGeneration
             string tableAlias,
             string columnName)
         {
-            return query.EnumerateScopeConditions(ConditionSource.Having)
-                .Where(c =>
-                    c.AggregateFunc.HasValue &&
-                    c.AggregateFunc is not AggregateFunction.Count and not AggregateFunction.CountDistinct &&
-                    IsConditionTargetingColumn(query, c, tableAlias, columnName))
-                .Select(c => new ColumnConditionTarget(
-                    c,
-                    GetDesiredTruthForCondition(scenario, c, defaultTruth: true)))
-                .ToList();
+            var targets = new List<ColumnConditionTarget>();
+            foreach (var condition in query.EnumerateScopeConditions(ConditionSource.Having))
+            {
+                if (!condition.AggregateFunc.HasValue ||
+                    condition.AggregateFunc is AggregateFunction.Count or AggregateFunction.CountDistinct ||
+                    !IsConditionTargetingColumn(query, condition, tableAlias, columnName) ||
+                    !TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth))
+                {
+                    continue;
+                }
+
+                targets.Add(new ColumnConditionTarget(condition, desiredTruth));
+            }
+
+            return targets;
         }
 
         private List<ColumnConditionTarget> FindApplicableSubqueryConditionTargets(
@@ -2481,9 +2498,9 @@ namespace SqlTestDataGenerator.DataGeneration
                 foreach (var condition in subquery.Conditions.Where(c =>
                     ConditionTargetsColumn(localAliasMap, c, tableName, tableAlias, columnName)))
                 {
-                    var desiredTruth = internalTruthMap.TryGetValue(condition.Key, out var mappedTruth)
-                        ? mappedTruth
-                        : true;
+                    if (!TryGetDesiredTruthFromAssignments(internalTruthMap, condition, defaultTruth: true, out var desiredTruth))
+                        continue;
+
                     object? comparisonValue = null;
                     if (condition.IsColumnComparison)
                     {
@@ -2828,7 +2845,7 @@ namespace SqlTestDataGenerator.DataGeneration
             AddCandidate(baseCandidate.Replace(" ", string.Empty, StringComparison.Ordinal));
             AddCandidate($"A{baseCandidate}Z");
 
-            var hints = ExtractStringHints(targets);
+            var hints = ExtractStringHints(targets, column);
             foreach (var hint in hints)
             {
                 var trimmedHint = hint.Trim();
@@ -3284,7 +3301,9 @@ namespace SqlTestDataGenerator.DataGeneration
             return !string.IsNullOrWhiteSpace(datePart);
         }
 
-        private static List<string> ExtractStringHints(IReadOnlyCollection<ColumnConditionTarget> targets)
+        private static List<string> ExtractStringHints(
+            IReadOnlyCollection<ColumnConditionTarget> targets,
+            ColumnSchema column)
         {
             var hints = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var target in targets)
@@ -3295,14 +3314,30 @@ namespace SqlTestDataGenerator.DataGeneration
                         hints.Add(hint);
                 }
 
-                foreach (var hint in EnumerateStringHints(target.Condition.RightExpression))
+                if (target.Condition.Operator == ComparisonOp.Like)
                 {
-                    if (!string.IsNullOrWhiteSpace(hint))
-                        hints.Add(hint);
+                    if (!string.IsNullOrWhiteSpace(target.Condition.LikePattern))
+                    {
+                        hints.Add(SqlLikePattern.GenerateMatchingValue(
+                            target.Condition.LikePattern,
+                            column,
+                            target.Condition.LikeEscape));
+                    }
+                }
+                else
+                {
+                    foreach (var hint in EnumerateStringHints(target.Condition.RightExpression))
+                    {
+                        if (!string.IsNullOrWhiteSpace(hint))
+                            hints.Add(hint);
+                    }
                 }
 
-                if (!string.IsNullOrWhiteSpace(target.Condition.Value))
+                if (!string.IsNullOrWhiteSpace(target.Condition.Value) &&
+                    target.Condition.Operator != ComparisonOp.Like)
+                {
                     hints.Add(target.Condition.Value);
+                }
 
                 if (!string.IsNullOrWhiteSpace(target.Condition.SecondValue))
                     hints.Add(target.Condition.SecondValue);
@@ -3339,6 +3374,19 @@ namespace SqlTestDataGenerator.DataGeneration
                     {
                         hints.Add(text);
                     }
+                }
+
+                if (target.Condition.Operator == ComparisonOp.Like)
+                {
+                    if (!string.IsNullOrWhiteSpace(target.Condition.LikePattern))
+                    {
+                        hints.Add(SqlLikePattern.GenerateMatchingValue(
+                            target.Condition.LikePattern,
+                            targetColumn,
+                            target.Condition.LikeEscape));
+                    }
+
+                    continue;
                 }
 
                 foreach (var expression in EnumerateHintExpressions(target.Condition.RightExpression, targetColumn, tableAlias))
@@ -3647,7 +3695,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     var patternValue = condition.RightExpression != null
                         ? EvaluateScalarExpression(condition.RightExpression, candidate, scenario, query, currentRow, column, tableAlias, dynamicValue, aliasMap)
                         : condition.LikePattern;
-                    truth = EvaluateLike(leftValue?.ToString() ?? string.Empty, patternValue?.ToString() ?? string.Empty);
+                    truth = EvaluateLike(leftValue?.ToString() ?? string.Empty, patternValue?.ToString() ?? string.Empty, condition.LikeEscape);
                     if (condition.IsNegated)
                     {
                         truth = !truth;
@@ -3915,7 +3963,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     var patternValue = condition.RightExpression != null
                         ? EvaluateScalarExpression(condition.RightExpression, candidate, scenario, query, currentRow, targetColumn, tableAlias, dynamicValue, aliasMap)
                         : condition.LikePattern;
-                    var truth = EvaluateLike(leftValue?.ToString() ?? string.Empty, patternValue?.ToString() ?? string.Empty);
+                    var truth = EvaluateLike(leftValue?.ToString() ?? string.Empty, patternValue?.ToString() ?? string.Empty, condition.LikeEscape);
                     return condition.IsNegated ? !truth : truth;
                 }
 
@@ -4741,7 +4789,7 @@ namespace SqlTestDataGenerator.DataGeneration
                                   CompareScalarValues(candidate, upper, col) <= 0;
                     return condition.IsNegated ? !between : between;
                 case ComparisonOp.Like:
-                    var like = EvaluateLike(candidate?.ToString() ?? string.Empty, condition.LikePattern);
+                    var like = EvaluateLike(candidate?.ToString() ?? string.Empty, condition.LikePattern, condition.LikeEscape);
                     return condition.IsNegated ? !like : like;
                 default:
                     var rightValue = condition.IsColumnComparison || comparisonValue != null
@@ -4761,16 +4809,9 @@ namespace SqlTestDataGenerator.DataGeneration
             }
         }
 
-        private static bool EvaluateLike(string input, string pattern)
+        private static bool EvaluateLike(string input, string pattern, string? escape)
         {
-            var regexPattern = "^" + System.Text.RegularExpressions.Regex.Escape(pattern)
-                .Replace("%", ".*")
-                .Replace("_", ".") + "$";
-
-            return System.Text.RegularExpressions.Regex.IsMatch(
-                input,
-                regexPattern,
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            return SqlLikePattern.IsMatch(input, pattern, escape);
         }
 
         private static int CompareScalarValues(object? left, object? right, ColumnSchema col)
@@ -4859,17 +4900,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 return false;
             }
 
-            var subquery = query.Subqueries.FirstOrDefault(s =>
-                s.Operator == SubqueryOperator.ScalarComparison &&
-                (string.IsNullOrWhiteSpace(condition.RightExpression?.Text) ||
-                 NormalizeSqlSnippet(s.SubquerySql).Equals(
-                     NormalizeSqlSnippet(condition.RightExpression.Text),
-                     StringComparison.OrdinalIgnoreCase) ||
-                 NormalizeSqlSnippet($"({s.SubquerySql})").Equals(
-                     NormalizeSqlSnippet(condition.RightExpression.Text),
-                     StringComparison.OrdinalIgnoreCase)));
-
-            if (subquery == null)
+            if (!TryFindScalarComparisonSubquery(query, condition, out _))
                 return false;
 
             value = column.TypeCategory switch
@@ -4883,6 +4914,32 @@ namespace SqlTestDataGenerator.DataGeneration
             };
 
             return value != null;
+        }
+
+        private static bool TryFindScalarComparisonSubquery(
+            ParsedQuery query,
+            ConditionInfo condition,
+            out SubqueryInfo subquery)
+        {
+            subquery = null!;
+            if (!IsScalarSubqueryPlaceholder(condition.RightExpression?.Text) &&
+                !IsScalarSubqueryPlaceholder(condition.Value))
+            {
+                return false;
+            }
+
+            var normalizedConditionSubquery = condition.RightExpression?.Text;
+            subquery = query.Subqueries.FirstOrDefault(s =>
+                s.Operator == SubqueryOperator.ScalarComparison &&
+                (string.IsNullOrWhiteSpace(normalizedConditionSubquery) ||
+                 NormalizeSqlSnippet(s.SubquerySql).Equals(
+                     NormalizeSqlSnippet(normalizedConditionSubquery),
+                     StringComparison.OrdinalIgnoreCase) ||
+                 NormalizeSqlSnippet($"({s.SubquerySql})").Equals(
+                     NormalizeSqlSnippet(normalizedConditionSubquery),
+                     StringComparison.OrdinalIgnoreCase)))!;
+
+            return subquery != null;
         }
 
         private static bool IsScalarSubqueryPlaceholder(object? value) =>
@@ -4913,6 +4970,37 @@ namespace SqlTestDataGenerator.DataGeneration
             return scenario.PredicateTruthMap.TryGetValue(condition.Key, out var desiredTruth)
                 ? desiredTruth
                 : defaultTruth;
+        }
+
+        private static bool TryGetDesiredTruthForCondition(
+            BranchScenario scenario,
+            ConditionInfo condition,
+            bool defaultTruth,
+            out bool desiredTruth)
+        {
+            return TryGetDesiredTruthFromAssignments(
+                scenario.PredicateTruthMap,
+                condition,
+                defaultTruth,
+                out desiredTruth);
+        }
+
+        private static bool TryGetDesiredTruthFromAssignments(
+            IReadOnlyDictionary<string, bool>? truthMap,
+            ConditionInfo condition,
+            bool defaultTruth,
+            out bool desiredTruth)
+        {
+            if (truthMap != null &&
+                truthMap.TryGetValue(condition.Key, out desiredTruth))
+            {
+                return true;
+            }
+
+            desiredTruth = defaultTruth;
+            return truthMap == null ||
+                   truthMap.Count == 0 ||
+                   string.IsNullOrWhiteSpace(condition.Key);
         }
 
         private static ConditionInfo? FindConditionByKey(ParsedQuery query, string key)
@@ -5024,7 +5112,8 @@ namespace SqlTestDataGenerator.DataGeneration
             return query.PredicateScopes
                 .SelectMany(s => s.Conditions)
                 .Any(condition =>
-                    GetDesiredTruthForCondition(scenario, condition, defaultTruth: true) &&
+                    TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth) &&
+                    desiredTruth &&
                     IsConditionTargetingColumn(query, condition, tableAlias, columnName));
         }
 
@@ -5037,7 +5126,8 @@ namespace SqlTestDataGenerator.DataGeneration
             return query.PredicateScopes
                 .SelectMany(s => s.Conditions)
                 .Any(condition =>
-                    GetDesiredTruthForCondition(scenario, condition, defaultTruth: true) &&
+                    TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth) &&
+                    desiredTruth &&
                     IsConditionTargetingColumn(query, condition, tableAlias, columnName) &&
                     condition.Operator is
                         ComparisonOp.Equal or
@@ -5046,6 +5136,931 @@ namespace SqlTestDataGenerator.DataGeneration
                         ComparisonOp.LessThan or
                         ComparisonOp.LessThanOrEqual or
                         ComparisonOp.Like);
+        }
+
+        private void ApplyScenarioScalarAggregateComparisonAdjustments(
+            ParsedQuery query,
+            BranchScenario scenario,
+            Dictionary<string, TableSchema> schemas)
+        {
+            if (scenario.Type != ScenarioType.Positive)
+                return;
+
+            foreach (var condition in query.PredicateScopes.SelectMany(s => s.Conditions))
+            {
+                if (!TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth) ||
+                    !desiredTruth)
+                {
+                    continue;
+                }
+
+                if (!TryBuildScalarAverageComparisonTarget(query, condition, schemas, out var target))
+                    continue;
+
+                ApplyScalarAverageComparisonTarget(query, scenario, target);
+            }
+        }
+
+        private bool TryBuildScalarAverageComparisonTarget(
+            ParsedQuery query,
+            ConditionInfo condition,
+            Dictionary<string, TableSchema> schemas,
+            out ScalarAverageComparisonTarget target)
+        {
+            target = null!;
+
+            if (condition.Operator is not (
+                    ComparisonOp.GreaterThan or
+                    ComparisonOp.GreaterThanOrEqual or
+                    ComparisonOp.LessThan or
+                    ComparisonOp.LessThanOrEqual or
+                    ComparisonOp.NotEqual) ||
+                string.IsNullOrWhiteSpace(condition.ColumnName) ||
+                !TryFindScalarComparisonSubquery(query, condition, out var subquery) ||
+                !subquery.SubquerySql.Contains("AVG", StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrWhiteSpace(subquery.SelectColumn))
+            {
+                return false;
+            }
+
+            var targetAlias = ResolveConditionTargetAlias(condition);
+            if (!TryResolveTableForColumn(query, schemas, targetAlias, condition.ColumnName, out var targetTableName) ||
+                !schemas.TryGetValue(targetTableName, out var targetSchema))
+            {
+                return false;
+            }
+
+            targetAlias = string.IsNullOrWhiteSpace(targetAlias) ? targetTableName : targetAlias;
+            var targetColumn = targetSchema.GetColumn(condition.ColumnName);
+            var targetComputedPlan = targetColumn != null &&
+                                     TryBuildComputedProductColumnPlan(targetSchema, targetColumn, out var resolvedTargetPlan)
+                ? resolvedTargetPlan
+                : null;
+            if (targetColumn == null ||
+                (!CanAdjustScalarAggregateColumn(targetSchema, targetColumn) && targetComputedPlan == null))
+            {
+                return false;
+            }
+
+            if (!TryResolveSubquerySelectTable(subquery, out var aggregateTableName, out var aggregateAlias) ||
+                !schemas.TryGetValue(aggregateTableName, out var aggregateSchema))
+            {
+                return false;
+            }
+
+            var aggregateColumn = aggregateSchema.GetColumn(subquery.SelectColumn);
+            var aggregateComputedPlan = aggregateColumn != null &&
+                                        TryBuildComputedProductColumnPlan(aggregateSchema, aggregateColumn, out var resolvedAggregatePlan)
+                ? resolvedAggregatePlan
+                : null;
+            if (aggregateColumn == null ||
+                (!CanAdjustScalarAggregateColumn(aggregateSchema, aggregateColumn) && aggregateComputedPlan == null))
+            {
+                return false;
+            }
+
+            var targetShouldBeHigher = condition.Operator is
+                ComparisonOp.GreaterThan or
+                ComparisonOp.GreaterThanOrEqual or
+                ComparisonOp.NotEqual;
+
+            target = new ScalarAverageComparisonTarget(
+                condition,
+                subquery,
+                targetTableName,
+                targetAlias,
+                targetSchema,
+                targetColumn,
+                aggregateTableName,
+                aggregateAlias,
+                aggregateSchema,
+                aggregateColumn,
+                targetComputedPlan,
+                aggregateComputedPlan,
+                targetShouldBeHigher);
+            return true;
+        }
+
+        private void ApplyScalarAverageComparisonTarget(
+            ParsedQuery query,
+            BranchScenario scenario,
+            ScalarAverageComparisonTarget target)
+        {
+            if (!scenario.TableRows.TryGetValue(target.TargetTableName, out var targetRows) ||
+                targetRows.Count == 0 ||
+                !scenario.TableRows.TryGetValue(target.AggregateTableName, out var aggregateRows) ||
+                aggregateRows.Count == 0)
+            {
+                return;
+            }
+
+            var sameTable = target.TargetTableName.Equals(target.AggregateTableName, StringComparison.OrdinalIgnoreCase);
+            var sameColumn = target.TargetColumn.ColumnName.Equals(target.AggregateColumn.ColumnName, StringComparison.OrdinalIgnoreCase);
+            if (sameTable && sameColumn && aggregateRows.Count < 2)
+                return;
+
+            if (target.TargetComputedPlan != null || target.AggregateComputedPlan != null)
+            {
+                ApplyComputedScalarAverageComparisonTarget(query, scenario, target, targetRows, aggregateRows, sameTable, sameColumn);
+                return;
+            }
+
+            var targetRow = targetRows.FirstOrDefault(r => r.GetValue(target.TargetColumn.ColumnName) != null) ??
+                            targetRows[0];
+
+            if (!TryBuildScalarAverageValuePair(
+                    query,
+                    scenario,
+                    target,
+                    targetRow,
+                    out var targetValue,
+                    out var targetDecimal,
+                    out var supportValue,
+                    out var supportDecimal))
+            {
+                return;
+            }
+
+            var relationSatisfied = target.TargetShouldBeHigher
+                ? targetDecimal > supportDecimal
+                : targetDecimal < supportDecimal;
+            if (!relationSatisfied)
+                return;
+
+            if (sameTable && sameColumn)
+            {
+                foreach (var row in aggregateRows)
+                {
+                    row.SetValue(
+                        target.AggregateColumn.ColumnName,
+                        ReferenceEquals(row, targetRow) ? targetValue : supportValue);
+                }
+
+                return;
+            }
+
+            targetRow.SetValue(target.TargetColumn.ColumnName, targetValue);
+            foreach (var row in aggregateRows)
+            {
+                row.SetValue(target.AggregateColumn.ColumnName, supportValue);
+            }
+        }
+
+        private void ApplyComputedScalarAverageComparisonTarget(
+            ParsedQuery query,
+            BranchScenario scenario,
+            ScalarAverageComparisonTarget target,
+            List<GeneratedRow> targetRows,
+            List<GeneratedRow> aggregateRows,
+            bool sameTable,
+            bool sameColumn)
+        {
+            if (target.TargetComputedPlan == null ||
+                target.AggregateComputedPlan == null ||
+                !sameTable ||
+                !sameColumn)
+            {
+                return;
+            }
+
+            var targetRow = targetRows[0];
+            if (!TryBuildComputedScalarAverageValuePair(
+                    query,
+                    scenario,
+                    target,
+                    target.TargetComputedPlan,
+                    out var targetAnchorValue,
+                    out var targetAdjustValue,
+                    out var targetComputedValue,
+                    out var targetComputedDecimal,
+                    out var supportAnchorValue,
+                    out var supportAdjustValue,
+                    out var supportComputedValue,
+                    out var supportComputedDecimal))
+            {
+                return;
+            }
+
+            var relationSatisfied = target.TargetShouldBeHigher
+                ? targetComputedDecimal > supportComputedDecimal
+                : targetComputedDecimal < supportComputedDecimal;
+            if (!relationSatisfied)
+                return;
+
+            foreach (var row in aggregateRows)
+            {
+                var isTargetRow = ReferenceEquals(row, targetRow);
+                row.SetValue(
+                    target.TargetComputedPlan.AnchorColumn.ColumnName,
+                    isTargetRow ? targetAnchorValue : supportAnchorValue);
+                row.SetValue(
+                    target.TargetComputedPlan.AdjustableColumn.ColumnName,
+                    isTargetRow ? targetAdjustValue : supportAdjustValue);
+
+                // Virtual value for validation/preview; SQL Server recomputes it on insert.
+                row.SetValue(
+                    target.TargetComputedPlan.ResultColumn.ColumnName,
+                    isTargetRow ? targetComputedValue : supportComputedValue);
+            }
+        }
+
+        private bool TryBuildComputedScalarAverageValuePair(
+            ParsedQuery query,
+            BranchScenario scenario,
+            ScalarAverageComparisonTarget target,
+            ComputedProductColumnPlan plan,
+            out object? targetAnchorValue,
+            out object? targetAdjustValue,
+            out object? targetComputedValue,
+            out decimal targetComputedDecimal,
+            out object? supportAnchorValue,
+            out object? supportAdjustValue,
+            out object? supportComputedValue,
+            out decimal supportComputedDecimal)
+        {
+            targetAnchorValue = null;
+            targetAdjustValue = null;
+            targetComputedValue = null;
+            targetComputedDecimal = 0m;
+            supportAnchorValue = null;
+            supportAdjustValue = null;
+            supportComputedValue = null;
+            supportComputedDecimal = 0m;
+
+            var anchorCandidates = BuildPositiveNumericColumnCandidates(
+                    query,
+                    scenario,
+                    target.TargetTableName,
+                    target.TargetAlias,
+                    plan.AnchorColumn)
+                .Where(v => v > 0m)
+                .ToList();
+            var adjustCandidates = BuildPositiveNumericColumnCandidates(
+                    query,
+                    scenario,
+                    target.TargetTableName,
+                    target.TargetAlias,
+                    plan.AdjustableColumn)
+                .ToList();
+
+            foreach (var anchorCandidate in anchorCandidates)
+            {
+                if (!TryNormalizeNumericCandidate(plan.AnchorColumn, anchorCandidate, out var normalizedAnchor, out var anchorDecimal) ||
+                    anchorDecimal <= 0m ||
+                    !SatisfiesPositiveColumnConstraints(query, scenario, target.TargetTableName, target.TargetAlias, plan.AnchorColumn, normalizedAnchor))
+                {
+                    continue;
+                }
+
+                var orderedTargetAdjustCandidates = target.TargetShouldBeHigher
+                    ? adjustCandidates.OrderByDescending(v => v)
+                    : adjustCandidates.OrderBy(v => v);
+                var orderedSupportAdjustCandidates = target.TargetShouldBeHigher
+                    ? adjustCandidates.OrderBy(v => v)
+                    : adjustCandidates.OrderByDescending(v => v);
+
+                foreach (var rawTargetAdjust in orderedTargetAdjustCandidates)
+                {
+                    if (!TryNormalizeNumericCandidate(plan.AdjustableColumn, rawTargetAdjust, out var normalizedTargetAdjust, out var targetAdjustDecimal) ||
+                        !SatisfiesPositiveColumnConstraints(query, scenario, target.TargetTableName, target.TargetAlias, plan.AdjustableColumn, normalizedTargetAdjust))
+                    {
+                        continue;
+                    }
+
+                    foreach (var rawSupportAdjust in orderedSupportAdjustCandidates)
+                    {
+                        if (!TryNormalizeNumericCandidate(plan.AdjustableColumn, rawSupportAdjust, out var normalizedSupportAdjust, out var supportAdjustDecimal) ||
+                            !SatisfiesPositiveColumnConstraints(query, scenario, target.TargetTableName, target.TargetAlias, plan.AdjustableColumn, normalizedSupportAdjust))
+                        {
+                            continue;
+                        }
+
+                        var targetComputedRaw = anchorDecimal * targetAdjustDecimal;
+                        var supportComputedRaw = anchorDecimal * supportAdjustDecimal;
+                        if (!TryNormalizeNumericCandidate(plan.ResultColumn, targetComputedRaw, out var normalizedTargetComputed, out var normalizedTargetComputedDecimal) ||
+                            !TryNormalizeNumericCandidate(plan.ResultColumn, supportComputedRaw, out var normalizedSupportComputed, out var normalizedSupportComputedDecimal))
+                        {
+                            continue;
+                        }
+
+                        var relationSatisfied = target.TargetShouldBeHigher
+                            ? normalizedTargetComputedDecimal > normalizedSupportComputedDecimal
+                            : normalizedTargetComputedDecimal < normalizedSupportComputedDecimal;
+                        if (!relationSatisfied)
+                            continue;
+
+                        targetAnchorValue = normalizedAnchor;
+                        targetAdjustValue = normalizedTargetAdjust;
+                        targetComputedValue = normalizedTargetComputed;
+                        targetComputedDecimal = normalizedTargetComputedDecimal;
+                        supportAnchorValue = normalizedAnchor;
+                        supportAdjustValue = normalizedSupportAdjust;
+                        supportComputedValue = normalizedSupportComputed;
+                        supportComputedDecimal = normalizedSupportComputedDecimal;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private bool TryBuildScalarAverageValuePair(
+            ParsedQuery query,
+            BranchScenario scenario,
+            ScalarAverageComparisonTarget target,
+            GeneratedRow targetRow,
+            out object? targetValue,
+            out decimal targetDecimal,
+            out object? supportValue,
+            out decimal supportDecimal)
+        {
+            targetValue = null;
+            targetDecimal = 0m;
+            supportValue = null;
+            supportDecimal = 0m;
+
+            foreach (var rawTarget in BuildScalarAverageTargetCandidates(query, scenario, target, targetRow))
+            {
+                if (!TryNormalizeNumericCandidate(target.TargetColumn, rawTarget, out var normalizedTarget, out var normalizedTargetDecimal) ||
+                    !SatisfiesScalarAverageTargetSideConstraints(query, scenario, target, normalizedTarget))
+                {
+                    continue;
+                }
+
+                foreach (var rawSupport in BuildScalarAverageSupportCandidates(target.AggregateColumn, normalizedTargetDecimal, target.TargetShouldBeHigher))
+                {
+                    if (!TryNormalizeNumericCandidate(target.AggregateColumn, rawSupport, out var normalizedSupport, out var normalizedSupportDecimal) ||
+                        !SatisfiesScalarAverageSupportSideConstraints(query, scenario, target, normalizedSupport))
+                    {
+                        continue;
+                    }
+
+                    var relationSatisfied = target.TargetShouldBeHigher
+                        ? normalizedTargetDecimal > normalizedSupportDecimal
+                        : normalizedTargetDecimal < normalizedSupportDecimal;
+                    if (!relationSatisfied)
+                        continue;
+
+                    targetValue = normalizedTarget;
+                    targetDecimal = normalizedTargetDecimal;
+                    supportValue = normalizedSupport;
+                    supportDecimal = normalizedSupportDecimal;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private IEnumerable<decimal> BuildScalarAverageTargetCandidates(
+            ParsedQuery query,
+            BranchScenario scenario,
+            ScalarAverageComparisonTarget target,
+            GeneratedRow targetRow)
+        {
+            var candidates = new List<decimal>();
+            var step = GetNumericRangeStep(target.TargetColumn);
+            if (TryConvertDecimal(targetRow.GetValue(target.TargetColumn.ColumnName), out var currentValue))
+            {
+                candidates.Add(currentValue);
+            }
+
+            var bounds = GetPositiveNumericBounds(
+                query,
+                scenario,
+                target.TargetTableName,
+                target.TargetAlias,
+                target.TargetColumn,
+                target.Condition.Key);
+
+            candidates.AddRange(bounds.DiscreteValues);
+
+            if (target.TargetShouldBeHigher)
+            {
+                if (bounds.Upper.HasValue)
+                    candidates.Add(bounds.Upper.Value);
+                if (bounds.Lower.HasValue)
+                    candidates.Add(bounds.Lower.Value + (step * 10m));
+                candidates.AddRange(new[] { 20m, 100m, 1000m, 15050000m });
+            }
+            else
+            {
+                if (bounds.Lower.HasValue)
+                    candidates.Add(bounds.Lower.Value);
+                if (bounds.Upper.HasValue)
+                    candidates.Add(bounds.Upper.Value - (step * 10m));
+                candidates.AddRange(new[] { 0m, 1m, 10m, 100m });
+            }
+
+            if (TryConvertDecimal(BuildMaxNumericValue(target.TargetColumn, 0, query, target.TargetAlias), out var maxValue))
+            {
+                candidates.Add(maxValue);
+            }
+
+            return DeduplicateDecimalCandidates(candidates)
+                .Where(c => IsWithinNumericBounds(c, bounds));
+        }
+
+        private static IEnumerable<decimal> BuildScalarAverageSupportCandidates(
+            ColumnSchema aggregateColumn,
+            decimal targetDecimal,
+            bool targetShouldBeHigher)
+        {
+            var step = GetNumericRangeStep(aggregateColumn);
+            var candidates = targetShouldBeHigher
+                ? new[]
+                {
+                    0m,
+                    1m,
+                    Math.Max(0m, targetDecimal / 2m),
+                    targetDecimal - step,
+                    targetDecimal - (step * 10m)
+                }
+                : new[]
+                {
+                    targetDecimal + step,
+                    targetDecimal + (step * 10m),
+                    Math.Max(100m, targetDecimal + 100m),
+                    Math.Max(1000m, targetDecimal + 1000m)
+                };
+
+            return DeduplicateDecimalCandidates(candidates);
+        }
+
+        private IEnumerable<decimal> BuildPositiveNumericColumnCandidates(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableName,
+            string tableAlias,
+            ColumnSchema column)
+        {
+            var bounds = GetPositiveNumericBounds(query, scenario, tableName, tableAlias, column, excludedConditionKey: string.Empty);
+            var step = GetNumericRangeStep(column);
+            var candidates = new List<decimal>();
+
+            candidates.AddRange(bounds.DiscreteValues);
+            if (bounds.Lower.HasValue)
+            {
+                candidates.Add(bounds.Lower.Value);
+                candidates.Add(bounds.Lower.Value + step);
+                candidates.Add(bounds.Lower.Value + (step * 100m));
+                candidates.Add(bounds.Lower.Value * 2m);
+            }
+
+            if (bounds.Upper.HasValue)
+            {
+                candidates.Add(bounds.Upper.Value);
+                candidates.Add(bounds.Upper.Value - step);
+                candidates.Add(bounds.Upper.Value - (step * 100m));
+            }
+
+            if (bounds.Lower.HasValue && bounds.Upper.HasValue && bounds.Lower.Value <= bounds.Upper.Value)
+            {
+                candidates.Add((bounds.Lower.Value + bounds.Upper.Value) / 2m);
+            }
+
+            candidates.AddRange(new[] { 1m, 2m, 5m, 10m, 100m, 1000m, 100000m, 200000m, 15050000m, 30000000m });
+
+            return DeduplicateDecimalCandidates(candidates)
+                .Where(c => IsWithinNumericBounds(c, bounds));
+        }
+
+        private NumericColumnBounds GetPositiveNumericBounds(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableName,
+            string tableAlias,
+            ColumnSchema column,
+            string excludedConditionKey)
+        {
+            var bounds = new NumericColumnBounds();
+            foreach (var condition in query.PredicateScopes.SelectMany(s => s.Conditions))
+            {
+                if (condition.Key.Equals(excludedConditionKey, StringComparison.OrdinalIgnoreCase) ||
+                    HasScalarSubqueryPlaceholder(condition) ||
+                    condition.IsNegated ||
+                    !ConditionTargetsColumn(query, condition, tableName, tableAlias, column.ColumnName) ||
+                    !TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth) ||
+                    !desiredTruth)
+                {
+                    continue;
+                }
+
+                if (condition.Operator == ComparisonOp.In)
+                {
+                    foreach (var value in condition.InValues)
+                    {
+                        if (TryConvertDecimal(value, out var inValue))
+                        {
+                            bounds.DiscreteValues.Add(inValue);
+                        }
+                    }
+                    continue;
+                }
+
+                if (condition.Operator == ComparisonOp.Between)
+                {
+                    if (TryResolveConditionNumericBoundary(condition, scenario, query, null, column, tableAlias, useSecondValue: false, out var lower))
+                    {
+                        bounds.Lower = MaxNullable(bounds.Lower, lower);
+                    }
+
+                    if (TryResolveConditionNumericBoundary(condition, scenario, query, null, column, tableAlias, useSecondValue: true, out var upper))
+                    {
+                        bounds.Upper = MinNullable(bounds.Upper, upper);
+                    }
+                    continue;
+                }
+
+                if (!TryResolveConditionNumericBoundary(condition, scenario, query, null, column, tableAlias, useSecondValue: false, out var boundary))
+                    continue;
+
+                var step = GetNumericRangeStep(column);
+                switch (condition.Operator)
+                {
+                    case ComparisonOp.Equal:
+                        bounds.Lower = MaxNullable(bounds.Lower, boundary);
+                        bounds.Upper = MinNullable(bounds.Upper, boundary);
+                        break;
+                    case ComparisonOp.GreaterThan:
+                        bounds.Lower = MaxNullable(bounds.Lower, boundary + step);
+                        break;
+                    case ComparisonOp.GreaterThanOrEqual:
+                        bounds.Lower = MaxNullable(bounds.Lower, boundary);
+                        break;
+                    case ComparisonOp.LessThan:
+                        bounds.Upper = MinNullable(bounds.Upper, boundary - step);
+                        break;
+                    case ComparisonOp.LessThanOrEqual:
+                        bounds.Upper = MinNullable(bounds.Upper, boundary);
+                        break;
+                }
+            }
+
+            return bounds;
+        }
+
+        private bool SatisfiesScalarAverageTargetSideConstraints(
+            ParsedQuery query,
+            BranchScenario scenario,
+            ScalarAverageComparisonTarget target,
+            object? value)
+        {
+            var generator = _valueFactory.GetGenerator(target.TargetColumn.TypeCategory);
+            foreach (var condition in query.PredicateScopes.SelectMany(s => s.Conditions))
+            {
+                if (condition.Key.Equals(target.Condition.Key, StringComparison.OrdinalIgnoreCase) ||
+                    HasScalarSubqueryPlaceholder(condition) ||
+                    !ConditionTargetsColumn(query, condition, target.TargetTableName, target.TargetAlias, target.TargetColumn.ColumnName) ||
+                    !TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth) ||
+                    !desiredTruth)
+                {
+                    continue;
+                }
+
+                var conditionTarget = new ColumnConditionTarget(condition, desiredTruth);
+                if (!EvaluateConditionTarget(value, conditionTarget, scenario, query, target.TargetColumn, generator, target.TargetAlias, currentRow: null))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private bool SatisfiesScalarAverageSupportSideConstraints(
+            ParsedQuery query,
+            BranchScenario scenario,
+            ScalarAverageComparisonTarget target,
+            object? value)
+        {
+            var localAliasMap = ExtendAliasMap(
+                new Dictionary<string, string>(query.AliasToTableMap, StringComparer.OrdinalIgnoreCase),
+                target.Subquery.Tables);
+            var internalTruthMap = BuildSubqueryInternalTruthMap(target.Subquery, predicateTruth: true);
+            var generator = _valueFactory.GetGenerator(target.AggregateColumn.TypeCategory);
+
+            foreach (var condition in target.Subquery.Conditions.Where(c =>
+                         ConditionTargetsColumn(localAliasMap, c, target.AggregateTableName, target.AggregateAlias, target.AggregateColumn.ColumnName)))
+            {
+                if (!TryGetDesiredTruthFromAssignments(internalTruthMap, condition, defaultTruth: true, out var desiredTruth) ||
+                    !desiredTruth)
+                {
+                    continue;
+                }
+
+                object? comparisonValue = null;
+                if (condition.IsColumnComparison)
+                {
+                    TryResolveSubqueryComparisonValue(
+                        scenario,
+                        query,
+                        condition,
+                        new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase),
+                        localAliasMap,
+                        out comparisonValue);
+                }
+
+                var conditionTarget = new ColumnConditionTarget(condition, desiredTruth, comparisonValue, localAliasMap);
+                if (!EvaluateConditionTarget(value, conditionTarget, scenario, query, target.AggregateColumn, generator, target.AggregateAlias, currentRow: null))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private bool SatisfiesPositiveColumnConstraints(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableName,
+            string tableAlias,
+            ColumnSchema column,
+            object? value)
+        {
+            var generator = _valueFactory.GetGenerator(column.TypeCategory);
+            foreach (var condition in query.PredicateScopes.SelectMany(s => s.Conditions))
+            {
+                if (HasScalarSubqueryPlaceholder(condition) ||
+                    !ConditionTargetsColumn(query, condition, tableName, tableAlias, column.ColumnName) ||
+                    !TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth) ||
+                    !desiredTruth)
+                {
+                    continue;
+                }
+
+                var conditionTarget = new ColumnConditionTarget(condition, desiredTruth);
+                if (!EvaluateConditionTarget(value, conditionTarget, scenario, query, column, generator, tableAlias, currentRow: null))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool TryNormalizeNumericCandidate(
+            ColumnSchema column,
+            decimal rawValue,
+            out object? normalizedValue,
+            out decimal normalizedDecimal)
+        {
+            normalizedValue = SqlServerValueNormalizer.NormalizeValue(column, rawValue) ?? rawValue;
+            return TryConvertDecimal(normalizedValue, out normalizedDecimal);
+        }
+
+        private static IEnumerable<decimal> DeduplicateDecimalCandidates(IEnumerable<decimal> candidates)
+        {
+            var seen = new HashSet<decimal>();
+            foreach (var candidate in candidates)
+            {
+                if (seen.Add(candidate))
+                    yield return candidate;
+            }
+        }
+
+        private static bool IsWithinNumericBounds(decimal candidate, NumericColumnBounds bounds)
+        {
+            if (bounds.Lower.HasValue && candidate < bounds.Lower.Value)
+                return false;
+            if (bounds.Upper.HasValue && candidate > bounds.Upper.Value)
+                return false;
+            if (bounds.DiscreteValues.Count > 0 && !bounds.DiscreteValues.Any(v => v == candidate))
+                return false;
+            return true;
+        }
+
+        private static bool HasScalarSubqueryPlaceholder(ConditionInfo condition) =>
+            IsScalarSubqueryPlaceholder(condition.RightExpression?.Text) ||
+            IsScalarSubqueryPlaceholder(condition.Value);
+
+        private static bool TryBuildComputedProductColumnPlan(
+            TableSchema schema,
+            ColumnSchema column,
+            out ComputedProductColumnPlan plan)
+        {
+            plan = null!;
+            if (!column.IsComputed ||
+                column.TypeCategory is not (DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float))
+            {
+                return false;
+            }
+
+            var referencedColumns = ExtractComputedExpressionColumnNames(column.ComputedExpression, schema)
+                .Where(c => !c.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Select(schema.GetColumn)
+                .Where(c => c != null &&
+                            !c.IsComputed &&
+                            c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float)
+                .Cast<ColumnSchema>()
+                .ToList();
+
+            if (referencedColumns.Count == 0 &&
+                column.ColumnName.Contains("LineTotal", StringComparison.OrdinalIgnoreCase))
+            {
+                var quantity = schema.Columns.FirstOrDefault(c =>
+                    !c.IsComputed &&
+                    c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
+                    c.ColumnName.Contains("Quantity", StringComparison.OrdinalIgnoreCase));
+                var price = schema.Columns.FirstOrDefault(c =>
+                    !c.IsComputed &&
+                    c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
+                    (c.ColumnName.Contains("Price", StringComparison.OrdinalIgnoreCase) ||
+                     c.ColumnName.Contains("Amount", StringComparison.OrdinalIgnoreCase)));
+
+                if (quantity != null && price != null)
+                {
+                    referencedColumns.Add(quantity);
+                    referencedColumns.Add(price);
+                }
+            }
+
+            if (referencedColumns.Count != 2 ||
+                (!string.IsNullOrWhiteSpace(column.ComputedExpression) &&
+                 !column.ComputedExpression.Contains('*', StringComparison.Ordinal)))
+            {
+                return false;
+            }
+
+            var adjustable = referencedColumns.FirstOrDefault(c => IsMeasureLikeNumericColumn(c)) ??
+                             referencedColumns.FirstOrDefault(c => c.ColumnName.Contains("Price", StringComparison.OrdinalIgnoreCase)) ??
+                             referencedColumns[1];
+            var anchor = referencedColumns.First(c => !c.ColumnName.Equals(adjustable.ColumnName, StringComparison.OrdinalIgnoreCase));
+            plan = new ComputedProductColumnPlan(column, anchor, adjustable);
+            return true;
+        }
+
+        private static IEnumerable<string> ExtractComputedExpressionColumnNames(string expression, TableSchema schema)
+        {
+            if (string.IsNullOrWhiteSpace(expression))
+                yield break;
+
+            var knownColumns = schema.Columns
+                .Select(c => c.ColumnName)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var regex = new System.Text.RegularExpressions.Regex(
+                @"\[(?<bracket>[^\]]+)\]|\b(?<bare>[A-Za-z_][A-Za-z0-9_]*)\b",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            foreach (System.Text.RegularExpressions.Match match in regex.Matches(expression))
+            {
+                var name = match.Groups["bracket"].Success
+                    ? match.Groups["bracket"].Value
+                    : match.Groups["bare"].Value;
+                if (knownColumns.Contains(name))
+                {
+                    yield return name;
+                }
+            }
+        }
+
+        private static bool CanAdjustScalarAggregateColumn(TableSchema schema, ColumnSchema column)
+        {
+            if (column.IsComputed ||
+                column.IsIdentity ||
+                column.IsPrimaryKey ||
+                schema.PrimaryKey?.Columns.Any(c => c.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)) == true ||
+                schema.ForeignKeys.Any(fk => fk.ColumnName.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)))
+            {
+                return false;
+            }
+
+            return column.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float;
+        }
+
+        private static string ResolveConditionTargetAlias(ConditionInfo condition)
+        {
+            if (!string.IsNullOrWhiteSpace(condition.TableAlias))
+                return condition.TableAlias;
+
+            return condition.ReferencedColumns
+                .FirstOrDefault(r => !r.IsRightSide)
+                ?.TableAlias ?? string.Empty;
+        }
+
+        private static bool TryResolveTableForColumn(
+            ParsedQuery query,
+            Dictionary<string, TableSchema> schemas,
+            string tableAlias,
+            string columnName,
+            out string tableName)
+        {
+            tableName = string.Empty;
+            if (!string.IsNullOrWhiteSpace(tableAlias))
+            {
+                tableName = query.ResolveAlias(tableAlias);
+                return schemas.ContainsKey(tableName);
+            }
+
+            var matches = schemas.Values
+                .Where(s => s.GetColumn(columnName) != null)
+                .Select(s => s.TableName)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (matches.Count != 1)
+                return false;
+
+            tableName = matches[0];
+            return true;
+        }
+
+        private static bool TryResolveSubquerySelectTable(
+            SubqueryInfo subquery,
+            out string tableName,
+            out string tableAlias)
+        {
+            tableName = string.Empty;
+            tableAlias = string.Empty;
+
+            if (!string.IsNullOrWhiteSpace(subquery.SelectTableAlias))
+            {
+                var table = subquery.Tables.FirstOrDefault(t =>
+                    t.EffectiveName.Equals(subquery.SelectTableAlias, StringComparison.OrdinalIgnoreCase) ||
+                    t.TableName.Equals(subquery.SelectTableAlias, StringComparison.OrdinalIgnoreCase));
+                if (table != null)
+                {
+                    tableName = table.TableName;
+                    tableAlias = table.EffectiveName;
+                    return true;
+                }
+            }
+
+            if (subquery.Tables.Count == 1)
+            {
+                var table = subquery.Tables[0];
+                tableName = table.TableName;
+                tableAlias = table.EffectiveName;
+                return true;
+            }
+
+            return false;
+        }
+
+        private sealed class ScalarAverageComparisonTarget
+        {
+            public ScalarAverageComparisonTarget(
+                ConditionInfo condition,
+                SubqueryInfo subquery,
+                string targetTableName,
+                string targetAlias,
+                TableSchema targetSchema,
+                ColumnSchema targetColumn,
+                string aggregateTableName,
+                string aggregateAlias,
+                TableSchema aggregateSchema,
+                ColumnSchema aggregateColumn,
+                ComputedProductColumnPlan? targetComputedPlan,
+                ComputedProductColumnPlan? aggregateComputedPlan,
+                bool targetShouldBeHigher)
+            {
+                Condition = condition;
+                Subquery = subquery;
+                TargetTableName = targetTableName;
+                TargetAlias = targetAlias;
+                TargetSchema = targetSchema;
+                TargetColumn = targetColumn;
+                AggregateTableName = aggregateTableName;
+                AggregateAlias = aggregateAlias;
+                AggregateSchema = aggregateSchema;
+                AggregateColumn = aggregateColumn;
+                TargetComputedPlan = targetComputedPlan;
+                AggregateComputedPlan = aggregateComputedPlan;
+                TargetShouldBeHigher = targetShouldBeHigher;
+            }
+
+            public ConditionInfo Condition { get; }
+            public SubqueryInfo Subquery { get; }
+            public string TargetTableName { get; }
+            public string TargetAlias { get; }
+            public TableSchema TargetSchema { get; }
+            public ColumnSchema TargetColumn { get; }
+            public string AggregateTableName { get; }
+            public string AggregateAlias { get; }
+            public TableSchema AggregateSchema { get; }
+            public ColumnSchema AggregateColumn { get; }
+            public ComputedProductColumnPlan? TargetComputedPlan { get; }
+            public ComputedProductColumnPlan? AggregateComputedPlan { get; }
+            public bool TargetShouldBeHigher { get; }
+        }
+
+        private sealed class ComputedProductColumnPlan
+        {
+            public ComputedProductColumnPlan(
+                ColumnSchema resultColumn,
+                ColumnSchema anchorColumn,
+                ColumnSchema adjustableColumn)
+            {
+                ResultColumn = resultColumn;
+                AnchorColumn = anchorColumn;
+                AdjustableColumn = adjustableColumn;
+            }
+
+            public ColumnSchema ResultColumn { get; }
+            public ColumnSchema AnchorColumn { get; }
+            public ColumnSchema AdjustableColumn { get; }
+        }
+
+        private sealed class NumericColumnBounds
+        {
+            public decimal? Lower { get; set; }
+            public decimal? Upper { get; set; }
+            public List<decimal> DiscreteValues { get; } = new();
         }
 
         private static string BuildJoinScenarioKey(JoinInfo join)
@@ -5348,28 +6363,27 @@ namespace SqlTestDataGenerator.DataGeneration
                     return null;
             }
 
-            var conditionTargets = subquery.Conditions
-                .Where(c => ConditionTargetsColumn(aliasToTableMap, c, schema.TableName, tableAlias, column.ColumnName))
-                .Select(c =>
-                {
-                    object? comparisonValue = null;
-                    if (c.IsColumnComparison)
-                    {
-                        TryResolveSubqueryComparisonValue(
-                            scenario,
-                            query,
-                            c,
-                            tableRowIds,
-                            aliasToTableMap,
-                            out comparisonValue);
-                    }
+            var conditionTargets = new List<ColumnConditionTarget>();
+            foreach (var condition in subquery.Conditions.Where(c =>
+                         ConditionTargetsColumn(aliasToTableMap, c, schema.TableName, tableAlias, column.ColumnName)))
+            {
+                if (!TryGetDesiredTruthFromAssignments(internalTruthMap, condition, defaultTruth: true, out var desiredTruth))
+                    continue;
 
-                    var desiredTruth = internalTruthMap.TryGetValue(c.Key, out var mappedTruth)
-                        ? mappedTruth
-                        : true;
-                    return new ColumnConditionTarget(c, desiredTruth, comparisonValue);
-                })
-                .ToList();
+                object? comparisonValue = null;
+                if (condition.IsColumnComparison)
+                {
+                    TryResolveSubqueryComparisonValue(
+                        scenario,
+                        query,
+                        condition,
+                        tableRowIds,
+                        aliasToTableMap,
+                        out comparisonValue);
+                }
+
+                conditionTargets.Add(new ColumnConditionTarget(condition, desiredTruth, comparisonValue));
+            }
 
             var globalSubqueryTargets = FindApplicableSubqueryConditionTargets(
                 scenario,
@@ -5668,9 +6682,12 @@ namespace SqlTestDataGenerator.DataGeneration
                 {
                     if (ColumnComparisonTargetsTable(condition, query.AliasToTableMap, tableName))
                     {
+                        if (!TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth))
+                            continue;
+
                         yield return new RowColumnComparisonTarget(
                             condition,
-                            GetDesiredTruthForCondition(scenario, condition, defaultTruth: true));
+                            desiredTruth);
                     }
                 }
             }
@@ -5706,9 +6723,9 @@ namespace SqlTestDataGenerator.DataGeneration
                     if (!ColumnComparisonTargetsTable(condition, localAliasMap, tableName))
                         continue;
 
-                    var desiredTruth = internalTruthMap.TryGetValue(condition.Key, out var mappedTruth)
-                        ? mappedTruth
-                        : true;
+                    if (!TryGetDesiredTruthFromAssignments(internalTruthMap, condition, defaultTruth: true, out var desiredTruth))
+                        continue;
+
                     yield return new RowColumnComparisonTarget(condition, desiredTruth);
                 }
 

@@ -560,6 +560,7 @@ namespace SqlTestDataGenerator.Parsing
                 condition.Value,
                 condition.SecondValue,
                 condition.LikePattern,
+                condition.LikeEscape,
                 condition.RightTableAlias,
                 condition.RightColumnName,
                 condition.AggregateFunc?.ToString() ?? string.Empty,

@@ -262,8 +262,9 @@ namespace SqlTestDataGenerator.Schema
         private void DetectComputedColumns(SqlConnection conn, string tableName, string schemaName, TableSchema schema)
         {
             var sql = @"
-                SELECT c.name
+                SELECT c.name, cc.definition
                 FROM sys.columns c
+                JOIN sys.computed_columns cc ON c.object_id = cc.object_id AND c.column_id = cc.column_id
                 JOIN sys.tables t ON c.object_id = t.object_id
                 JOIN sys.schemas s ON t.schema_id = s.schema_id
                 WHERE t.name = @TableName
@@ -279,7 +280,11 @@ namespace SqlTestDataGenerator.Schema
             {
                 var colName = reader.GetString(0);
                 var col = schema.GetColumn(colName);
-                if (col != null) col.IsComputed = true;
+                if (col != null)
+                {
+                    col.IsComputed = true;
+                    col.ComputedExpression = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
+                }
             }
         }
     }

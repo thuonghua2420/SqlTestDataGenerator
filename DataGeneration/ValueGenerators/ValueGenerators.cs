@@ -1,4 +1,5 @@
 using SqlTestDataGenerator.Schema.Models;
+using SqlTestDataGenerator.DataGeneration;
 
 namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
 {
@@ -324,7 +325,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
             {
                 "=" => value,
                 "<>" or "!=" => value + "_alt",
-                "LIKE" => GenerateFromLikePattern(value, column),
+                "LIKE" => SqlLikePattern.GenerateMatchingValue(value, column),
                 _ => value
             };
         }
@@ -336,7 +337,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
             {
                 "=" => value + "_different",
                 "<>" or "!=" => value,
-                "LIKE" => "ZZZZZ_nomatch",
+                "LIKE" => SqlLikePattern.GenerateNonMatchingValue(value, column),
                 _ => "NoMatch"
             };
             if (raw.Length <= maxLen)
@@ -348,20 +349,6 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
         public object GenerateFromLiteral(string literal, ColumnSchema column)
         {
             return literal;
-        }
-
-        /// <summary>
-        /// Generate a string that matches a LIKE pattern.
-        /// % = any chars, _ = single char
-        /// </summary>
-        private string GenerateFromLikePattern(string pattern, ColumnSchema column)
-        {
-            // Simple pattern matching
-            var result = pattern
-                .Replace("%", "Test")
-                .Replace("_", "X");
-            var maxLen = NormalizeMaxLength(column.MaxLength);
-            return result.Length > maxLen ? result[..maxLen] : result;
         }
 
         private static int NormalizeMaxLength(int? maxLength)

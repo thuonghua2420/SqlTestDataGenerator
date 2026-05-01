@@ -265,6 +265,9 @@ namespace SqlTestDataGenerator.Parsing
             CollectReferencedColumns(node.FirstExpression, condition, isRightSide: false);
             CollectReferencedColumns(node.SecondExpression, condition, isRightSide: true);
             condition.LikePattern = ExtractLiteralValue(node.SecondExpression);
+            condition.LikeEscape = node.EscapeExpression == null
+                ? string.Empty
+                : ExtractLiteralValue(node.EscapeExpression);
             condition.Value = condition.LikePattern;
             return condition;
         }
