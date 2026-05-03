@@ -5493,14 +5493,16 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             var targetAlias = ResolveConditionTargetAlias(condition);
-            if (!TryResolveTableForColumn(query, schemas, targetAlias, condition.ColumnName, out var targetTableName) ||
+            var targetColumnName = condition.ColumnName;
+            ResolveDerivedColumnReference(query, ref targetAlias, ref targetColumnName);
+            if (!TryResolveTableForColumn(query, schemas, targetAlias, targetColumnName, out var targetTableName) ||
                 !schemas.TryGetValue(targetTableName, out var targetSchema))
             {
                 return false;
             }
 
             targetAlias = string.IsNullOrWhiteSpace(targetAlias) ? targetTableName : targetAlias;
-            var targetColumn = targetSchema.GetColumn(condition.ColumnName);
+            var targetColumn = targetSchema.GetColumn(targetColumnName);
             var targetComputedPlan = targetColumn != null &&
                                      TryBuildComputedProductColumnPlan(targetSchema, targetColumn, out var resolvedTargetPlan)
                 ? resolvedTargetPlan
@@ -5511,13 +5513,13 @@ namespace SqlTestDataGenerator.DataGeneration
                 return false;
             }
 
-            if (!TryResolveSubquerySelectTable(subquery, out var aggregateTableName, out var aggregateAlias) ||
+            if (!TryResolveSubquerySelectColumn(query, schemas, subquery, out var aggregateTableName, out var aggregateAlias, out var aggregateColumnName) ||
                 !schemas.TryGetValue(aggregateTableName, out var aggregateSchema))
             {
                 return false;
             }
 
-            var aggregateColumn = aggregateSchema.GetColumn(subquery.SelectColumn);
+            var aggregateColumn = aggregateSchema.GetColumn(aggregateColumnName);
             var aggregateComputedPlan = aggregateColumn != null &&
                                         TryBuildComputedProductColumnPlan(aggregateSchema, aggregateColumn, out var resolvedAggregatePlan)
                 ? resolvedAggregatePlan
@@ -6306,23 +6308,73 @@ namespace SqlTestDataGenerator.DataGeneration
             return true;
         }
 
-        private static bool TryResolveSubquerySelectTable(
+        private static void ResolveDerivedColumnReference(
+            ParsedQuery query,
+            ref string tableAlias,
+            ref string columnName)
+        {
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            while (!string.IsNullOrWhiteSpace(tableAlias) &&
+                   !string.IsNullOrWhiteSpace(columnName) &&
+                   seen.Add($"{tableAlias}|{columnName}") &&
+                   query.TryResolveDerivedColumn(tableAlias, columnName, out var binding))
+            {
+                tableAlias = binding.SourceAlias;
+                columnName = binding.SourceColumn;
+            }
+
+            if (!string.IsNullOrWhiteSpace(tableAlias) ||
+                string.IsNullOrWhiteSpace(columnName))
+            {
+                return;
+            }
+
+            var unresolvedColumnName = columnName;
+            var matches = query.DerivedColumnMappings.Values
+                .SelectMany(c => c.Values)
+                .Where(binding => binding.OutputColumn.Equals(unresolvedColumnName, StringComparison.OrdinalIgnoreCase) &&
+                                  !string.IsNullOrWhiteSpace(binding.SourceColumn))
+                .Select(binding => new { binding.SourceAlias, binding.SourceColumn })
+                .DistinctBy(binding => $"{binding.SourceAlias}\u001F{binding.SourceColumn}", StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (matches.Count == 1)
+            {
+                tableAlias = matches[0].SourceAlias;
+                columnName = matches[0].SourceColumn;
+            }
+        }
+
+        private static bool TryResolveSubquerySelectColumn(
+            ParsedQuery query,
+            Dictionary<string, TableSchema> schemas,
             SubqueryInfo subquery,
             out string tableName,
-            out string tableAlias)
+            out string tableAlias,
+            out string columnName)
         {
             tableName = string.Empty;
             tableAlias = string.Empty;
+            columnName = subquery.SelectColumn;
+            var selectAlias = subquery.SelectTableAlias;
+            ResolveDerivedColumnReference(query, ref selectAlias, ref columnName);
 
-            if (!string.IsNullOrWhiteSpace(subquery.SelectTableAlias))
+            if (!string.IsNullOrWhiteSpace(selectAlias))
             {
                 var table = subquery.Tables.FirstOrDefault(t =>
-                    t.EffectiveName.Equals(subquery.SelectTableAlias, StringComparison.OrdinalIgnoreCase) ||
-                    t.TableName.Equals(subquery.SelectTableAlias, StringComparison.OrdinalIgnoreCase));
+                    t.EffectiveName.Equals(selectAlias, StringComparison.OrdinalIgnoreCase) ||
+                    t.TableName.Equals(selectAlias, StringComparison.OrdinalIgnoreCase));
                 if (table != null)
                 {
                     tableName = table.TableName;
                     tableAlias = table.EffectiveName;
+                    return true;
+                }
+
+                if (TryResolveTableForColumn(query, schemas, selectAlias, columnName, out tableName))
+                {
+                    tableAlias = selectAlias;
                     return true;
                 }
             }
@@ -6330,8 +6382,26 @@ namespace SqlTestDataGenerator.DataGeneration
             if (subquery.Tables.Count == 1)
             {
                 var table = subquery.Tables[0];
-                tableName = table.TableName;
-                tableAlias = table.EffectiveName;
+                if (schemas.TryGetValue(table.TableName, out var schema) &&
+                    schema.GetColumn(columnName) != null)
+                {
+                    tableName = table.TableName;
+                    tableAlias = table.EffectiveName;
+                    return true;
+                }
+            }
+
+            var resolvedColumnName = columnName;
+            var matches = subquery.Tables
+                .Where(t => schemas.TryGetValue(t.TableName, out var schema) &&
+                            schema.GetColumn(resolvedColumnName) != null)
+                .DistinctBy(t => t.TableName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (matches.Count == 1)
+            {
+                tableName = matches[0].TableName;
+                tableAlias = matches[0].EffectiveName;
                 return true;
             }
 
