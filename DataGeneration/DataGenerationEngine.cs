@@ -377,9 +377,13 @@ namespace SqlTestDataGenerator.DataGeneration
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+            var omittedTables = BuildOmittedTablesForNegativeScenario(scenario, query, schemas);
 
             foreach (var tableName in insertOrder)
             {
+                if (omittedTables.Contains(tableName))
+                    continue;
+
                 var schema = schemas.GetValueOrDefault(tableName);
                 if (schema == null) continue;
 
@@ -592,9 +596,13 @@ namespace SqlTestDataGenerator.DataGeneration
             var tableRowIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referenceableTableIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             var referencedTableIdPools = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+            var omittedTables = BuildOmittedTablesForNegativeScenario(scenario, query, schemas);
 
             foreach (var tableName in insertOrder)
             {
+                if (omittedTables.Contains(tableName))
+                    continue;
+
                 var schema = schemas.GetValueOrDefault(tableName);
                 if (schema == null) continue;
 
@@ -633,6 +641,141 @@ namespace SqlTestDataGenerator.DataGeneration
         }
 
         // ─── Boundary: values at exact boundary ────────────────────────
+        private HashSet<string> BuildOmittedTablesForNegativeScenario(
+            BranchScenario scenario,
+            ParsedQuery query,
+            Dictionary<string, TableSchema> schemas)
+        {
+            var omitted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var condition in query.EnumerateScopeConditions(ConditionSource.JoinOn))
+            {
+                if (!scenario.PredicateTruthMap.TryGetValue(condition.Key, out var desiredTruth) ||
+                    desiredTruth)
+                {
+                    continue;
+                }
+
+                if (TryResolveChildTableForColumnComparison(condition, query.AliasToTableMap, schemas, out var childTable))
+                {
+                    AddTableAndDependentsToOmit(childTable, schemas, omitted);
+                }
+            }
+
+            foreach (var subquery in query.Subqueries)
+            {
+                AddOmittedTablesForNegativeSubqueryScenario(subquery, scenario, query, schemas, omitted);
+            }
+
+            return omitted;
+        }
+
+        private void AddOmittedTablesForNegativeSubqueryScenario(
+            SubqueryInfo subquery,
+            BranchScenario scenario,
+            ParsedQuery query,
+            Dictionary<string, TableSchema> schemas,
+            HashSet<string> omitted)
+        {
+            if (!string.IsNullOrWhiteSpace(subquery.PredicateConditionKey) &&
+                scenario.PredicateTruthMap.TryGetValue(subquery.PredicateConditionKey, out var predicateTruth) &&
+                !predicateTruth &&
+                subquery.Operator == SubqueryOperator.Exists)
+            {
+                var localAliasMap = ExtendAliasMap(
+                    new Dictionary<string, string>(query.AliasToTableMap, StringComparer.OrdinalIgnoreCase),
+                    subquery.Tables);
+
+                foreach (var condition in subquery.Conditions.Where(c => c.IsColumnComparison))
+                {
+                    if (TryResolveChildTableForColumnComparison(condition, localAliasMap, schemas, out var childTable))
+                    {
+                        AddTableAndDependentsToOmit(childTable, schemas, omitted);
+                    }
+                }
+            }
+
+            foreach (var nested in subquery.NestedSubqueries)
+            {
+                AddOmittedTablesForNegativeSubqueryScenario(nested, scenario, query, schemas, omitted);
+            }
+        }
+
+        private static bool TryResolveChildTableForColumnComparison(
+            ConditionInfo condition,
+            IReadOnlyDictionary<string, string> aliasMap,
+            Dictionary<string, TableSchema> schemas,
+            out string childTable)
+        {
+            childTable = string.Empty;
+            if (!condition.IsColumnComparison ||
+                string.IsNullOrWhiteSpace(condition.TableAlias) ||
+                string.IsNullOrWhiteSpace(condition.ColumnName) ||
+                string.IsNullOrWhiteSpace(condition.RightTableAlias) ||
+                string.IsNullOrWhiteSpace(condition.RightColumnName))
+            {
+                return false;
+            }
+
+            var leftTable = ResolveAliasFromMap(aliasMap, condition.TableAlias);
+            var rightTable = ResolveAliasFromMap(aliasMap, condition.RightTableAlias);
+            if (string.IsNullOrWhiteSpace(leftTable) || string.IsNullOrWhiteSpace(rightTable))
+                return false;
+
+            if (IsForeignKeyReference(schemas, leftTable, condition.ColumnName, rightTable, condition.RightColumnName))
+            {
+                childTable = leftTable;
+                return true;
+            }
+
+            if (IsForeignKeyReference(schemas, rightTable, condition.RightColumnName, leftTable, condition.ColumnName))
+            {
+                childTable = rightTable;
+                return true;
+            }
+
+            childTable = rightTable;
+            return schemas.ContainsKey(childTable);
+        }
+
+        private static string ResolveAliasFromMap(IReadOnlyDictionary<string, string> aliasMap, string aliasOrTable)
+        {
+            return aliasMap.TryGetValue(aliasOrTable, out var tableName)
+                ? tableName
+                : aliasOrTable;
+        }
+
+        private static bool IsForeignKeyReference(
+            Dictionary<string, TableSchema> schemas,
+            string childTable,
+            string childColumn,
+            string parentTable,
+            string parentColumn)
+        {
+            return schemas.TryGetValue(childTable, out var schema) &&
+                   schema.ForeignKeys.Any(fk =>
+                       fk.ColumnName.Equals(childColumn, StringComparison.OrdinalIgnoreCase) &&
+                       fk.ReferencedTable.Equals(parentTable, StringComparison.OrdinalIgnoreCase) &&
+                       fk.ReferencedColumn.Equals(parentColumn, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static void AddTableAndDependentsToOmit(
+            string tableName,
+            Dictionary<string, TableSchema> schemas,
+            HashSet<string> omitted)
+        {
+            if (!omitted.Add(tableName))
+                return;
+
+            foreach (var dependent in schemas.Values)
+            {
+                if (dependent.ForeignKeys.Any(fk => fk.ReferencedTable.Equals(tableName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    AddTableAndDependentsToOmit(dependent.TableName, schemas, omitted);
+                }
+            }
+        }
+
         private void GenerateBoundaryData(
             BranchScenario scenario, ParsedQuery query,
             Dictionary<string, TableSchema> schemas, List<string> insertOrder, Dictionary<string, int> nextTableIds,
@@ -2648,6 +2791,20 @@ namespace SqlTestDataGenerator.DataGeneration
                 if (targets.All(target => EvaluateConditionTarget(candidate, target, scenario, query, col, generator, tableAlias, currentRow)))
                 {
                     return new ResolvedColumnValue(true, candidate);
+                }
+            }
+
+            var falsifyingTargets = targets
+                .Where(target => !target.DesiredTruth)
+                .ToList();
+            if (falsifyingTargets.Count > 0)
+            {
+                foreach (var candidate in DeduplicateCandidates(candidates))
+                {
+                    if (falsifyingTargets.All(target => EvaluateConditionTarget(candidate, target, scenario, query, col, generator, tableAlias, currentRow)))
+                    {
+                        return new ResolvedColumnValue(true, candidate);
+                    }
                 }
             }
 
@@ -5143,18 +5300,19 @@ namespace SqlTestDataGenerator.DataGeneration
             BranchScenario scenario,
             Dictionary<string, TableSchema> schemas)
         {
-            if (scenario.Type != ScenarioType.Positive)
-                return;
-
             foreach (var condition in query.PredicateScopes.SelectMany(s => s.Conditions))
             {
-                if (!TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth) ||
-                    !desiredTruth)
+                if (!TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth))
                 {
                     continue;
                 }
 
-                if (!TryBuildScalarAverageComparisonTarget(query, condition, schemas, out var target))
+                if (!scenario.ExpectedToReturnRows && desiredTruth)
+                {
+                    continue;
+                }
+
+                if (!TryBuildScalarAverageComparisonTarget(query, condition, desiredTruth, schemas, out var target))
                     continue;
 
                 ApplyScalarAverageComparisonTarget(query, scenario, target);
@@ -5164,6 +5322,7 @@ namespace SqlTestDataGenerator.DataGeneration
         private bool TryBuildScalarAverageComparisonTarget(
             ParsedQuery query,
             ConditionInfo condition,
+            bool desiredTruth,
             Dictionary<string, TableSchema> schemas,
             out ScalarAverageComparisonTarget target)
         {
@@ -5219,10 +5378,10 @@ namespace SqlTestDataGenerator.DataGeneration
                 return false;
             }
 
-            var targetShouldBeHigher = condition.Operator is
-                ComparisonOp.GreaterThan or
-                ComparisonOp.GreaterThanOrEqual or
-                ComparisonOp.NotEqual;
+            if (!TryResolveScalarAverageTargetOrdering(condition.Operator, desiredTruth, out var targetShouldBeHigher))
+            {
+                return false;
+            }
 
             target = new ScalarAverageComparisonTarget(
                 condition,
@@ -5237,8 +5396,36 @@ namespace SqlTestDataGenerator.DataGeneration
                 aggregateColumn,
                 targetComputedPlan,
                 aggregateComputedPlan,
+                desiredTruth,
                 targetShouldBeHigher);
             return true;
+        }
+
+        private static bool TryResolveScalarAverageTargetOrdering(
+            ComparisonOp op,
+            bool desiredTruth,
+            out bool targetShouldBeHigher)
+        {
+            targetShouldBeHigher = true;
+            switch (op)
+            {
+                case ComparisonOp.GreaterThan:
+                case ComparisonOp.GreaterThanOrEqual:
+                    targetShouldBeHigher = desiredTruth;
+                    return true;
+
+                case ComparisonOp.LessThan:
+                case ComparisonOp.LessThanOrEqual:
+                    targetShouldBeHigher = !desiredTruth;
+                    return true;
+
+                case ComparisonOp.NotEqual:
+                    targetShouldBeHigher = true;
+                    return desiredTruth;
+
+                default:
+                    return false;
+            }
         }
 
         private void ApplyScalarAverageComparisonTarget(
@@ -5289,11 +5476,12 @@ namespace SqlTestDataGenerator.DataGeneration
 
             if (sameTable && sameColumn)
             {
+                var useUniformFalseValue = ShouldUseUniformFalseScalarAverageValue(target);
                 foreach (var row in aggregateRows)
                 {
                     row.SetValue(
                         target.AggregateColumn.ColumnName,
-                        ReferenceEquals(row, targetRow) ? targetValue : supportValue);
+                        ReferenceEquals(row, targetRow) || useUniformFalseValue ? targetValue : supportValue);
                 }
 
                 return;
@@ -5347,21 +5535,28 @@ namespace SqlTestDataGenerator.DataGeneration
             if (!relationSatisfied)
                 return;
 
+            var useUniformFalseValue = ShouldUseUniformFalseScalarAverageValue(target);
             foreach (var row in aggregateRows)
             {
                 var isTargetRow = ReferenceEquals(row, targetRow);
                 row.SetValue(
                     target.TargetComputedPlan.AnchorColumn.ColumnName,
-                    isTargetRow ? targetAnchorValue : supportAnchorValue);
+                    isTargetRow || useUniformFalseValue ? targetAnchorValue : supportAnchorValue);
                 row.SetValue(
                     target.TargetComputedPlan.AdjustableColumn.ColumnName,
-                    isTargetRow ? targetAdjustValue : supportAdjustValue);
+                    isTargetRow || useUniformFalseValue ? targetAdjustValue : supportAdjustValue);
 
                 // Virtual value for validation/preview; SQL Server recomputes it on insert.
                 row.SetValue(
                     target.TargetComputedPlan.ResultColumn.ColumnName,
-                    isTargetRow ? targetComputedValue : supportComputedValue);
+                    isTargetRow || useUniformFalseValue ? targetComputedValue : supportComputedValue);
             }
+        }
+
+        private static bool ShouldUseUniformFalseScalarAverageValue(ScalarAverageComparisonTarget target)
+        {
+            return !target.DesiredTruth &&
+                   target.Condition.Operator is ComparisonOp.GreaterThan or ComparisonOp.LessThan;
         }
 
         private bool TryBuildComputedScalarAverageValuePair(
@@ -6007,6 +6202,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 ColumnSchema aggregateColumn,
                 ComputedProductColumnPlan? targetComputedPlan,
                 ComputedProductColumnPlan? aggregateComputedPlan,
+                bool desiredTruth,
                 bool targetShouldBeHigher)
             {
                 Condition = condition;
@@ -6021,6 +6217,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 AggregateColumn = aggregateColumn;
                 TargetComputedPlan = targetComputedPlan;
                 AggregateComputedPlan = aggregateComputedPlan;
+                DesiredTruth = desiredTruth;
                 TargetShouldBeHigher = targetShouldBeHigher;
             }
 
@@ -6036,6 +6233,7 @@ namespace SqlTestDataGenerator.DataGeneration
             public ColumnSchema AggregateColumn { get; }
             public ComputedProductColumnPlan? TargetComputedPlan { get; }
             public ComputedProductColumnPlan? AggregateComputedPlan { get; }
+            public bool DesiredTruth { get; }
             public bool TargetShouldBeHigher { get; }
         }
 

@@ -87,7 +87,7 @@ namespace SqlTestDataGenerator.Output
                 if (!scenario.TableRows.TryGetValue(tableName, out var rows) || !rows.Any())
                     continue;
 
-                var validRows = rows.Where(r => r.ColumnValues.Any()).ToList();
+                var validRows = FilterInsertableRows(tableName, rows);
                 if (!validRows.Any())
                     continue;
 
@@ -122,7 +122,7 @@ namespace SqlTestDataGenerator.Output
                 if (scenario.InsertOrder.Contains(kvp.Key, StringComparer.OrdinalIgnoreCase))
                     continue;
 
-                var validRows = kvp.Value.Where(r => r.ColumnValues.Any()).ToList();
+                var validRows = FilterInsertableRows(kvp.Key, kvp.Value);
                 if (!validRows.Any())
                     continue;
 
@@ -213,6 +213,45 @@ namespace SqlTestDataGenerator.Output
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
             return rows.Any(r => r.ColumnValues.Keys.Any(identityColumns.Contains));
+        }
+
+        private List<GeneratedRow> FilterInsertableRows(string tableName, IEnumerable<GeneratedRow> rows)
+        {
+            var result = new List<GeneratedRow>();
+            TableSchema? schema = null;
+            Schemas?.TryGetValue(tableName, out schema);
+
+            foreach (var row in rows)
+            {
+                var filtered = new GeneratedRow { TableName = row.TableName };
+
+                if (schema == null)
+                {
+                    foreach (var kvp in row.ColumnValues)
+                    {
+                        filtered.SetValue(kvp.Key, kvp.Value);
+                    }
+                }
+                else
+                {
+                    foreach (var column in schema.Columns
+                                 .Where(c => !c.IsComputed)
+                                 .OrderBy(c => c.OrdinalPosition))
+                    {
+                        if (row.ColumnValues.TryGetValue(column.ColumnName, out var value))
+                        {
+                            filtered.SetValue(column.ColumnName, value);
+                        }
+                    }
+                }
+
+                if (filtered.ColumnValues.Any())
+                {
+                    result.Add(filtered);
+                }
+            }
+
+            return result;
         }
 
         private List<string> GetIdentityTablesWithGeneratedValues(BranchScenario scenario)

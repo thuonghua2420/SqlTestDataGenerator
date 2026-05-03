@@ -26,6 +26,7 @@ namespace SqlTestDataGenerator.UI
         private readonly GeneratedDataDbExecutor _dbExecutor = new();
         private readonly TableCsvExporter _csvExporter = new();
         private readonly TableCsvFolderImporter _csvImporter = new();
+        private readonly ConnectionProfileCache _connectionProfileCache = new();
         private TableKeySeedResolver? _tableKeySeedResolver;
         private TableSampleExtractor? _tableSampleExtractor;
         private DatabaseConnectionManager? _connectionManager;
@@ -96,6 +97,7 @@ namespace SqlTestDataGenerator.UI
         {
             InitializeComponent();
             ApplyTheme();
+            Shown += MainForm_Shown;
             LogInfo("Application started.");
         }
 
@@ -1236,38 +1238,55 @@ namespace SqlTestDataGenerator.UI
             _exportFolderInput.Width = Math.Max(220, _browseExportFolderBtn.Left - inputLeft - 10);
         }
 
+        private async void MainForm_Shown(object? sender, EventArgs e)
+        {
+            Shown -= MainForm_Shown;
+
+            if (!_connectionProfileCache.TryLoad(out var profile, out var message))
+            {
+                if (!string.IsNullOrWhiteSpace(message))
+                {
+                    LogWarn(message);
+                }
+
+                return;
+            }
+
+            SetStatus("Auto-connecting to cached database...");
+            LogInfo($"Auto-connecting to cached database {profile.Server}/{profile.Database}.");
+            var success = await ConnectToDatabaseAsync(
+                profile,
+                cacheOnSuccess: false,
+                showErrorDialog: false,
+                sourceLabel: "cached database");
+
+            if (!success)
+            {
+                SetStatus("Cached database auto-login failed. Please connect manually.");
+            }
+        }
+
         private async void ConnectBtn_Click(object? sender, EventArgs e)
         {
-            using var form = new ConnectionForm();
-            if (form.ShowDialog(this) == DialogResult.OK)
-            {
-                _connectionManager = new DatabaseConnectionManager();
-                var (success, message) = await _connectionManager.ConnectAsync(
-                    form.ServerName, form.DatabaseName,
-                    form.Username, form.Password,
-                    form.UseWindowsAuth);
+            _connectionProfileCache.TryLoad(out var cachedProfile, out _);
+            using var form = new ConnectionForm(cachedProfile);
+            if (form.ShowDialog(this) != DialogResult.OK)
+                return;
 
-                if (success)
-                {
-                    _schemaIntrospector = new SchemaIntrospector(() => _connectionManager.CreateNewConnection());
-                    _tableKeySeedResolver = new TableKeySeedResolver(() => _connectionManager.CreateNewConnection());
-                    _tableSampleExtractor = new TableSampleExtractor(() => _connectionManager.CreateNewConnection());
-                    _baselineSampleRows.Clear();
-                    ClearLastInsertedTables();
-                    _connectionStatusLabel.Text = $"● Connected: {form.ServerName}/{form.DatabaseName}";
-                    _connectionStatusLabel.ForeColor = Color.Green;
-                    _connectBtn.Visible = false;
-                    _disconnectBtn.Visible = true;
-                    SetStatus("Database connected successfully.");
-                    LogInfo($"Connected to database {form.ServerName}/{form.DatabaseName}.");
-                    UpdateDbInsertButtonState();
-                }
-                else
-                {
-                    LogError(message);
-                    MessageBox.Show(message, "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                }
-            }
+            var profile = new ConnectionProfile
+            {
+                Server = form.ServerName,
+                Database = form.DatabaseName,
+                Username = form.Username,
+                Password = form.Password,
+                UseWindowsAuth = form.UseWindowsAuth
+            };
+
+            await ConnectToDatabaseAsync(
+                profile,
+                cacheOnSuccess: true,
+                showErrorDialog: true,
+                sourceLabel: "database");
         }
 
         private void DisconnectBtn_Click(object? sender, EventArgs e)
@@ -1277,6 +1296,7 @@ namespace SqlTestDataGenerator.UI
             _schemaIntrospector = null;
             _tableKeySeedResolver = null;
             _tableSampleExtractor = null;
+            _connectionProfileCache.Clear();
             _baselineSampleRows.Clear();
             _currentDataSetIsGenerated = false;
             ClearLastInsertedTables();
@@ -1287,6 +1307,63 @@ namespace SqlTestDataGenerator.UI
             SetStatus("Disconnected.");
             LogInfo("Disconnected from database.");
             UpdateDbInsertButtonState();
+        }
+
+        private async Task<bool> ConnectToDatabaseAsync(
+            ConnectionProfile profile,
+            bool cacheOnSuccess,
+            bool showErrorDialog,
+            string sourceLabel)
+        {
+            var connectionManager = new DatabaseConnectionManager();
+            var (success, message) = await connectionManager.ConnectAsync(
+                profile.Server,
+                profile.Database,
+                profile.Username,
+                profile.Password,
+                profile.UseWindowsAuth);
+
+            if (!success)
+            {
+                connectionManager.Dispose();
+                LogError(message);
+                if (showErrorDialog)
+                {
+                    MessageBox.Show(message, "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+
+                return false;
+            }
+
+            _connectionManager?.Dispose();
+            _connectionManager = connectionManager;
+            _schemaIntrospector = new SchemaIntrospector(() => _connectionManager.CreateNewConnection());
+            _tableKeySeedResolver = new TableKeySeedResolver(() => _connectionManager.CreateNewConnection());
+            _tableSampleExtractor = new TableSampleExtractor(() => _connectionManager.CreateNewConnection());
+            _baselineSampleRows.Clear();
+            ClearLastInsertedTables();
+            _connectionStatusLabel.Text = $"● Connected: {profile.Server}/{profile.Database}";
+            _connectionStatusLabel.ForeColor = Color.Green;
+            _connectBtn.Visible = false;
+            _disconnectBtn.Visible = true;
+            SetStatus("Database connected successfully.");
+            LogInfo($"Connected to {sourceLabel} {profile.Server}/{profile.Database}.");
+
+            if (cacheOnSuccess)
+            {
+                try
+                {
+                    _connectionProfileCache.Save(profile);
+                    LogInfo("Cached database login profile for next startup.");
+                }
+                catch (Exception ex)
+                {
+                    LogWarn($"Connected, but failed to cache login profile: {ex.Message}");
+                }
+            }
+
+            UpdateDbInsertButtonState();
+            return true;
         }
 
         private void AnalyzeBtn_Click(object? sender, EventArgs e)

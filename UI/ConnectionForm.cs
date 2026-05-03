@@ -5,6 +5,8 @@ namespace SqlTestDataGenerator.UI
     /// </summary>
     public class ConnectionForm : Form
     {
+        private readonly Database.ConnectionProfile? _initialProfile;
+
         public string ServerName { get; private set; } = "";
         public string DatabaseName { get; private set; } = "";
         public string Username { get; private set; } = "";
@@ -30,8 +32,15 @@ namespace SqlTestDataGenerator.UI
         private readonly Color _textSecondary = SystemColors.GrayText;
 
         public ConnectionForm()
+            : this(null)
         {
+        }
+
+        public ConnectionForm(Database.ConnectionProfile? initialProfile)
+        {
+            _initialProfile = initialProfile;
             InitializeComponent();
+            ApplyInitialProfile();
         }
 
         private void InitializeComponent()
@@ -134,6 +143,20 @@ namespace SqlTestDataGenerator.UI
             bool sqlAuth = _sqlAuthRadio.Checked;
             _usernameInput.Enabled = sqlAuth;
             _passwordInput.Enabled = sqlAuth;
+        }
+
+        private void ApplyInitialProfile()
+        {
+            if (_initialProfile == null)
+                return;
+
+            _serverInput.Text = _initialProfile.Server;
+            _databaseInput.Text = _initialProfile.Database;
+            _winAuthRadio.Checked = _initialProfile.UseWindowsAuth;
+            _sqlAuthRadio.Checked = !_initialProfile.UseWindowsAuth;
+            _usernameInput.Text = _initialProfile.Username;
+            _passwordInput.Text = _initialProfile.Password;
+            AuthRadio_CheckedChanged(this, EventArgs.Empty);
         }
 
         private async void TestBtn_Click(object? sender, EventArgs e)

@@ -31,6 +31,9 @@ namespace SqlTestDataGenerator.DataGeneration
                 foreach (var assignment in falseAssignments)
                 {
                     var mergedTruthMap = MergeTruthMaps(positiveTruthMap, assignment);
+                    if (!IsFeasibleTruthMap(mergedTruthMap, conditionByKey))
+                        continue;
+
                     var scenarioType = ClassifyNegativeScenario(scope, assignment, conditionByKey);
                     scenarios.Add(CreateNegativeScenario(scope, scenarioType, assignment, mergedTruthMap, conditionByKey));
                 }
@@ -281,6 +284,106 @@ namespace SqlTestDataGenerator.DataGeneration
             return merged;
         }
 
+        private static bool IsFeasibleTruthMap(
+            IReadOnlyDictionary<string, bool> truthMap,
+            IReadOnlyDictionary<string, ConditionInfo> conditionByKey)
+        {
+            var ranges = new Dictionary<string, NumericFeasibilityRange>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var (conditionKey, desiredTruth) in truthMap)
+            {
+                if (!conditionByKey.TryGetValue(conditionKey, out var condition) ||
+                    !TryBuildNumericRangeConstraint(condition, desiredTruth, out var targetKey, out var constraint))
+                {
+                    continue;
+                }
+
+                if (!ranges.TryGetValue(targetKey, out var range))
+                {
+                    range = new NumericFeasibilityRange();
+                    ranges[targetKey] = range;
+                }
+
+                range.Apply(constraint);
+                if (!range.IsFeasible)
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool TryBuildNumericRangeConstraint(
+            ConditionInfo condition,
+            bool desiredTruth,
+            out string targetKey,
+            out NumericRangeConstraint constraint)
+        {
+            targetKey = string.Empty;
+            constraint = new NumericRangeConstraint();
+
+            if (condition.HasSubquery ||
+                condition.IsColumnComparison ||
+                condition.AggregateFunc.HasValue ||
+                string.IsNullOrWhiteSpace(condition.ColumnName))
+            {
+                return false;
+            }
+
+            var effectiveTruth = condition.IsNegated ? !desiredTruth : desiredTruth;
+            if (!TryParseDecimalLiteral(condition.Value, out var value))
+                return false;
+
+            targetKey = $"{condition.TableAlias}.{condition.ColumnName}";
+            switch (condition.Operator)
+            {
+                case ComparisonOp.GreaterThan:
+                    constraint = effectiveTruth
+                        ? NumericRangeConstraint.LowerBound(value, inclusive: false)
+                        : NumericRangeConstraint.UpperBound(value, inclusive: true);
+                    return true;
+
+                case ComparisonOp.GreaterThanOrEqual:
+                    constraint = effectiveTruth
+                        ? NumericRangeConstraint.LowerBound(value, inclusive: true)
+                        : NumericRangeConstraint.UpperBound(value, inclusive: false);
+                    return true;
+
+                case ComparisonOp.LessThan:
+                    constraint = effectiveTruth
+                        ? NumericRangeConstraint.UpperBound(value, inclusive: false)
+                        : NumericRangeConstraint.LowerBound(value, inclusive: true);
+                    return true;
+
+                case ComparisonOp.LessThanOrEqual:
+                    constraint = effectiveTruth
+                        ? NumericRangeConstraint.UpperBound(value, inclusive: true)
+                        : NumericRangeConstraint.LowerBound(value, inclusive: false);
+                    return true;
+
+                case ComparisonOp.Between when effectiveTruth &&
+                                               TryParseDecimalLiteral(condition.SecondValue, out var secondValue):
+                    constraint = NumericRangeConstraint.Between(value, secondValue);
+                    return true;
+
+                default:
+                    return false;
+            }
+        }
+
+        private static bool TryParseDecimalLiteral(string? value, out decimal result)
+        {
+            result = 0m;
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            var trimmed = value.Trim().Trim('\'');
+            return decimal.TryParse(
+                trimmed,
+                System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out result);
+        }
+
         private static bool IsRangeCondition(ConditionInfo condition)
         {
             return condition.Operator is
@@ -351,6 +454,9 @@ namespace SqlTestDataGenerator.DataGeneration
                     {
                         var truthMap = MergeTruthMaps(positiveTruthMap, assignment);
                         truthMap[subquery.PredicateConditionKey] = false;
+                        if (!IsFeasibleTruthMap(truthMap, conditionByKey))
+                            continue;
+
                         scenarios.Add(CreateNegativeScenario(
                             subquery.WherePredicateScope,
                             ScenarioType.SubqueryMiss,
@@ -398,6 +504,89 @@ namespace SqlTestDataGenerator.DataGeneration
         {
             var predicateText = assignment.Condition?.ToString() ?? assignment.ConditionKey;
             return $"force {(assignment.DesiredTruth ? "TRUE" : "FALSE")}: {predicateText}";
+        }
+
+        private sealed class NumericFeasibilityRange
+        {
+            private decimal? _lower;
+            private bool _lowerInclusive = true;
+            private decimal? _upper;
+            private bool _upperInclusive = true;
+
+            public bool IsFeasible
+            {
+                get
+                {
+                    if (!_lower.HasValue || !_upper.HasValue)
+                        return true;
+                    if (_lower.Value < _upper.Value)
+                        return true;
+                    if (_lower.Value > _upper.Value)
+                        return false;
+                    return _lowerInclusive && _upperInclusive;
+                }
+            }
+
+            public void Apply(NumericRangeConstraint constraint)
+            {
+                if (constraint.Lower.HasValue)
+                    ApplyLower(constraint.Lower.Value, constraint.LowerInclusive);
+                if (constraint.Upper.HasValue)
+                    ApplyUpper(constraint.Upper.Value, constraint.UpperInclusive);
+            }
+
+            private void ApplyLower(decimal value, bool inclusive)
+            {
+                if (!_lower.HasValue || value > _lower.Value)
+                {
+                    _lower = value;
+                    _lowerInclusive = inclusive;
+                    return;
+                }
+
+                if (value == _lower.Value)
+                {
+                    _lowerInclusive = _lowerInclusive && inclusive;
+                }
+            }
+
+            private void ApplyUpper(decimal value, bool inclusive)
+            {
+                if (!_upper.HasValue || value < _upper.Value)
+                {
+                    _upper = value;
+                    _upperInclusive = inclusive;
+                    return;
+                }
+
+                if (value == _upper.Value)
+                {
+                    _upperInclusive = _upperInclusive && inclusive;
+                }
+            }
+        }
+
+        private readonly struct NumericRangeConstraint
+        {
+            public decimal? Lower { get; init; }
+            public bool LowerInclusive { get; init; }
+            public decimal? Upper { get; init; }
+            public bool UpperInclusive { get; init; }
+
+            public static NumericRangeConstraint LowerBound(decimal value, bool inclusive) =>
+                new() { Lower = value, LowerInclusive = inclusive };
+
+            public static NumericRangeConstraint UpperBound(decimal value, bool inclusive) =>
+                new() { Upper = value, UpperInclusive = inclusive };
+
+            public static NumericRangeConstraint Between(decimal lower, decimal upper) =>
+                new()
+                {
+                    Lower = Math.Min(lower, upper),
+                    LowerInclusive = true,
+                    Upper = Math.Max(lower, upper),
+                    UpperInclusive = true
+                };
         }
 
         private sealed record ScenarioAssignment(
