@@ -116,7 +116,7 @@ namespace SqlTestDataGenerator.Parsing
         {
             var sb = new System.Text.StringBuilder();
 
-            sb.AppendLine("═══ ANALYSIS RESULT ═══");
+            sb.AppendLine("═══ Kết quả phân tích ═══");
             sb.AppendLine();
 
             // Tables

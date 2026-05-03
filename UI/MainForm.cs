@@ -69,6 +69,7 @@ namespace SqlTestDataGenerator.UI
 
         private Panel _toolbarPanel = null!;
         private Panel _bottomToolbar = null!;
+        private TabControl _featureTabs = null!;
 
         private CheckedListBox _scenarioList = null!;
         private CheckBox _selectAllScenariosCheck = null!;
@@ -103,7 +104,7 @@ namespace SqlTestDataGenerator.UI
 
         private void InitializeComponent()
         {
-            this.Text = "SQL Test Data Generator";
+            this.Text = "Tool support UTR";
             this.Size = new Size(1400, 900);
             this.MinimumSize = new Size(1000, 700);
             this.StartPosition = FormStartPosition.CenterScreen;
@@ -124,7 +125,7 @@ namespace SqlTestDataGenerator.UI
 
             _titleLabel = new Label
             {
-                Text = "⚡ SQL Test Data Generator",
+                Text = "Tool support UTR",
                 Font = new Font("Segoe UI", 16F, FontStyle.Bold),
                 AutoSize = true,
                 Location = new Point(16, 14)
@@ -268,7 +269,7 @@ namespace SqlTestDataGenerator.UI
             var analysisPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(8) };
             var analysisLabel = new Label
             {
-                Text = "📊 Analysis Result",
+                Text = "📊 Kết quả phân tích",
                 Dock = DockStyle.Top,
                 Height = 30,
                 Font = new Font("Segoe UI Semibold", 11F),
@@ -287,7 +288,7 @@ namespace SqlTestDataGenerator.UI
 
             var scenarioLabel = new Label
             {
-                Text = "☑ Scenarios to generate:",
+                Text = "☑ Scenarios:",
                 Dock = DockStyle.Bottom,
                 Height = 22,
                 Font = new Font("Segoe UI Semibold", 9F),
@@ -471,7 +472,7 @@ namespace SqlTestDataGenerator.UI
 
             _titleLabel = new Label
             {
-                Text = "⚡ SQL Test Data Generator",
+                Text = "Tool support UTR",
                 Font = new Font("Segoe UI", 16F, FontStyle.Bold),
                 ForeColor = _textPrimary,
                 AutoSize = true,
@@ -557,6 +558,25 @@ namespace SqlTestDataGenerator.UI
                 _analyzeBtn, _generateBtn, _insertDbBtn, rowsPerTableLabel, _rowsPerTableInput, _maxLengthMaxValueCheck
             });
 
+            void CenterToolbarControls()
+            {
+                foreach (var control in new Control[]
+                {
+                    _analyzeBtn,
+                    _generateBtn,
+                    _insertDbBtn,
+                    rowsPerTableLabel,
+                    _rowsPerTableInput,
+                    _maxLengthMaxValueCheck
+                })
+                {
+                    control.Top = Math.Max(0, (_toolbarPanel.ClientSize.Height - control.Height) / 2);
+                }
+            }
+
+            CenterToolbarControls();
+            _toolbarPanel.Resize += (_, _) => CenterToolbarControls();
+
             var contentPanel = new Panel
             {
                 Dock = DockStyle.Fill,
@@ -586,7 +606,7 @@ namespace SqlTestDataGenerator.UI
                 Font = new Font("Cascadia Code, Consolas", 10F),
                 AcceptsReturn = true,
                 AcceptsTab = true,
-                PlaceholderText = "Paste or type your SQL script here..."
+                PlaceholderText = "Nhập câu SQL..."
             };
 
             _analysisOutput = new TextBox
@@ -639,10 +659,10 @@ namespace SqlTestDataGenerator.UI
             var sqlCard = CreateCard("SQL Input", _accentBlue, CreateSurface(_sqlInput, new Padding(10)));
             sqlCard.Margin = new Padding(0, 0, 12, 12);
 
-            var analysisCard = CreateCard("Analysis Result", _accentGreen, CreateSurface(_analysisOutput, new Padding(10)));
+            var analysisCard = CreateCard("Kết quả phân tích", _accentGreen, CreateSurface(_analysisOutput, new Padding(10)));
             analysisCard.Margin = new Padding(0, 0, 0, 12);
 
-            var scenarioCard = CreateCard("Scenarios to generate", _accentOrange, CreateSurface(_scenarioList, new Padding(10)), _selectAllScenariosCheck);
+            var scenarioCard = CreateCard("Scenarios", _accentOrange, CreateSurface(_scenarioList, new Padding(10)), _selectAllScenariosCheck);
             scenarioCard.Margin = new Padding(0, 0, 0, 12);
 
             var rightTopLayout = new TableLayoutPanel
@@ -737,9 +757,39 @@ namespace SqlTestDataGenerator.UI
             });
             _bottomToolbar.Resize += BottomToolbar_Resize;
 
-            Controls.Add(contentPanel);
-            Controls.Add(_bottomToolbar);
-            Controls.Add(_toolbarPanel);
+            var createDataPage = new TabPage("Create Data")
+            {
+                BackColor = SystemColors.Control,
+                Padding = new Padding(0)
+            };
+            var createDataContainer = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = SystemColors.Control,
+                Padding = new Padding(0)
+            };
+            createDataContainer.Controls.Add(contentPanel);
+            createDataContainer.Controls.Add(_bottomToolbar);
+            createDataContainer.Controls.Add(_toolbarPanel);
+            createDataPage.Controls.Add(createDataContainer);
+
+            var supportToolsPage = new TabPage("Format")
+            {
+                BackColor = SystemColors.Control,
+                Padding = new Padding(0)
+            };
+            supportToolsPage.Controls.Add(new SupportToolsPanel { Dock = DockStyle.Fill });
+
+            _featureTabs = new TabControl
+            {
+                Dock = DockStyle.Fill,
+                Font = new Font("Segoe UI", 9F),
+                Padding = new Point(16, 5)
+            };
+            _featureTabs.TabPages.Add(createDataPage);
+            _featureTabs.TabPages.Add(supportToolsPage);
+
+            Controls.Add(_featureTabs);
             Controls.Add(_headerPanel);
 
             HeaderPanel_Resize(this, EventArgs.Empty);
@@ -802,7 +852,7 @@ namespace SqlTestDataGenerator.UI
 
             _titleLabel = new Label
             {
-                Text = "SQL Test Data Generator",
+                Text = "Tool support UTR",
                 Font = new Font("Segoe UI Semibold", 18F),
                 ForeColor = _textPrimary,
                 AutoSize = true,
@@ -952,7 +1002,7 @@ namespace SqlTestDataGenerator.UI
                 Font = new Font("Cascadia Code, Consolas", 10F),
                 AcceptsReturn = true,
                 AcceptsTab = true,
-                PlaceholderText = "Paste or type your SQL script here..."
+                PlaceholderText = "Nhập câu SQL..."
             };
 
             _analysisOutput = new TextBox
@@ -1005,10 +1055,10 @@ namespace SqlTestDataGenerator.UI
             var sqlCard = CreateCard("SQL Input", _accentBlue, CreateSurface(_sqlInput, new Padding(10)));
             sqlCard.Margin = new Padding(0, 0, 12, 12);
 
-            var analysisCard = CreateCard("Analysis Result", _accentGreen, CreateSurface(_analysisOutput, new Padding(10)));
+            var analysisCard = CreateCard("Kết quả phân tích", _accentGreen, CreateSurface(_analysisOutput, new Padding(10)));
             analysisCard.Margin = new Padding(0, 0, 0, 12);
 
-            var scenarioCard = CreateCard("Scenarios to generate", _accentOrange, CreateSurface(_scenarioList, new Padding(10)), _selectAllScenariosCheck);
+            var scenarioCard = CreateCard("Scenarios", _accentOrange, CreateSurface(_scenarioList, new Padding(10)), _selectAllScenariosCheck);
             scenarioCard.Margin = new Padding(0);
 
             var rightTopLayout = new TableLayoutPanel
