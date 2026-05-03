@@ -10,13 +10,29 @@ namespace SqlTestDataGenerator.DataGeneration
 
         public static string GenerateMatchingValue(string pattern, ColumnSchema column, string? escape = null)
         {
-            var value = BuildMatchingCore(pattern, ResolveEscapeCharacter(escape));
+            var escapeChar = ResolveEscapeCharacter(escape);
+            var value = BuildMatchingCore(pattern, escapeChar, fillPercentWildcard: true);
             if (string.IsNullOrEmpty(value))
             {
                 value = DefaultFiller;
             }
 
-            return FitToColumn(value, column);
+            var fitted = FitToColumn(value, column);
+            if (IsMatch(fitted, pattern, escape))
+            {
+                return fitted;
+            }
+
+            var minimalValue = BuildMatchingCore(pattern, escapeChar, fillPercentWildcard: false);
+            if (string.IsNullOrEmpty(minimalValue))
+            {
+                minimalValue = DefaultFiller;
+            }
+
+            var minimalFitted = FitToColumn(minimalValue, column);
+            return IsMatch(minimalFitted, pattern, escape)
+                ? minimalFitted
+                : fitted;
         }
 
         public static string GenerateNonMatchingValue(string pattern, ColumnSchema column, string? escape = null)
@@ -54,7 +70,7 @@ namespace SqlTestDataGenerator.DataGeneration
             return Regex.IsMatch(input, regex, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         }
 
-        private static string BuildMatchingCore(string pattern, char? escapeChar)
+        private static string BuildMatchingCore(string pattern, char? escapeChar, bool fillPercentWildcard)
         {
             var sb = new StringBuilder();
             for (var i = 0; i < pattern.Length; i++)
@@ -69,6 +85,10 @@ namespace SqlTestDataGenerator.DataGeneration
                 switch (ch)
                 {
                     case '%':
+                        if (fillPercentWildcard)
+                        {
+                            sb.Append(DefaultFiller);
+                        }
                         break;
                     case '_':
                         sb.Append('X');
