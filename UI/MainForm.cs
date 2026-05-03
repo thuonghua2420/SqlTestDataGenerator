@@ -484,7 +484,8 @@ namespace SqlTestDataGenerator.UI
                 Text = "● Not Connected",
                 Font = new Font("Segoe UI", 9F),
                 ForeColor = _accentRed,
-                AutoSize = true
+                AutoSize = false,
+                TextAlign = ContentAlignment.MiddleLeft
             };
 
             _connectBtn = CreateLegacyButton("🔌 Connect", 90);
@@ -1269,9 +1270,36 @@ namespace SqlTestDataGenerator.UI
 
         private void HeaderPanel_Resize(object? sender, EventArgs e)
         {
-            _connectionStatusLabel.Location = new Point(_headerPanel.Width - _connectionStatusLabel.Width - 250, 18);
-            _connectBtn.Location = new Point(_headerPanel.Width - 220, 14);
-            _disconnectBtn.Location = new Point(_headerPanel.Width - 120, 14);
+            if (_headerPanel == null ||
+                _connectionStatusLabel == null ||
+                _connectBtn == null ||
+                _disconnectBtn == null)
+            {
+                return;
+            }
+
+            var activeButton = _disconnectBtn.Visible ? _disconnectBtn : _connectBtn;
+            var buttonTop = Math.Max(0, (_headerPanel.ClientSize.Height - activeButton.Height) / 2);
+            var buttonLeft = Math.Max(
+                _headerPanel.Padding.Left,
+                _headerPanel.ClientSize.Width - _headerPanel.Padding.Right - activeButton.Width);
+
+            _connectBtn.Location = new Point(buttonLeft, buttonTop);
+            _disconnectBtn.Location = new Point(buttonLeft, buttonTop);
+
+            var statusTextSize = TextRenderer.MeasureText(
+                _connectionStatusLabel.Text,
+                _connectionStatusLabel.Font,
+                new Size(int.MaxValue, activeButton.Height),
+                TextFormatFlags.NoPadding);
+            var statusWidth = Math.Min(
+                Math.Max(160, statusTextSize.Width + 4),
+                Math.Max(160, buttonLeft - _headerPanel.Padding.Left - 16));
+
+            _connectionStatusLabel.Size = new Size(statusWidth, activeButton.Height);
+            _connectionStatusLabel.Location = new Point(
+                Math.Max(_headerPanel.Padding.Left, buttonLeft - statusWidth - 14),
+                buttonTop);
         }
 
         private void BottomToolbar_Resize(object? sender, EventArgs e)
@@ -1354,6 +1382,7 @@ namespace SqlTestDataGenerator.UI
             _connectionStatusLabel.ForeColor = _accentRed;
             _connectBtn.Visible = true;
             _disconnectBtn.Visible = false;
+            HeaderPanel_Resize(_headerPanel, EventArgs.Empty);
             SetStatus("Disconnected.");
             LogInfo("Disconnected from database.");
             UpdateDbInsertButtonState();
@@ -1396,6 +1425,7 @@ namespace SqlTestDataGenerator.UI
             _connectionStatusLabel.ForeColor = Color.Green;
             _connectBtn.Visible = false;
             _disconnectBtn.Visible = true;
+            HeaderPanel_Resize(_headerPanel, EventArgs.Empty);
             SetStatus("Database connected successfully.");
             LogInfo($"Connected to {sourceLabel} {profile.Server}/{profile.Database}.");
 

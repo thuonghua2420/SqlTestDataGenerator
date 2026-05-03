@@ -100,6 +100,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 ApplyScenarioScalarAggregateComparisonAdjustments(query, workingScenario, schemas);
                 ApplyScenarioInsertSafetyAdjustments(query, workingScenario, schemas);
                 EnforceScenarioForeignKeyClosure(workingScenario, schemas);
+                ApplyScenarioJoinColumnComparisonAdjustments(query, workingScenario, schemas);
                 ValidateScenarioLocalForeignKeys(workingScenario, schemas);
                 dataSet.Scenarios.Add(workingScenario);
             }
@@ -2867,6 +2868,16 @@ namespace SqlTestDataGenerator.DataGeneration
                 return new ResolvedColumnValue(true, temporalValue);
             }
 
+            var resolvedTargets = targets
+                .Select(target => ResolveColumnConditionTargetComparisonValue(
+                    scenario,
+                    query,
+                    target,
+                    tableRowIds,
+                    rowIndex,
+                    col))
+                .ToList();
+
             var candidates = new List<object?>();
 
             AddRangeIntersectionCandidates(
@@ -2875,26 +2886,12 @@ namespace SqlTestDataGenerator.DataGeneration
                 currentRow,
                 col,
                 tableAlias,
-                targets,
+                resolvedTargets,
                 candidates);
 
-            foreach (var target in targets)
+            foreach (var target in resolvedTargets)
             {
                 var comparisonValue = target.ComparisonValue;
-                if (target.Condition.IsColumnComparison && comparisonValue == null)
-                {
-                    TryResolveSubqueryComparisonValue(
-                        scenario,
-                        query,
-                        target.Condition,
-                        tableRowIds,
-                        query.AliasToTableMap,
-                        out comparisonValue);
-                }
-                else if (comparisonValue == null)
-                {
-                    TryResolveScalarSubqueryComparisonValue(query, target.Condition, col, out comparisonValue);
-                }
 
                 candidates.Add(GenerateConditionValue(
                     scenario,
@@ -2921,13 +2918,13 @@ namespace SqlTestDataGenerator.DataGeneration
 
             foreach (var candidate in DeduplicateCandidates(candidates))
             {
-                if (targets.All(target => EvaluateConditionTarget(candidate, target, scenario, query, col, generator, tableAlias, currentRow)))
+                if (resolvedTargets.All(target => EvaluateConditionTarget(candidate, target, scenario, query, col, generator, tableAlias, currentRow)))
                 {
                     return new ResolvedColumnValue(true, candidate);
                 }
             }
 
-            var falsifyingTargets = targets
+            var falsifyingTargets = resolvedTargets
                 .Where(target => !target.DesiredTruth)
                 .ToList();
             if (falsifyingTargets.Count > 0)
@@ -2942,6 +2939,39 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             return new ResolvedColumnValue(false, null);
+        }
+
+        private ColumnConditionTarget ResolveColumnConditionTargetComparisonValue(
+            BranchScenario scenario,
+            ParsedQuery query,
+            ColumnConditionTarget target,
+            Dictionary<string, List<int>> tableRowIds,
+            int rowIndex,
+            ColumnSchema column)
+        {
+            if (target.ComparisonValue != null)
+                return target;
+
+            object? comparisonValue = null;
+            if (target.Condition.IsColumnComparison)
+            {
+                TryResolveSubqueryComparisonValue(
+                    scenario,
+                    query,
+                    target.Condition,
+                    tableRowIds,
+                    query.AliasToTableMap,
+                    out comparisonValue,
+                    rowIndex);
+            }
+            else
+            {
+                TryResolveScalarSubqueryComparisonValue(query, target.Condition, column, out comparisonValue);
+            }
+
+            return comparisonValue == null
+                ? target
+                : new ColumnConditionTarget(target.Condition, target.DesiredTruth, comparisonValue, target.SubqueryAliasMap);
         }
 
         private void AddRangeIntersectionCandidates(
@@ -6956,7 +6986,8 @@ namespace SqlTestDataGenerator.DataGeneration
             ConditionInfo condition,
             Dictionary<string, List<int>> tableRowIds,
             Dictionary<string, string> aliasToTableMap,
-            out object? value)
+            out object? value,
+            int rowIndex = 0)
         {
             value = null;
 
@@ -6969,10 +7000,10 @@ namespace SqlTestDataGenerator.DataGeneration
                     ? resolvedTable
                     : query.ResolveAlias(condition.RightTableAlias);
 
-                if (TryResolveScenarioValue(scenario, tableName, condition.RightColumnName, out value))
+                if (TryResolveRelatedColumnValue(scenario, tableName, condition.RightColumnName, rowIndex, out value))
                     return true;
 
-                if (TryResolveRelatedRowId(tableRowIds, tableName, 0, out var relatedId))
+                if (TryResolveRelatedRowId(tableRowIds, tableName, rowIndex, out var relatedId))
                 {
                     value = relatedId;
                     return true;
@@ -7088,6 +7119,121 @@ namespace SqlTestDataGenerator.DataGeneration
                     row.SetValue(leftColumn.ColumnName, adjustedLeft);
                 }
             }
+        }
+
+        private void ApplyScenarioJoinColumnComparisonAdjustments(
+            ParsedQuery query,
+            BranchScenario scenario,
+            Dictionary<string, TableSchema> schemas)
+        {
+            foreach (var condition in query.EnumerateScopeConditions(ConditionSource.JoinOn)
+                         .Where(c => c.IsColumnComparison))
+            {
+                if (!TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth) ||
+                    !desiredTruth ||
+                    string.IsNullOrWhiteSpace(condition.TableAlias) ||
+                    string.IsNullOrWhiteSpace(condition.ColumnName) ||
+                    string.IsNullOrWhiteSpace(condition.RightTableAlias) ||
+                    string.IsNullOrWhiteSpace(condition.RightColumnName))
+                {
+                    continue;
+                }
+
+                var leftTableName = query.ResolveAlias(condition.TableAlias);
+                var rightTableName = query.ResolveAlias(condition.RightTableAlias);
+                if (!schemas.TryGetValue(leftTableName, out var leftSchema) ||
+                    !schemas.TryGetValue(rightTableName, out var rightSchema) ||
+                    !scenario.TableRows.TryGetValue(leftTableName, out var leftRows) ||
+                    !scenario.TableRows.TryGetValue(rightTableName, out var rightRows) ||
+                    leftRows.Count == 0 ||
+                    rightRows.Count == 0)
+                {
+                    continue;
+                }
+
+                var leftColumn = leftSchema.GetColumn(condition.ColumnName);
+                var rightColumn = rightSchema.GetColumn(condition.RightColumnName);
+                if (leftColumn == null || rightColumn == null)
+                {
+                    continue;
+                }
+
+                var pairCount = Math.Max(leftRows.Count, rightRows.Count);
+                for (var rowIndex = 0; rowIndex < pairCount; rowIndex++)
+                {
+                    var leftRow = leftRows[Math.Min(rowIndex, leftRows.Count - 1)];
+                    var rightRow = rightRows[Math.Min(rowIndex, rightRows.Count - 1)];
+                    var leftValue = leftRow.GetValue(leftColumn.ColumnName);
+                    var rightValue = rightRow.GetValue(rightColumn.ColumnName);
+                    if (EvaluateColumnComparison(leftValue, rightValue, condition.Operator))
+                    {
+                        continue;
+                    }
+
+                    if (TryAdjustJoinComparisonLeftSide(
+                            leftSchema,
+                            leftColumn,
+                            leftRow,
+                            rightValue,
+                            condition.Operator))
+                    {
+                        continue;
+                    }
+
+                    TryAdjustJoinComparisonRightSide(
+                        rightSchema,
+                        rightColumn,
+                        rightRow,
+                        leftValue,
+                        condition.Operator);
+                }
+            }
+        }
+
+        private static bool TryAdjustJoinComparisonLeftSide(
+            TableSchema schema,
+            ColumnSchema column,
+            GeneratedRow row,
+            object? referenceValue,
+            ComparisonOp op)
+        {
+            if (!CanAdjustComparisonColumn(schema, column) ||
+                !TryBuildColumnComparisonAdjustment(
+                    column,
+                    referenceValue,
+                    op,
+                    adjustRightSide: false,
+                    desiredTruth: true,
+                    out var adjustedValue))
+            {
+                return false;
+            }
+
+            row.SetValue(column.ColumnName, adjustedValue);
+            return true;
+        }
+
+        private static bool TryAdjustJoinComparisonRightSide(
+            TableSchema schema,
+            ColumnSchema column,
+            GeneratedRow row,
+            object? referenceValue,
+            ComparisonOp op)
+        {
+            if (!CanAdjustComparisonColumn(schema, column) ||
+                !TryBuildColumnComparisonAdjustment(
+                    column,
+                    referenceValue,
+                    op,
+                    adjustRightSide: true,
+                    desiredTruth: true,
+                    out var adjustedValue))
+            {
+                return false;
+            }
+
+            row.SetValue(column.ColumnName, adjustedValue);
+            return true;
         }
 
         private IEnumerable<RowColumnComparisonTarget> EnumerateRowColumnComparisonTargets(
