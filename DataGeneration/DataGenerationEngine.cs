@@ -590,7 +590,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         {
                             value = col.TypeCategory == DataTypeCategory.Integer
                                 ? SqlServerValueNormalizer.NormalizeValue(col, GetIntegerTypeMaxValue(col)) ?? GetIntegerTypeMaxValue(col)
-                                : GenerateDefaultColumnValue(col, _valueFactory.GetGenerator(col.TypeCategory), rowIdx, query, alias);
+                                : GenerateDefaultColumnValue(col, _valueFactory.GetGenerator(col.TypeCategory), rowIdx, query, alias, tableSchema: null);
                         }
                         else
                         {
@@ -1347,7 +1347,7 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             // 5. Default value generation
-            return GenerateDefaultColumnValue(col, generator, rowIndex, query, tableAlias);
+            return GenerateDefaultColumnValue(col, generator, rowIndex, query, tableAlias, tableSchema: currentTableSchema);
         }
 
         private static bool TryResolveJoinedColumnValue(
@@ -1418,7 +1418,8 @@ namespace SqlTestDataGenerator.DataGeneration
             IValueGenerator generator,
             int rowIndex,
             ParsedQuery query,
-            string tableAlias)
+            string tableAlias,
+            TableSchema? tableSchema = null)
         {
             if (col.TypeCategory == DataTypeCategory.String &&
                 TryBuildQueryFunctionHintedString(col, rowIndex, query, out var hintedString))
@@ -1428,7 +1429,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
             if (UseMaxLengthMaxValueMode)
             {
-                var maxModeValue = GenerateMaxLengthMaxValue(col, rowIndex, query, tableAlias);
+                var maxModeValue = GenerateMaxLengthMaxValue(col, rowIndex, query, tableAlias, tableSchema);
                 if (maxModeValue != null)
                 {
                     return maxModeValue;
@@ -1523,16 +1524,55 @@ namespace SqlTestDataGenerator.DataGeneration
             return row.TryGetValue(column.ColumnName, out sampleValue);
         }
 
-        private object? GenerateMaxLengthMaxValue(ColumnSchema column, int rowIndex, ParsedQuery query, string tableAlias)
+        private object? GenerateMaxLengthMaxValue(ColumnSchema column, int rowIndex, ParsedQuery query, string tableAlias, TableSchema? tableSchema = null)
         {
-            return column.TypeCategory switch
+            if (column.TypeCategory == DataTypeCategory.String)
+                return BuildMaxLengthString(column, rowIndex);
+
+            if (column.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float)
             {
-                DataTypeCategory.String => BuildMaxLengthString(column, rowIndex),
-                DataTypeCategory.Integer => BuildMaxNumericValue(column, rowIndex, query, tableAlias),
-                DataTypeCategory.Decimal => BuildMaxNumericValue(column, rowIndex, query, tableAlias),
-                DataTypeCategory.Float => BuildMaxNumericValue(column, rowIndex, query, tableAlias),
-                _ => null
-            };
+                decimal? computedUpperBound = null;
+                if (tableSchema != null &&
+                    TryGetComputedProductUpperBound(tableSchema, column, out var bound))
+                {
+                    computedUpperBound = bound;
+                }
+                return BuildMaxNumericValue(column, rowIndex, query, tableAlias, computedUpperBound);
+            }
+
+            return null;
+        }
+
+        private bool TryGetComputedProductUpperBound(
+            TableSchema schema,
+            ColumnSchema sourceColumn,
+            out decimal upperBound)
+        {
+            upperBound = 0m;
+            foreach (var computedCol in schema.Columns)
+            {
+                if (!computedCol.IsComputed) continue;
+                if (!TryBuildComputedProductColumnPlan(schema, computedCol, out var plan)) continue;
+                if (!TryGetPositiveColumnMax(plan.ResultColumn, out var resultMax)) continue;
+
+                ColumnSchema? otherFactor = null;
+                if (plan.AnchorColumn.ColumnName.Equals(sourceColumn.ColumnName, StringComparison.OrdinalIgnoreCase))
+                    otherFactor = plan.AdjustableColumn;
+                else if (plan.AdjustableColumn.ColumnName.Equals(sourceColumn.ColumnName, StringComparison.OrdinalIgnoreCase))
+                    otherFactor = plan.AnchorColumn;
+
+                if (otherFactor == null) continue;
+
+                if (!TryGetPositiveColumnMax(otherFactor, out var otherMax) || otherMax <= 0m)
+                    continue;
+
+                var limit = resultMax / otherMax;
+                if (limit <= 0m) continue;
+
+                upperBound = limit;
+                return true;
+            }
+            return false;
         }
 
         private object? GenerateSampleBasedValue(ColumnSchema column, object? sampleValue, int rowIndex)
@@ -1787,24 +1827,43 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private object BuildMaxNumericValue(ColumnSchema column, int rowIndex)
         {
-            return BuildMaxNumericValue(column, rowIndex, query: null, tableAlias: column.TableName);
+            return BuildMaxNumericValue(column, rowIndex, query: null, tableAlias: column.TableName, upperBound: null);
         }
 
-        private object BuildMaxNumericValue(ColumnSchema column, int rowIndex, ParsedQuery? query, string tableAlias)
+        private object BuildMaxNumericValue(ColumnSchema column, int rowIndex, ParsedQuery? query, string tableAlias, decimal? upperBound = null)
         {
             var offset = rowIndex + GetColumnVariantOffset(column);
+            var step = GetNumericStep(column);
 
-            return column.TypeCategory switch
+            switch (column.TypeCategory)
             {
-                DataTypeCategory.Integer => SqlServerValueNormalizer.NormalizeValue(column, GetMaxIntegerValue(column) - offset) ?? 0,
-                DataTypeCategory.Decimal => SqlServerValueNormalizer.NormalizeValue(
-                    column,
-                    GetMaxDecimalValue(column) - (offset * GetNumericStep(column))) ?? 0m,
-                DataTypeCategory.Float => SqlServerValueNormalizer.NormalizeValue(
-                    column,
-                    GetMaxFloatValue(column) - offset) ?? 0d,
-                _ => 0
-            };
+                case DataTypeCategory.Integer:
+                {
+                    var raw = (decimal)(GetMaxIntegerValue(column) - offset);
+                    if (upperBound.HasValue)
+                        raw = Math.Min(raw, Math.Floor(upperBound.Value - offset));
+                    if (raw < 0) raw = 0;
+                    return SqlServerValueNormalizer.NormalizeValue(column, (long)raw) ?? (long)raw;
+                }
+                case DataTypeCategory.Decimal:
+                {
+                    var raw = GetMaxDecimalValue(column) - (offset * step);
+                    if (upperBound.HasValue)
+                        raw = Math.Min(raw, upperBound.Value - (offset * step));
+                    if (raw < 0) raw = 0;
+                    return SqlServerValueNormalizer.NormalizeValue(column, raw) ?? raw;
+                }
+                case DataTypeCategory.Float:
+                {
+                    var raw = GetMaxFloatValue(column) - offset;
+                    if (upperBound.HasValue)
+                        raw = Math.Min(raw, (double)upperBound.Value - offset);
+                    if (raw < 0) raw = 0;
+                    return SqlServerValueNormalizer.NormalizeValue(column, raw) ?? raw;
+                }
+                default:
+                    return 0;
+            }
         }
 
         private object MutateSampleString(ColumnSchema column, object sampleValue, int rowIndex)
@@ -6727,8 +6786,16 @@ namespace SqlTestDataGenerator.DataGeneration
             out ComputedProductColumnPlan plan)
         {
             plan = null!;
-            if (!column.IsComputed ||
-                column.TypeCategory is not (DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float))
+            if (!column.IsComputed)
+                return false;
+
+            // Allow computed columns regardless of resolved TypeCategory:
+            // the schema reader may not always populate TypeCategory correctly for computed columns,
+            // and we can still determine if it is numeric from source column types.
+            // Only skip if TypeCategory is explicitly a non-numeric, non-computed known type.
+            if (column.TypeCategory is DataTypeCategory.String or DataTypeCategory.Boolean or
+                DataTypeCategory.DateTime or DataTypeCategory.Time or DataTypeCategory.DateTimeOffset or
+                DataTypeCategory.Guid or DataTypeCategory.Binary or DataTypeCategory.Xml)
             {
                 return false;
             }
@@ -8123,6 +8190,47 @@ namespace SqlTestDataGenerator.DataGeneration
             var unitPrice = UseMaxLengthMaxValueMode
                 ? BuildSafeHighDecimal(query, schema, unitPriceColumnName, rowIndex, 0, 0, 11.25m + (rowIndex * 2.15m))
                 : 11.25m + (rowIndex * 2.15m);
+
+            // When UseMaxLengthMaxValueMode: cap unitPrice so that quantity * unitPrice stays within the
+            // computed column's (LineTotal) maximum. Anchor = Quantity keeps its max; Adjustable = Price is capped.
+            if (UseMaxLengthMaxValueMode && quantity > 0)
+            {
+                var lineTotalColumn = schema.Columns.FirstOrDefault(c =>
+                    c.IsComputed &&
+                    TryBuildComputedProductColumnPlan(schema, c, out _));
+
+                if (lineTotalColumn != null &&
+                    TryBuildComputedProductColumnPlan(schema, lineTotalColumn, out var plan))
+                {
+                    // Get LineTotal's max. If it's not resolvable or absurdly large,
+                    // fall back to the adjustable column's (Price) own declared max.
+                    if (!TryGetPositiveColumnMax(plan.ResultColumn, out var resultMax))
+                        resultMax = decimal.MaxValue;
+
+                    // Also get Price column's own max (e.g. decimal(10,2) = 99999999.99).
+                    // The effective resultMax cannot exceed what Price's type can hold × Quantity.
+                    if (TryGetPositiveColumnMax(plan.AdjustableColumn, out var adjColMax))
+                    {
+                        var productAtAdjMax = adjColMax * Math.Abs((decimal)quantity);
+                        if (productAtAdjMax < resultMax)
+                            resultMax = productAtAdjMax;
+                    }
+
+                    var maxUnitPrice = resultMax / Math.Abs((decimal)quantity);
+                    if (unitPrice > maxUnitPrice)
+                    {
+                        var unitPriceCol = schema.GetColumn(unitPriceColumnName);
+                        var step = unitPriceCol != null ? GetNumericStep(unitPriceCol) : 0.01m;
+                        unitPrice = Math.Max(0m, maxUnitPrice - ((decimal)rowIndex * step));
+                        if (unitPriceCol != null)
+                        {
+                            var normalized = SqlServerValueNormalizer.NormalizeValue(unitPriceCol, unitPrice);
+                            if (TryConvertDecimal(normalized, out var nd)) unitPrice = nd;
+                        }
+                    }
+                }
+            }
+
             var unitCost = UseMaxLengthMaxValueMode
                 ? BuildSafeHighDecimal(query, schema, "UnitCost", rowIndex, 3, 0, Math.Max(0.01m, unitPrice - 1.35m))
                 : unitPrice - 1.35m;
@@ -8529,7 +8637,24 @@ namespace SqlTestDataGenerator.DataGeneration
                 case DataTypeCategory.Decimal:
                     max = GetMaxDecimalValue(column);
                     return max > 0m;
+                case DataTypeCategory.Float:
+                    max = (decimal)GetMaxFloatValue(column);
+                    return max > 0m;
                 default:
+                    // Computed columns may have a TypeCategory that isn't Integer/Decimal/Float
+                    // (schema reader may not resolve the type). Derive a conservative max from
+                    // NumericPrecision/NumericScale if available, otherwise assume decimal(18,2).
+                    if (column.IsComputed)
+                    {
+                        var precision = column.NumericPrecision ?? 18;
+                        var scale = column.NumericScale ?? 2;
+                        decimal wholePart = 1m;
+                        for (int i = 0; i < Math.Max(1, precision - scale); i++)
+                            wholePart *= 10m;
+                        var step = scale > 0 ? (decimal)Math.Pow(10, -scale) : 1m;
+                        max = wholePart - step;
+                        return max > 0m;
+                    }
                     return false;
             }
         }
