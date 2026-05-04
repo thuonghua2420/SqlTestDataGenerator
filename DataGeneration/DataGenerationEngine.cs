@@ -1839,7 +1839,8 @@ namespace SqlTestDataGenerator.DataGeneration
             {
                 case DataTypeCategory.Integer:
                 {
-                    var raw = (decimal)(GetMaxIntegerValue(column) - offset);
+                    // Use practical max (considers multiplicative arithmetic risk) instead of raw type max.
+                    var raw = (decimal)(GetPracticalMaxIntegerValue(column, query, tableAlias) - offset);
                     if (upperBound.HasValue)
                         raw = Math.Min(raw, Math.Floor(upperBound.Value - offset));
                     if (raw < 0) raw = 0;
@@ -1847,7 +1848,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 }
                 case DataTypeCategory.Decimal:
                 {
-                    var raw = GetMaxDecimalValue(column) - (offset * step);
+                    var raw = GetPracticalMaxDecimalValue(column, query, tableAlias) - (offset * step);
                     if (upperBound.HasValue)
                         raw = Math.Min(raw, upperBound.Value - (offset * step));
                     if (raw < 0) raw = 0;
@@ -1855,7 +1856,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 }
                 case DataTypeCategory.Float:
                 {
-                    var raw = GetMaxFloatValue(column) - offset;
+                    var raw = GetPracticalMaxFloatValue(column, query, tableAlias) - offset;
                     if (upperBound.HasValue)
                         raw = Math.Min(raw, (double)upperBound.Value - offset);
                     if (raw < 0) raw = 0;
@@ -8191,8 +8192,9 @@ namespace SqlTestDataGenerator.DataGeneration
                 ? BuildSafeHighDecimal(query, schema, unitPriceColumnName, rowIndex, 0, 0, 11.25m + (rowIndex * 2.15m))
                 : 11.25m + (rowIndex * 2.15m);
 
-            // When UseMaxLengthMaxValueMode: cap unitPrice so that quantity * unitPrice stays within the
-            // computed column's (LineTotal) maximum. Anchor = Quantity keeps its max; Adjustable = Price is capped.
+            // When UseMaxLengthMaxValueMode: cap both quantity and unitPrice so that
+            // quantity * unitPrice stays within the computed column's (LineTotal) maximum.
+            // Derive resultMax from source column types for reliability.
             if (UseMaxLengthMaxValueMode && quantity > 0)
             {
                 var lineTotalColumn = schema.Columns.FirstOrDefault(c =>
@@ -8202,20 +8204,33 @@ namespace SqlTestDataGenerator.DataGeneration
                 if (lineTotalColumn != null &&
                     TryBuildComputedProductColumnPlan(schema, lineTotalColumn, out var plan))
                 {
-                    // Get LineTotal's max. If it's not resolvable or absurdly large,
-                    // fall back to the adjustable column's (Price) own declared max.
+                    // Get LineTotal's max from schema.
                     if (!TryGetPositiveColumnMax(plan.ResultColumn, out var resultMax))
-                        resultMax = decimal.MaxValue;
+                        resultMax = 99_999_999.99m; // Conservative fallback
 
-                    // Also get Price column's own max (e.g. decimal(10,2) = 99999999.99).
-                    // The effective resultMax cannot exceed what Price's type can hold × Quantity.
-                    if (TryGetPositiveColumnMax(plan.AdjustableColumn, out var adjColMax))
+                    // Also constrain resultMax by source column max products to avoid inflation.
+                    var adjColMax = 0m;
+                    if (TryGetPositiveColumnMax(plan.AnchorColumn, out var anchorColMax) &&
+                        TryGetPositiveColumnMax(plan.AdjustableColumn, out adjColMax))
                     {
-                        var productAtAdjMax = adjColMax * Math.Abs((decimal)quantity);
-                        if (productAtAdjMax < resultMax)
-                            resultMax = productAtAdjMax;
+                        try
+                        {
+                            var sourceProductMax = anchorColMax * adjColMax;
+                            if (sourceProductMax < resultMax)
+                                resultMax = sourceProductMax;
+                        }
+                        catch (OverflowException) { }
                     }
 
+                    // Cap quantity first
+                    if (adjColMax > 0m)
+                    {
+                        var maxQuantity = resultMax / adjColMax;
+                        if ((decimal)quantity > maxQuantity)
+                            quantity = Math.Max(1, (int)Math.Floor(maxQuantity));
+                    }
+
+                    // Then cap unitPrice using the (possibly capped) quantity
                     var maxUnitPrice = resultMax / Math.Abs((decimal)quantity);
                     if (unitPrice > maxUnitPrice)
                     {
@@ -8643,10 +8658,12 @@ namespace SqlTestDataGenerator.DataGeneration
                 default:
                     // Computed columns may have a TypeCategory that isn't Integer/Decimal/Float
                     // (schema reader may not resolve the type). Derive a conservative max from
-                    // NumericPrecision/NumericScale if available, otherwise assume decimal(18,2).
+                    // NumericPrecision/NumericScale if available, otherwise assume decimal(10,2).
+                    // Using decimal(10,2) instead of decimal(18,2) prevents astronomically large
+                    // resultMax values that make computed bound checks ineffective.
                     if (column.IsComputed)
                     {
-                        var precision = column.NumericPrecision ?? 18;
+                        var precision = column.NumericPrecision ?? 10;
                         var scale = column.NumericScale ?? 2;
                         decimal wholePart = 1m;
                         for (int i = 0; i < Math.Max(1, precision - scale); i++)
