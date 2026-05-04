@@ -103,6 +103,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 ApplyScenarioInsertSafetyAdjustments(query, workingScenario, schemas);
                 EnforceScenarioForeignKeyClosure(workingScenario, schemas);
                 ApplyScenarioJoinColumnComparisonAdjustments(query, workingScenario, schemas);
+                ApplyScenarioInsertSafetyAdjustments(query, workingScenario, schemas);
                 ValidateScenarioLocalForeignKeys(workingScenario, schemas);
                 dataSet.Scenarios.Add(workingScenario);
             }
@@ -2823,6 +2824,9 @@ namespace SqlTestDataGenerator.DataGeneration
             if (conditionTableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase))
                 return true;
 
+            if (IsExplicitDifferentAlias(query.AliasToTableMap, conditionTableAlias, tableAlias))
+                return false;
+
             var resolved = query.ResolveAlias(conditionTableAlias);
             return resolved.Equals(tableName, StringComparison.OrdinalIgnoreCase);
         }
@@ -2845,6 +2849,23 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             return conditionTableAlias.Equals(tableName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsExplicitDifferentAlias(
+            IReadOnlyDictionary<string, string> aliasMap,
+            string conditionTableAlias,
+            string tableAlias)
+        {
+            if (!aliasMap.TryGetValue(conditionTableAlias, out var resolved))
+                return false;
+
+            var tableAliasIsExplicit = aliasMap.TryGetValue(tableAlias, out var tableAliasResolved) &&
+                                       !tableAlias.Equals(tableAliasResolved, StringComparison.OrdinalIgnoreCase);
+            if (!tableAliasIsExplicit)
+                return false;
+
+            return !conditionTableAlias.Equals(resolved, StringComparison.OrdinalIgnoreCase) &&
+                   !conditionTableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase);
         }
 
         private ResolvedColumnValue ResolveColumnValueFromTargets(
@@ -5498,7 +5519,7 @@ namespace SqlTestDataGenerator.DataGeneration
             if (!scenario.ExpectedToReturnRows)
                 return;
 
-            foreach (var condition in query.EnumerateScopeConditions(ConditionSource.Having))
+            foreach (var condition in EnumerateAggregateComparisonConditions(query))
             {
                 if (!condition.AggregateFunc.HasValue ||
                     condition.AggregateFunc is AggregateFunction.Count or AggregateFunction.CountDistinct ||
@@ -5563,6 +5584,13 @@ namespace SqlTestDataGenerator.DataGeneration
                     condition,
                     column);
             }
+        }
+
+        private static IEnumerable<ConditionInfo> EnumerateAggregateComparisonConditions(ParsedQuery query)
+        {
+            return query.PredicateScopes
+                .SelectMany(s => s.Conditions)
+                .Where(c => c.AggregateFunc.HasValue);
         }
 
         private void ApplyDirectHavingAggregateCondition(
@@ -7993,7 +8021,7 @@ namespace SqlTestDataGenerator.DataGeneration
             int rowIndex)
         {
             ApplyQueryFunctionHintedStringRowAdjustments(query, schema, row, rowIndex);
-            ApplyScalarAvgSubqueryRowAdjustments(query, schema, row, rowIndex);
+            ApplyScalarAvgSubqueryRowAdjustments(query, scenario, schema, row, rowIndex);
 
             if (!NeedsAggregateDiversitySupport(query))
                 return;
@@ -8055,8 +8083,9 @@ namespace SqlTestDataGenerator.DataGeneration
             }
         }
 
-        private static void ApplyScalarAvgSubqueryRowAdjustments(
+        private void ApplyScalarAvgSubqueryRowAdjustments(
             ParsedQuery query,
+            BranchScenario scenario,
             TableSchema schema,
             GeneratedRow row,
             int rowIndex)
@@ -8076,11 +8105,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 return;
 
             var rawValue = rowIndex == 0 ? 20m : 1m;
-            var normalized = SqlServerValueNormalizer.NormalizeValue(column, rawValue);
-            if (normalized != null)
-            {
-                row.SetValue(column.ColumnName, normalized);
-            }
+            SetNormalizedRowValueIfSafe(query, scenario, schema, row, column.ColumnName, rawValue);
         }
 
         private void ApplyLineRowAdjustments(
@@ -8291,7 +8316,147 @@ namespace SqlTestDataGenerator.DataGeneration
                 return true;
             }
 
+            return TryBuildSafeComputedProductPairFromCandidates(
+                query,
+                scenario,
+                tableName,
+                tableAlias,
+                plan,
+                resultMax,
+                currentAnchor,
+                currentAdjustable,
+                out safeAnchorValue,
+                out safeAnchorDecimal,
+                out safeAdjustableValue,
+                out safeAdjustableDecimal);
+        }
+
+        private bool TryBuildSafeComputedProductPairFromCandidates(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableName,
+            string tableAlias,
+            ComputedProductColumnPlan plan,
+            decimal resultMax,
+            decimal currentAnchor,
+            decimal currentAdjustable,
+            out object? safeAnchorValue,
+            out decimal safeAnchorDecimal,
+            out object? safeAdjustableValue,
+            out decimal safeAdjustableDecimal)
+        {
+            safeAnchorValue = null;
+            safeAnchorDecimal = 0m;
+            safeAdjustableValue = null;
+            safeAdjustableDecimal = 0m;
+
+            var anchorCandidates = BuildSafeComputedProductFactorCandidates(
+                    query,
+                    scenario,
+                    tableName,
+                    tableAlias,
+                    plan.AnchorColumn,
+                    currentAnchor,
+                    resultMax)
+                .OrderByDescending(Math.Abs)
+                .ToList();
+            var baseAdjustableCandidates = BuildSafeComputedProductFactorCandidates(
+                    query,
+                    scenario,
+                    tableName,
+                    tableAlias,
+                    plan.AdjustableColumn,
+                    currentAdjustable,
+                    resultMax)
+                .ToList();
+            var adjustableStep = GetNumericRangeStep(plan.AdjustableColumn);
+
+            foreach (var rawAnchor in anchorCandidates)
+            {
+                if (!TryNormalizeNumericCandidate(plan.AnchorColumn, rawAnchor, out var normalizedAnchor, out var anchorDecimal) ||
+                    anchorDecimal == 0m ||
+                    !SatisfiesPositiveColumnConstraints(query, scenario, tableName, tableAlias, plan.AnchorColumn, normalizedAnchor))
+                {
+                    continue;
+                }
+
+                var adjustableLimit = resultMax / Math.Abs(anchorDecimal);
+                var adjustableCandidates = new List<decimal>(baseAdjustableCandidates)
+                {
+                    adjustableLimit,
+                    adjustableLimit - adjustableStep,
+                    -adjustableLimit,
+                    -adjustableLimit + adjustableStep
+                };
+
+                foreach (var rawAdjustable in DeduplicateDecimalCandidates(adjustableCandidates).OrderByDescending(Math.Abs))
+                {
+                    if (!TryNormalizeNumericCandidate(plan.AdjustableColumn, rawAdjustable, out var normalizedAdjustable, out var adjustableDecimal) ||
+                        !SatisfiesPositiveColumnConstraints(query, scenario, tableName, tableAlias, plan.AdjustableColumn, normalizedAdjustable) ||
+                        !IsComputedProductWithinRange(anchorDecimal, adjustableDecimal, resultMax))
+                    {
+                        continue;
+                    }
+
+                    safeAnchorValue = normalizedAnchor;
+                    safeAnchorDecimal = anchorDecimal;
+                    safeAdjustableValue = normalizedAdjustable;
+                    safeAdjustableDecimal = adjustableDecimal;
+                    return true;
+                }
+            }
+
             return false;
+        }
+
+        private IEnumerable<decimal> BuildSafeComputedProductFactorCandidates(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableName,
+            string tableAlias,
+            ColumnSchema column,
+            decimal currentValue,
+            decimal resultMax)
+        {
+            var bounds = GetPositiveNumericBounds(query, scenario, tableName, tableAlias, column, excludedConditionKey: string.Empty);
+            var step = GetNumericRangeStep(column);
+            var candidates = new List<decimal>
+            {
+                currentValue,
+                1m,
+                -1m,
+                2m,
+                5m,
+                10m,
+                100m,
+                1000m,
+                10000m,
+                resultMax,
+                resultMax - step
+            };
+
+            candidates.AddRange(bounds.DiscreteValues);
+
+            if (bounds.Lower.HasValue)
+            {
+                candidates.Add(bounds.Lower.Value);
+                candidates.Add(bounds.Lower.Value + step);
+            }
+
+            if (bounds.Upper.HasValue)
+            {
+                candidates.Add(bounds.Upper.Value);
+                candidates.Add(bounds.Upper.Value - step);
+            }
+
+            if (TryConvertDecimal(BuildMaxNumericValue(column, 0, query, tableAlias), out var columnMax))
+            {
+                candidates.Add(columnMax);
+                candidates.Add(columnMax - step);
+            }
+
+            return DeduplicateDecimalCandidates(candidates)
+                .Where(c => IsWithinNumericBounds(c, bounds));
         }
 
         private bool TryBuildBestFactorWithinLimit(

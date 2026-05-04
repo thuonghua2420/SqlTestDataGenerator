@@ -220,11 +220,52 @@ namespace SqlTestDataGenerator.DataGeneration
             PredicateScope scope,
             IReadOnlyDictionary<string, ConditionInfo> conditionByKey)
         {
-            return PredicateTruthPlanner.GetMinimalAssignments(scope.Root, desiredTruth: true)
+            var positiveAssignments = PredicateTruthPlanner.GetMinimalAssignments(scope.Root, desiredTruth: true)
                 .OrderBy(a => ScorePositiveAssignment(a, conditionByKey))
                 .ThenBy(a => a.Count)
                 .ThenBy(BuildAssignmentKey, StringComparer.OrdinalIgnoreCase)
-                .FirstOrDefault() ?? new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+                .ToList();
+
+            var chosen = positiveAssignments.FirstOrDefault() ??
+                         new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            chosen = new Dictionary<string, bool>(chosen, StringComparer.OrdinalIgnoreCase);
+
+            foreach (var candidate in positiveAssignments
+                         .SelectMany(a => a)
+                         .Where(kvp =>
+                             kvp.Value &&
+                             conditionByKey.TryGetValue(kvp.Key, out var condition) &&
+                             condition.AggregateFunc.HasValue)
+                         .GroupBy(kvp => $"{kvp.Key}:{kvp.Value}", StringComparer.OrdinalIgnoreCase)
+                         .Select(g => g.First())
+                         .OrderBy(kvp => ScorePositiveAssignment(
+                             new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
+                             {
+                                 [kvp.Key] = kvp.Value
+                             },
+                             conditionByKey))
+                         .ThenBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase))
+            {
+                if (chosen.TryGetValue(candidate.Key, out var existing))
+                {
+                    if (existing != candidate.Value)
+                        continue;
+
+                    continue;
+                }
+
+                var trial = new Dictionary<string, bool>(chosen, StringComparer.OrdinalIgnoreCase)
+                {
+                    [candidate.Key] = candidate.Value
+                };
+
+                if (IsFeasibleTruthMap(trial, conditionByKey))
+                {
+                    chosen = trial;
+                }
+            }
+
+            return chosen;
         }
 
         private static int ScorePositiveAssignment(
@@ -323,7 +364,6 @@ namespace SqlTestDataGenerator.DataGeneration
 
             if (condition.HasSubquery ||
                 condition.IsColumnComparison ||
-                condition.AggregateFunc.HasValue ||
                 string.IsNullOrWhiteSpace(condition.ColumnName))
             {
                 return false;
@@ -333,7 +373,9 @@ namespace SqlTestDataGenerator.DataGeneration
             if (!TryParseDecimalLiteral(condition.Value, out var value))
                 return false;
 
-            targetKey = $"{condition.TableAlias}.{condition.ColumnName}";
+            targetKey = condition.AggregateFunc.HasValue
+                ? $"AGG:{condition.AggregateFunc}:{condition.TableAlias}.{condition.ColumnName}"
+                : $"{condition.TableAlias}.{condition.ColumnName}";
             switch (condition.Operator)
             {
                 case ComparisonOp.GreaterThan:

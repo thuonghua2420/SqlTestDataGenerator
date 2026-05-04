@@ -299,7 +299,7 @@ namespace SqlTestDataGenerator.Database
                         fk.ReferencedColumn,
                         fkValue!);
 
-                    AddPlannedRow(plannedRows, referencedSchema.TableName, syntheticParent);
+                    AddPlannedRow(plannedRows, referencedSchema.TableName, syntheticParent, referencedSchema);
                     queue.Enqueue((referencedSchema.TableName, syntheticParent));
                 }
             }
@@ -499,14 +499,62 @@ namespace SqlTestDataGenerator.Database
         private static void AddPlannedRow(
             Dictionary<string, List<GeneratedRow>> plannedRows,
             string tableName,
-            GeneratedRow row)
+            GeneratedRow row,
+            TableSchema? schema = null)
         {
             if (!plannedRows.ContainsKey(tableName))
             {
                 plannedRows[tableName] = new List<GeneratedRow>();
             }
 
+            if (schema != null &&
+                TryMergeWithExistingPrimaryKeyRow(plannedRows[tableName], schema, row))
+            {
+                return;
+            }
+
             plannedRows[tableName].Add(row);
+        }
+
+        private static bool TryMergeWithExistingPrimaryKeyRow(
+            List<GeneratedRow> rows,
+            TableSchema schema,
+            GeneratedRow candidate)
+        {
+            var pkColumns = schema.PrimaryKey?.Columns
+                .Select(schema.GetColumn)
+                .Where(c => c != null && !c.IsComputed)
+                .Select(c => c!)
+                .ToList();
+            if (pkColumns == null || pkColumns.Count == 0)
+                return false;
+
+            var candidateKey = BuildConstraintKey(pkColumns, candidate);
+            if (candidateKey == null)
+                return false;
+
+            foreach (var existing in rows)
+            {
+                var existingKey = BuildConstraintKey(pkColumns, existing);
+                if (existingKey == null ||
+                    !existingKey.Equals(candidateKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                foreach (var kvp in candidate.ColumnValues)
+                {
+                    var existingValue = existing.GetValue(kvp.Key);
+                    if (IsNullValue(existingValue) && !IsNullValue(kvp.Value))
+                    {
+                        existing.SetValue(kvp.Key, kvp.Value);
+                    }
+                }
+
+                return true;
+            }
+
+            return false;
         }
 
         private static bool ValuesEqual(object? left, object? right)
@@ -1147,7 +1195,7 @@ namespace SqlTestDataGenerator.Database
                             cloned.SetValue(col.Key, col.Value);
                         }
 
-                        AddPlannedRow(result, kvp.Key, cloned);
+                        AddPlannedRow(result, kvp.Key, cloned, schema);
                     }
                 }
             }

@@ -131,5 +131,6 @@ namespace SqlTestDataGenerator.Parsing.Models
         public string SourceAlias { get; set; } = string.Empty;
         public string SourceColumn { get; set; } = string.Empty;
         public string SourceExpression { get; set; } = string.Empty;
+        public AggregateFunction? AggregateFunc { get; set; }
     }
 }

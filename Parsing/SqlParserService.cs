@@ -481,6 +481,7 @@ namespace SqlTestDataGenerator.Parsing
                     ConditionSource.Where,
                     $"{NormalizeScopeLabel(scopeLabel)}:where",
                     $"{scopeLabel} WHERE");
+                QualifyUnqualifiedConditions(whereScope.Conditions, scopeAliasMap);
                 whereScope.Conditions = FilterConditionsToScope(whereScope.Conditions, scopeAliasMap);
                 result.PredicateScopes.Add(whereScope);
                 result.WhereConditions.AddRange(whereScope.Conditions);
@@ -493,6 +494,7 @@ namespace SqlTestDataGenerator.Parsing
                     ConditionSource.Having,
                     $"{NormalizeScopeLabel(scopeLabel)}:having",
                     $"{scopeLabel} HAVING");
+                QualifyUnqualifiedConditions(havingScope.Conditions, scopeAliasMap);
                 havingScope.Conditions = FilterConditionsToScope(havingScope.Conditions, scopeAliasMap);
                 result.PredicateScopes.Add(havingScope);
                 result.HavingConditions.AddRange(havingScope.Conditions);
@@ -510,7 +512,7 @@ namespace SqlTestDataGenerator.Parsing
                 return;
 
             int joinIndex = 1;
-            foreach (var join in EnumerateQualifiedJoins(fromClause.TableReferences))
+            foreach (var join in EnumerateScopedQualifiedJoins(fromClause))
             {
                 if (join.SearchCondition == null)
                     continue;
@@ -520,9 +522,96 @@ namespace SqlTestDataGenerator.Parsing
                     ConditionSource.JoinOn,
                     $"{NormalizeScopeLabel(scopeLabel)}:join{joinIndex}",
                     $"{scopeLabel} JOIN {ResolveTableReferenceLabel(join.SecondTableReference)}");
+                QualifyUnqualifiedConditions(joinScope.Conditions, scopeAliasMap);
                 joinScope.Conditions = FilterConditionsToScope(joinScope.Conditions, scopeAliasMap);
                 result.PredicateScopes.Add(joinScope);
                 joinIndex++;
+            }
+        }
+
+        private static void QualifyUnqualifiedConditions(
+            IEnumerable<ConditionInfo> conditions,
+            IReadOnlyDictionary<string, string> scopeAliasMap)
+        {
+            if (!TryGetSingleScopeAlias(scopeAliasMap, out var singleAlias))
+                return;
+
+            foreach (var condition in conditions)
+            {
+                QualifyUnqualifiedCondition(condition, singleAlias);
+            }
+        }
+
+        private static bool TryGetSingleScopeAlias(
+            IReadOnlyDictionary<string, string> scopeAliasMap,
+            out string alias)
+        {
+            alias = string.Empty;
+            var sourceGroups = scopeAliasMap
+                .Where(kvp => !string.IsNullOrWhiteSpace(kvp.Key) && !string.IsNullOrWhiteSpace(kvp.Value))
+                .GroupBy(kvp => kvp.Value, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (sourceGroups.Count != 1)
+                return false;
+
+            alias = sourceGroups[0]
+                .Select(kvp => kvp.Key)
+                .FirstOrDefault(key => !key.Equals(sourceGroups[0].Key, StringComparison.OrdinalIgnoreCase)) ??
+                    sourceGroups[0].Key;
+            return !string.IsNullOrWhiteSpace(alias);
+        }
+
+        private static void QualifyUnqualifiedCondition(ConditionInfo condition, string alias)
+        {
+            if (string.IsNullOrWhiteSpace(condition.TableAlias) &&
+                !string.IsNullOrWhiteSpace(condition.ColumnName))
+            {
+                condition.TableAlias = alias;
+            }
+
+            if (string.IsNullOrWhiteSpace(condition.RightTableAlias) &&
+                !string.IsNullOrWhiteSpace(condition.RightColumnName))
+            {
+                condition.RightTableAlias = alias;
+            }
+
+            foreach (var reference in condition.ReferencedColumns)
+            {
+                if (string.IsNullOrWhiteSpace(reference.TableAlias) &&
+                    !string.IsNullOrWhiteSpace(reference.ColumnName))
+                {
+                    reference.TableAlias = alias;
+                }
+            }
+
+            QualifyUnqualifiedExpression(condition.LeftExpression, alias);
+            QualifyUnqualifiedExpression(condition.RightExpression, alias);
+        }
+
+        private static void QualifyUnqualifiedExpression(ScalarExpressionInfo? expression, string alias)
+        {
+            switch (expression)
+            {
+                case ColumnScalarExpressionInfo column when string.IsNullOrWhiteSpace(column.TableAlias):
+                    column.TableAlias = alias;
+                    break;
+
+                case FunctionScalarExpressionInfo function:
+                    foreach (var argument in function.Arguments)
+                    {
+                        QualifyUnqualifiedExpression(argument, alias);
+                    }
+                    break;
+
+                case BinaryScalarExpressionInfo binary:
+                    QualifyUnqualifiedExpression(binary.Left, alias);
+                    QualifyUnqualifiedExpression(binary.Right, alias);
+                    break;
+
+                case UnaryScalarExpressionInfo unary:
+                    QualifyUnqualifiedExpression(unary.Operand, alias);
+                    break;
             }
         }
 
@@ -575,34 +664,60 @@ namespace SqlTestDataGenerator.Parsing
             if (fromClause == null)
                 return map;
 
-            var visitor = new TableExtractorVisitor();
-            fromClause.Accept(visitor);
-
-            foreach (var table in visitor.Tables)
+            foreach (var tableReference in fromClause.TableReferences)
             {
-                if (!string.IsNullOrWhiteSpace(table.Alias))
-                {
-                    map[table.Alias] = table.TableName;
-                }
-
-                if (!string.IsNullOrWhiteSpace(table.TableName))
-                {
-                    map[table.TableName] = table.TableName;
-                }
-            }
-
-            var derivedVisitor = new DerivedTableCollectorVisitor();
-            fromClause.Accept(derivedVisitor);
-            foreach (var derived in derivedVisitor.DerivedTables)
-            {
-                var alias = derived.Alias?.Value;
-                if (!string.IsNullOrWhiteSpace(alias))
-                {
-                    map[alias] = alias;
-                }
+                AddScopeAliasesFromTableReference(tableReference, map);
             }
 
             return map;
+        }
+
+        private static void AddScopeAliasesFromTableReference(
+            TableReference tableReference,
+            Dictionary<string, string> map)
+        {
+            switch (tableReference)
+            {
+                case NamedTableReference named:
+                {
+                    var tableName = named.SchemaObject.BaseIdentifier?.Value ?? string.Empty;
+                    var alias = named.Alias?.Value ?? string.Empty;
+                    if (!string.IsNullOrWhiteSpace(alias))
+                    {
+                        map[alias] = tableName;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(tableName))
+                    {
+                        map[tableName] = tableName;
+                    }
+                    break;
+                }
+
+                case QueryDerivedTable derived:
+                {
+                    var alias = derived.Alias?.Value ?? string.Empty;
+                    if (!string.IsNullOrWhiteSpace(alias))
+                    {
+                        map[alias] = alias;
+                    }
+                    break;
+                }
+
+                case QualifiedJoin qualifiedJoin:
+                    AddScopeAliasesFromTableReference(qualifiedJoin.FirstTableReference, map);
+                    AddScopeAliasesFromTableReference(qualifiedJoin.SecondTableReference, map);
+                    break;
+
+                case UnqualifiedJoin unqualifiedJoin:
+                    AddScopeAliasesFromTableReference(unqualifiedJoin.FirstTableReference, map);
+                    AddScopeAliasesFromTableReference(unqualifiedJoin.SecondTableReference, map);
+                    break;
+
+                case JoinParenthesisTableReference joinParen:
+                    AddScopeAliasesFromTableReference(joinParen.Join, map);
+                    break;
+            }
         }
 
         private List<ConditionInfo> FilterConditionsToScope(
@@ -777,7 +892,12 @@ namespace SqlTestDataGenerator.Parsing
             {
                 var alias = condition.TableAlias;
                 var column = condition.ColumnName;
-                ResolveDerivedAliasColumn(result, ref alias, ref column);
+                ResolveDerivedAliasColumn(result, ref alias, ref column, out var aggregateFunc);
+                if (aggregateFunc.HasValue && !condition.AggregateFunc.HasValue)
+                {
+                    condition.AggregateFunc = aggregateFunc;
+                }
+
                 condition.TableAlias = alias;
                 condition.ColumnName = column;
             }
@@ -787,7 +907,7 @@ namespace SqlTestDataGenerator.Parsing
             {
                 var alias = condition.RightTableAlias;
                 var column = condition.RightColumnName;
-                ResolveDerivedAliasColumn(result, ref alias, ref column);
+                ResolveDerivedAliasColumn(result, ref alias, ref column, out _);
                 condition.RightTableAlias = alias;
                 condition.RightColumnName = column;
             }
@@ -802,7 +922,7 @@ namespace SqlTestDataGenerator.Parsing
 
                 var alias = reference.TableAlias;
                 var column = reference.ColumnName;
-                ResolveDerivedAliasColumn(result, ref alias, ref column);
+                ResolveDerivedAliasColumn(result, ref alias, ref column, out _);
                 reference.TableAlias = alias;
                 reference.ColumnName = column;
             }
@@ -816,7 +936,7 @@ namespace SqlTestDataGenerator.Parsing
                 {
                     var alias = column.TableAlias;
                     var columnName = column.ColumnName;
-                    ResolveDerivedAliasColumn(result, ref alias, ref columnName);
+                    ResolveDerivedAliasColumn(result, ref alias, ref columnName, out _);
                     column.TableAlias = alias;
                     column.ColumnName = columnName;
                     break;
@@ -842,12 +962,23 @@ namespace SqlTestDataGenerator.Parsing
 
         private static void ResolveDerivedAliasColumn(ParsedQuery result, ref string alias, ref string column)
         {
+            ResolveDerivedAliasColumn(result, ref alias, ref column, out _);
+        }
+
+        private static void ResolveDerivedAliasColumn(
+            ParsedQuery result,
+            ref string alias,
+            ref string column,
+            out AggregateFunction? aggregateFunc)
+        {
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            aggregateFunc = null;
             while (!string.IsNullOrWhiteSpace(alias) &&
                    !string.IsNullOrWhiteSpace(column) &&
                    seen.Add($"{alias}|{column}") &&
                    result.TryResolveDerivedColumn(alias, column, out var binding))
             {
+                aggregateFunc ??= binding.AggregateFunc;
                 alias = binding.SourceAlias;
                 column = binding.SourceColumn;
             }
@@ -1034,6 +1165,9 @@ namespace SqlTestDataGenerator.Parsing
                     CollectDerivedMappingsFromTableReference(tableReference, localDerivedMappings, outerDerivedMappings);
                 }
             }
+            var defaultSourceAlias = TryGetSingleSourceAlias(spec.FromClause, out var resolvedSourceAlias)
+                ? resolvedSourceAlias
+                : string.Empty;
 
             foreach (var star in spec.SelectElements.OfType<SelectStarExpression>())
             {
@@ -1048,7 +1182,8 @@ namespace SqlTestDataGenerator.Parsing
                         OutputColumn = sourceBinding.OutputColumn,
                         SourceAlias = sourceBinding.SourceAlias,
                         SourceColumn = sourceBinding.SourceColumn,
-                        SourceExpression = sourceBinding.SourceExpression
+                        SourceExpression = sourceBinding.SourceExpression,
+                        AggregateFunc = sourceBinding.AggregateFunc
                     };
                 }
             }
@@ -1065,7 +1200,7 @@ namespace SqlTestDataGenerator.Parsing
                 if (string.IsNullOrWhiteSpace(outputColumn))
                     continue;
 
-                if (!TryResolveExpressionSource(element.Expression, localDerivedMappings, out var sourceAlias, out var sourceColumn))
+                if (!TryResolveExpressionSource(element.Expression, localDerivedMappings, defaultSourceAlias, out var sourceAlias, out var sourceColumn))
                     continue;
 
                 bindings[outputColumn] = new DerivedColumnBinding
@@ -1074,7 +1209,10 @@ namespace SqlTestDataGenerator.Parsing
                     OutputColumn = outputColumn,
                     SourceAlias = sourceAlias,
                     SourceColumn = sourceColumn,
-                    SourceExpression = GetFragmentText(element.Expression)
+                    SourceExpression = GetFragmentText(element.Expression),
+                    AggregateFunc = TryGetAggregateFunction(element.Expression, out var aggregateFunc)
+                        ? aggregateFunc
+                        : null
                 };
             }
 
@@ -1194,7 +1332,8 @@ namespace SqlTestDataGenerator.Parsing
                     OutputColumn = binding.OutputColumn,
                     SourceAlias = binding.SourceAlias,
                     SourceColumn = binding.SourceColumn,
-                    SourceExpression = binding.SourceExpression
+                    SourceExpression = binding.SourceExpression,
+                    AggregateFunc = binding.AggregateFunc
                 };
             }
 
@@ -1204,6 +1343,7 @@ namespace SqlTestDataGenerator.Parsing
         private bool TryResolveExpressionSource(
             ScalarExpression expression,
             IReadOnlyDictionary<string, Dictionary<string, DerivedColumnBinding>> localDerivedMappings,
+            string defaultSourceAlias,
             out string sourceAlias,
             out string sourceColumn)
         {
@@ -1218,7 +1358,7 @@ namespace SqlTestDataGenerator.Parsing
                     if (parts == null || parts.Count == 0)
                         return false;
 
-                    var alias = parts.Count >= 2 ? parts[0].Value : string.Empty;
+                    var alias = parts.Count >= 2 ? parts[0].Value : defaultSourceAlias;
                     var column = parts[^1].Value;
                     var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                     while (!string.IsNullOrWhiteSpace(alias) &&
@@ -1236,56 +1376,79 @@ namespace SqlTestDataGenerator.Parsing
                 }
 
                 case ParenthesisExpression paren:
-                    return TryResolveExpressionSource(paren.Expression, localDerivedMappings, out sourceAlias, out sourceColumn);
+                    return TryResolveExpressionSource(paren.Expression, localDerivedMappings, defaultSourceAlias, out sourceAlias, out sourceColumn);
 
                 case FunctionCall func when IsAggregateFunction(func.FunctionName?.Value ?? string.Empty) &&
                                             !IsCountAggregateFunction(func.FunctionName?.Value ?? string.Empty) &&
                                             func.Parameters.Count > 0:
-                    return TryResolveExpressionSource(func.Parameters[0], localDerivedMappings, out sourceAlias, out sourceColumn);
+                    return TryResolveExpressionSource(func.Parameters[0], localDerivedMappings, defaultSourceAlias, out sourceAlias, out sourceColumn);
             }
 
             return false;
         }
 
-        private static bool IsCountAggregateFunction(string functionName) =>
-            functionName.Equals("COUNT", StringComparison.OrdinalIgnoreCase);
-
-        private static IEnumerable<QualifiedJoin> EnumerateQualifiedJoins(IEnumerable<TableReference> tableReferences)
+        private static bool TryGetAggregateFunction(
+            ScalarExpression expression,
+            out AggregateFunction aggregateFunc)
         {
-            foreach (var tableReference in tableReferences)
+            aggregateFunc = default;
+            switch (expression)
             {
-                foreach (var join in EnumerateQualifiedJoins(tableReference))
-                {
-                    yield return join;
-                }
+                case FunctionCall func:
+                    return TryParseAggregateFunction(func.FunctionName?.Value ?? string.Empty, out aggregateFunc);
+
+                case ParenthesisExpression paren:
+                    return TryGetAggregateFunction(paren.Expression, out aggregateFunc);
+
+                default:
+                    return false;
             }
         }
 
-        private static IEnumerable<QualifiedJoin> EnumerateQualifiedJoins(TableReference tableReference)
+        private static bool TryParseAggregateFunction(string functionName, out AggregateFunction aggregateFunc)
         {
-            switch (tableReference)
+            aggregateFunc = functionName.ToUpperInvariant() switch
             {
-                case QualifiedJoin qualifiedJoin:
-                    foreach (var nested in EnumerateQualifiedJoins(qualifiedJoin.FirstTableReference))
-                    {
-                        yield return nested;
-                    }
+                "COUNT" => AggregateFunction.Count,
+                "SUM" => AggregateFunction.Sum,
+                "AVG" => AggregateFunction.Avg,
+                "MAX" => AggregateFunction.Max,
+                "MIN" => AggregateFunction.Min,
+                _ => default
+            };
 
-                    foreach (var nested in EnumerateQualifiedJoins(qualifiedJoin.SecondTableReference))
-                    {
-                        yield return nested;
-                    }
+            return aggregateFunc != default || functionName.Equals("COUNT", StringComparison.OrdinalIgnoreCase);
+        }
 
-                    yield return qualifiedJoin;
-                    yield break;
+        private static bool TryGetSingleSourceAlias(FromClause? fromClause, out string sourceAlias)
+        {
+            sourceAlias = string.Empty;
+            if (fromClause == null)
+                return false;
 
-                case JoinParenthesisTableReference joinParen:
-                    foreach (var nested in EnumerateQualifiedJoins(joinParen.Join))
-                    {
-                        yield return nested;
-                    }
-                    yield break;
-            }
+            var visitor = new TableExtractorVisitor();
+            fromClause.Accept(visitor);
+            var sources = visitor.Tables
+                .Select(t => string.IsNullOrWhiteSpace(t.Alias) ? t.TableName : t.Alias)
+                .Where(t => !string.IsNullOrWhiteSpace(t))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (sources.Count != 1)
+                return false;
+
+            sourceAlias = sources[0];
+            return true;
+        }
+
+        private static bool IsCountAggregateFunction(string functionName) =>
+            functionName.Equals("COUNT", StringComparison.OrdinalIgnoreCase);
+
+        private static IEnumerable<QualifiedJoin> EnumerateScopedQualifiedJoins(FromClause fromClause)
+        {
+            var visitor = new ScopedQualifiedJoinCollectorVisitor();
+            fromClause.Accept(visitor);
+            return visitor.Joins;
         }
 
         private static string ResolveTableReferenceLabel(TableReference tableReference)
@@ -1332,6 +1495,23 @@ namespace SqlTestDataGenerator.Parsing
             {
                 DerivedTables.Add(node);
                 base.Visit(node);
+            }
+        }
+
+        private sealed class ScopedQualifiedJoinCollectorVisitor : TSqlFragmentVisitor
+        {
+            public List<QualifiedJoin> Joins { get; } = new();
+
+            public override void Visit(QualifiedJoin node)
+            {
+                Joins.Add(node);
+                base.Visit(node);
+            }
+
+            public override void Visit(QueryDerivedTable node)
+            {
+                // A derived table owns its inner query scope. The parent scope only sees
+                // the derived alias, so JOIN predicates inside it are analyzed separately.
             }
         }
 
