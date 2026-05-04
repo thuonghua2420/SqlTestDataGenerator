@@ -24,8 +24,8 @@ public class SupportToolsPanel : UserControl
     private ComboBox cmbFontName = null!;
     private TextBox txtZoom = null!;
     private Button btnFormatExcel = null!;
-    private TextBox txtImgScale = null!;
-    private Button btnFormatEvd = null!;
+    private TextBox txtImgScaleWidth = null!;
+    private TextBox txtImgScaleHeight = null!;
     private RichTextBox rtbLog2 = null!;
 
     // ── Color palette ──
@@ -259,29 +259,26 @@ public class SupportToolsPanel : UserControl
         lblImgSec.Font = new Font(UiFont, FontStyle.Bold);
         y += rowH;
 
-        var lblScale = Lbl("Scale (%):", lx, y + 3);
-        txtImgScale = Txt(ix, y, 70, "60");
-        var lblScaleNote = Lbl("% — áp dụng cho cả Width & Height", ix + 78, y + 3);
-        lblScaleNote.ForeColor = ClrMuted;
+        var lblScaleWidth = Lbl("Width (%):", lx, y + 3);
+        txtImgScaleWidth = Txt(ix, y, 70, "55");
+        var lblScaleHeight = Lbl("Height (%):", ix + 92, y + 3);
+        txtImgScaleHeight = Txt(ix + 176, y, 70, "55");
 
         card.Controls.AddRange(new Control[]
         {
             chkFontSize, txtFontSize, lblFn, cmbFontName, lblZm, txtZoom,
-            sep, lblImgSec, lblScale, txtImgScale, lblScaleNote
+            sep, lblImgSec, lblScaleWidth, txtImgScaleWidth, lblScaleHeight, txtImgScaleHeight
         });
 
         // Buttons row (below card)
-        btnFormatExcel = Btn("Format Excel", pad, pad + card.Height + 12, 180);
-        btnFormatExcel.Click += BtnFormatExcel_Click;
-
-        btnFormatEvd = Btn("Format EVD", pad + 190, pad + card.Height + 12, 170);
-        btnFormatEvd.Click += BtnFormatEvd_Click;
+        btnFormatExcel = Btn("▶ Format Excel + EVD", pad, pad + card.Height + 12, 210);
+        btnFormatExcel.Click += BtnFormatExcelAndEvd_Click;
 
         // Log
         var lblLog = Lbl("Kết quả thực thi:", pad, pad + card.Height + 68);
         rtbLog2 = LogBox(pad, pad + card.Height + 92, 100, 300);
 
-        tabExcel.Controls.AddRange(new Control[] { card, btnFormatExcel, btnFormatEvd, lblLog, rtbLog2 });
+        tabExcel.Controls.AddRange(new Control[] { card, btnFormatExcel, lblLog, rtbLog2 });
 
         tabExcel.Resize += (_, _) =>
         {
@@ -289,7 +286,6 @@ public class SupportToolsPanel : UserControl
             card.Width = w;
             int btnY = pad + card.Height + 12;
             btnFormatExcel.Top = btnY;
-            btnFormatEvd.Top  = btnY;
             lblLog.Top = pad + card.Height + 68;
             rtbLog2.Location = new Point(pad, pad + card.Height + 92);
             rtbLog2.Size = new Size(w, tabExcel.ClientSize.Height - rtbLog2.Top - pad);
@@ -475,7 +471,7 @@ public class SupportToolsPanel : UserControl
     // ─────────────────────────────────────────────────────────
     //  Tab 2 handler
     // ─────────────────────────────────────────────────────────
-    private async void BtnFormatExcel_Click(object? sender, EventArgs e)
+    private async void BtnFormatExcelAndEvd_Click(object? sender, EventArgs e)
     {
         if (!GetValidPath(out var root)) return;
 
@@ -499,39 +495,53 @@ public class SupportToolsPanel : UserControl
         }
 
         string fontName = cmbFontName.Text.Trim();
+        if (!TryReadScalePercent(txtImgScaleWidth, "Scale Width", out var scaleWidth)) return;
+        if (!TryReadScalePercent(txtImgScaleHeight, "Scale Height", out var scaleHeight)) return;
 
         rtbLog2.Clear();
         bool applyFontSize = chkFontSize.Checked;
         string sizeLabel = applyFontSize ? fontSize.ToString() : "giữ nguyên";
-        Log(rtbLog2, $"Bắt đầu format Excel... Font: \"{fontName}\" | Size: {sizeLabel} | Zoom: {zoom}%");
+        Log(rtbLog2, $"Bắt đầu format Excel + EVD... Font: \"{fontName}\" | Size: {sizeLabel} | Zoom: {zoom}% | Scale W/H: {scaleWidth}% / {scaleHeight}%");
 
         btnFormatExcel.Enabled = false;
-        try { await Task.Run(() => FormatExcelFiles(root, fontSize, applyFontSize, fontName, zoom)); }
+        try
+        {
+            var (excelSuccess, excelFailed, evdSuccess, evdFailed) = await Task.Run(() =>
+            {
+                var excel = FormatExcelFiles(root, fontSize, applyFontSize, fontName, zoom, showMessage: false);
+                var evd = FormatEvdFiles(root, scaleWidth, scaleHeight, zoom, showMessage: false);
+                return (excel.success, excel.failed, evd.success, evd.failed);
+            });
+
+            MessageBox.Show(
+                $"Format Excel + EVD hoàn thành!\n\n" +
+                $"Excel: Thành công {excelSuccess}, Lỗi {excelFailed}\n" +
+                $"EVD: Thành công {evdSuccess}, Lỗi {evdFailed}",
+                "Kết quả", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
         finally { btnFormatExcel.Enabled = true; }
     }
 
-    private async void BtnFormatEvd_Click(object? sender, EventArgs e)
+    private static bool TryReadScalePercent(TextBox textBox, string label, out double scale)
     {
-        if (!GetValidPath(out var root)) return;
-
-        string scaleStr = txtImgScale.Text.Trim().Replace(',', '.');
-        if (!double.TryParse(scaleStr, NumberStyles.Any, CultureInfo.InvariantCulture, out double scale)
+        string scaleStr = textBox.Text.Trim().Replace(',', '.');
+        if (!double.TryParse(scaleStr, NumberStyles.Any, CultureInfo.InvariantCulture, out scale)
             || scale <= 0 || scale > 500)
         {
-            MessageBox.Show("Scale không hợp lệ! Nhập số dương từ 1 đến 500 (%).",
+            MessageBox.Show($"{label} không hợp lệ! Nhập số dương từ 1 đến 500 (%).",
                 "Lỗi", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
+            return false;
         }
 
-        rtbLog2.Clear();
-        Log(rtbLog2, $"Format EVD — Scale: {scale}% (Width & Height), gap: 3 rows");
-
-        btnFormatEvd.Enabled = false;
-        try { await Task.Run(() => FormatEvdFiles(root, scale)); }
-        finally { btnFormatEvd.Enabled = true; }
+        return true;
     }
 
-    private void FormatEvdFiles(string root, double scalePct)
+    private (int success, int failed) FormatEvdFiles(
+        string root,
+        double scaleWidthPct,
+        double scaleHeightPct,
+        int zoom,
+        bool showMessage = true)
     {
         var ssNs  = XNamespace.Get("http://schemas.openxmlformats.org/spreadsheetml/2006/main");
         var rNs   = XNamespace.Get("http://schemas.openxmlformats.org/officeDocument/2006/relationships");
@@ -544,6 +554,7 @@ public class SupportToolsPanel : UserControl
             .ToArray();
 
         Log(rtbLog2, $"Tìm thấy {files.Length} file.");
+        Log(rtbLog2, $"Format EVD — Scale Width: {scaleWidthPct}% | Scale Height: {scaleHeightPct}% | gap: 3 rows");
         int success = 0, failed = 0;
 
         foreach (var file in files)
@@ -611,7 +622,7 @@ public class SupportToolsPanel : UserControl
                         XDocument drawDoc; using (var s = drawEntry.Open()) drawDoc = XDocument.Load(s);
 
                         var (drawMod, sheetMod) = EvdProcessDrawing(zip, drawPath, drawDoc, xdrNs,
-                            sheetDoc, ssNs, sharedStrings, scalePct, colW, rowH);
+                            sheetDoc, ssNs, sharedStrings, scaleWidthPct, scaleHeightPct, colW, rowH);
 
                         if (drawMod)
                         {
@@ -630,7 +641,7 @@ public class SupportToolsPanel : UserControl
                     }
                 }
 
-                ResetExcelView(file, zoomScale: 100);
+                ResetExcelView(file, zoomScale: zoom);
                 Log(rtbLog2, drawingsProcessed > 0
                     ? $"  ✓ Xử lý {drawingsProcessed} drawing(s)"
                     : "  ✓ Không có ảnh cần xử lý");
@@ -640,9 +651,14 @@ public class SupportToolsPanel : UserControl
         }
 
         Log(rtbLog2, $"Hoàn thành EVD! Thành công: {success} | Lỗi: {failed}", ClrInfo);
-        Invoke(() => MessageBox.Show(
-            $"Format EVD hoàn thành!\n\nThành công: {success}\nLỗi: {failed}",
-            "Kết quả", MessageBoxButtons.OK, MessageBoxIcon.Information));
+        if (showMessage)
+        {
+            Invoke(() => MessageBox.Show(
+                $"Format EVD hoàn thành!\n\nThành công: {success}\nLỗi: {failed}",
+                "Kết quả", MessageBoxButtons.OK, MessageBoxIcon.Information));
+        }
+
+        return (success, failed);
     }
 
     // ── EVD drawing processor ─────────────────────────────────
@@ -650,7 +666,8 @@ public class SupportToolsPanel : UserControl
         ZipArchive zip, string drawingPath,
         XDocument drawDoc, XNamespace xdr,
         XDocument sheetDoc, XNamespace ssNs, string[] sharedStrings,
-        double scalePct,
+        double scaleWidthPct,
+        double scaleHeightPct,
         Dictionary<int, long> colW, Dictionary<int, long> rowH)
     {
         var aNs   = XNamespace.Get("http://schemas.openxmlformats.org/drawingml/2006/main");
@@ -678,7 +695,7 @@ public class SupportToolsPanel : UserControl
         if (anchors.Count == 0) return (false, false);
 
         const long DefColEmu = 609600L;
-        const long DefRowEmu = 190500L;
+        long defRowEmu = EvdDefaultRowHeightEmu(sheetDoc, ssNs);
         const int  Gap       = 3;
         const int  SecondImageCol = 19;
 
@@ -689,7 +706,7 @@ public class SupportToolsPanel : UserControl
             (long nCx, long nCy) = rId != null && ridToImg.TryGetValue(rId, out var ip)
                 ? EvdNaturalSizeEmu(zip, ip) : (0L, 0L);
             if (nCx <= 0 || nCy <= 0) (nCx, nCy) = EvdCurrentSizeEmu(anchor, xdr, aNs);
-            return ((long)(nCx * scalePct / 100.0), (long)(nCy * scalePct / 100.0));
+            return ((long)(nCx * scaleWidthPct / 100.0), (long)(nCy * scaleHeightPct / 100.0));
         }
 
         // Layout group; returns row index after last image + gap
@@ -700,8 +717,8 @@ public class SupportToolsPanel : UserControl
             {
                 var (imgW, imgH) = GetImgSize(anchor);
                 if (imgW <= 0 || imgH <= 0) continue;
-                EvdSetAnchor(anchor, xdr, targetCol, 0, curRow, 0, imgW, imgH, colW, rowH, DefColEmu, DefRowEmu);
-                curRow += EvdRowSpan(curRow, imgH, rowH, DefRowEmu) + Gap;
+                EvdSetAnchor(anchor, xdr, targetCol, 0, curRow, 0, imgW, imgH, colW, rowH, DefColEmu, defRowEmu);
+                curRow += EvdRowSpan(curRow, imgH, rowH, defRowEmu) + Gap;
             }
             return curRow;
         }
@@ -783,7 +800,8 @@ public class SupportToolsPanel : UserControl
         return (true, sheetModified);
     }
 
-    // Đọc kích thước gốc của ảnh từ file ảnh bên trong ZIP (EMU theo DPI thực)
+    // Excel reports picture scale against a 96-DPI intrinsic size, even when the image
+    // carries non-square embedded DPI metadata.
     private static (long cx, long cy) EvdNaturalSizeEmu(ZipArchive zip, string imgPath)
     {
         try
@@ -796,10 +814,9 @@ public class SupportToolsPanel : UserControl
             ms.Position = 0;
 
             using var img = System.Drawing.Image.FromStream(ms, useEmbeddedColorManagement: false, validateImageData: false);
-            float dpiX = img.HorizontalResolution > 0 ? img.HorizontalResolution : 96f;
-            float dpiY = img.VerticalResolution   > 0 ? img.VerticalResolution   : 96f;
-            long cx = (long)(img.Width  * 914400L / dpiX);
-            long cy = (long)(img.Height * 914400L / dpiY);
+            const double ExcelDpi = 96.0;
+            long cx = (long)(img.Width  * 914400L / ExcelDpi);
+            long cy = (long)(img.Height * 914400L / ExcelDpi);
             return (cx, cy);
         }
         catch { return (0, 0); }
@@ -850,6 +867,22 @@ public class SupportToolsPanel : UserControl
             ext.SetAttributeValue("cx", imgW);
             ext.SetAttributeValue("cy", imgH);
         }
+
+        EvdSetPictureTransformExt(anchor, imgW, imgH);
+    }
+
+    private static void EvdSetPictureTransformExt(XElement anchor, long imgW, long imgH)
+    {
+        var aNs = XNamespace.Get("http://schemas.openxmlformats.org/drawingml/2006/main");
+        var xfrmExt = anchor
+            .Descendants(aNs + "xfrm")
+            .Elements(aNs + "ext")
+            .FirstOrDefault();
+        if (xfrmExt == null)
+            return;
+
+        xfrmExt.SetAttributeValue("cx", imgW);
+        xfrmExt.SetAttributeValue("cy", imgH);
     }
 
     // Tính (endIdx, endOffset) từ startIdx + startOffset + sizeEMU, dựa vào bảng kích thước thực
@@ -887,6 +920,22 @@ public class SupportToolsPanel : UserControl
             row++;
         }
         return row - fromRow;
+    }
+
+    private static long EvdDefaultRowHeightEmu(XDocument sheetDoc, XNamespace ssNs)
+    {
+        const long PtToEmu = 12700L;
+        const double ExcelDefaultRowHeightPt = 15.0;
+
+        var sheetFormatPr = sheetDoc.Root?.Element(ssNs + "sheetFormatPr");
+        var rawDefaultHeight = sheetFormatPr?.Attribute("defaultRowHeight")?.Value;
+        if (double.TryParse(rawDefaultHeight, NumberStyles.Any, CultureInfo.InvariantCulture, out var defaultHeight) &&
+            defaultHeight > 0)
+        {
+            return (long)(defaultHeight * PtToEmu);
+        }
+
+        return (long)(ExcelDefaultRowHeightPt * PtToEmu);
     }
 
     // Đọc col widths từ sheet XML (chuyển từ character-units → EMU)
@@ -1024,7 +1073,13 @@ public class SupportToolsPanel : UserControl
         }
     }
 
-    private void FormatExcelFiles(string root, double fontSize, bool applyFontSize, string fontName, int zoom)
+    private (int success, int failed) FormatExcelFiles(
+        string root,
+        double fontSize,
+        bool applyFontSize,
+        string fontName,
+        int zoom,
+        bool showMessage = true)
     {
         var files = Directory.GetFiles(root, "*.xls?", SearchOption.AllDirectories)
             .Where(f => f.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase) ||
@@ -1054,7 +1109,7 @@ public class SupportToolsPanel : UserControl
                         range.Style.Font.FontSize = fontSize;
                 }
                 wb.Save();
-                ResetExcelView(file);
+                ResetExcelView(file, zoomScale: zoom);
                 Log(rtbLog2, $"  ✓ Xong");
                 success++;
             }
@@ -1066,9 +1121,14 @@ public class SupportToolsPanel : UserControl
         }
 
         Log(rtbLog2, $"Hoàn thành! Thành công: {success} | Lỗi: {failed}", ClrInfo);
-        Invoke(() => MessageBox.Show(
-            $"Format Excel hoàn thành!\n\nThành công: {success}\nLỗi: {failed}",
-            "Kết quả", MessageBoxButtons.OK, MessageBoxIcon.Information));
+        if (showMessage)
+        {
+            Invoke(() => MessageBox.Show(
+                $"Format Excel hoàn thành!\n\nThành công: {success}\nLỗi: {failed}",
+                "Kết quả", MessageBoxButtons.OK, MessageBoxIcon.Information));
+        }
+
+        return (success, failed);
     }
 
     // ─────────────────────────────────────────────────────────

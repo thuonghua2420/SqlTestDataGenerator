@@ -99,6 +99,8 @@ namespace SqlTestDataGenerator.DataGeneration
                 GenerateScenarioData(workingScenario, query, schemas, insertOrder, nextTableIds);
                 ApplyScenarioScalarAggregateComparisonAdjustments(query, workingScenario, schemas);
                 ApplyScenarioInsertSafetyAdjustments(query, workingScenario, schemas);
+                ApplyScenarioHavingAggregateComparisonAdjustments(query, workingScenario, schemas);
+                ApplyScenarioInsertSafetyAdjustments(query, workingScenario, schemas);
                 EnforceScenarioForeignKeyClosure(workingScenario, schemas);
                 ApplyScenarioJoinColumnComparisonAdjustments(query, workingScenario, schemas);
                 ValidateScenarioLocalForeignKeys(workingScenario, schemas);
@@ -5475,6 +5477,486 @@ namespace SqlTestDataGenerator.DataGeneration
                         ComparisonOp.Like);
         }
 
+        private void ApplyScenarioHavingAggregateComparisonAdjustments(
+            ParsedQuery query,
+            BranchScenario scenario,
+            Dictionary<string, TableSchema> schemas)
+        {
+            if (!scenario.ExpectedToReturnRows)
+                return;
+
+            ApplyScenarioHavingAggregateComparisonAdjustments(query, scenario, schemas, includeComputedTargets: false);
+            ApplyScenarioHavingAggregateComparisonAdjustments(query, scenario, schemas, includeComputedTargets: true);
+        }
+
+        private void ApplyScenarioHavingAggregateComparisonAdjustments(
+            ParsedQuery query,
+            BranchScenario scenario,
+            Dictionary<string, TableSchema> schemas,
+            bool includeComputedTargets)
+        {
+            if (!scenario.ExpectedToReturnRows)
+                return;
+
+            foreach (var condition in query.EnumerateScopeConditions(ConditionSource.Having))
+            {
+                if (!condition.AggregateFunc.HasValue ||
+                    condition.AggregateFunc is AggregateFunction.Count or AggregateFunction.CountDistinct ||
+                    string.IsNullOrWhiteSpace(condition.ColumnName) ||
+                    !TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth) ||
+                    !desiredTruth)
+                {
+                    continue;
+                }
+
+                var tableAlias = ResolveConditionTargetAlias(condition);
+                var columnName = condition.ColumnName;
+                ResolveDerivedColumnReference(query, ref tableAlias, ref columnName);
+
+                if (!TryResolveTableForColumn(query, schemas, tableAlias, columnName, out var tableName) ||
+                    !schemas.TryGetValue(tableName, out var schema) ||
+                    !scenario.TableRows.TryGetValue(tableName, out var rows) ||
+                    rows.Count == 0)
+                {
+                    continue;
+                }
+
+                tableAlias = string.IsNullOrWhiteSpace(tableAlias) ? tableName : tableAlias;
+                var column = schema.GetColumn(columnName);
+                if (column == null ||
+                    column.TypeCategory is not (DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float))
+                {
+                    continue;
+                }
+
+                if (TryBuildComputedProductColumnPlan(schema, column, out var computedPlan))
+                {
+                    if (!includeComputedTargets)
+                    {
+                        continue;
+                    }
+
+                    ApplyComputedProductHavingAggregateCondition(
+                        query,
+                        scenario,
+                        tableName,
+                        tableAlias,
+                        schema,
+                        rows,
+                        condition,
+                        computedPlan);
+                    continue;
+                }
+
+                if (includeComputedTargets)
+                {
+                    continue;
+                }
+
+                ApplyDirectHavingAggregateCondition(
+                    query,
+                    scenario,
+                    tableName,
+                    tableAlias,
+                    schema,
+                    rows,
+                    condition,
+                    column);
+            }
+        }
+
+        private void ApplyDirectHavingAggregateCondition(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableName,
+            string tableAlias,
+            TableSchema schema,
+            List<GeneratedRow> rows,
+            ConditionInfo condition,
+            ColumnSchema column)
+        {
+            if (TryResolveConditionNumericBoundary(
+                    condition,
+                    scenario,
+                    query,
+                    null,
+                    column,
+                    tableAlias,
+                    false,
+                    out var boundary) &&
+                ExistingHavingAggregateConditionSatisfied(condition, rows, column, computedPlan: null, boundary))
+            {
+                return;
+            }
+
+            if (!CanAdjustComparisonColumn(schema, column) ||
+                !TryBuildDirectHavingAggregateValue(
+                    query,
+                    scenario,
+                    tableName,
+                    tableAlias,
+                    rows,
+                    condition,
+                    column,
+                    out var value))
+            {
+                return;
+            }
+
+            foreach (var row in rows)
+            {
+                row.SetValue(column.ColumnName, value);
+            }
+        }
+
+        private bool TryBuildDirectHavingAggregateValue(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableName,
+            string tableAlias,
+            List<GeneratedRow> rows,
+            ConditionInfo condition,
+            ColumnSchema column,
+            out object? value)
+        {
+            value = null;
+            if (!TryResolveConditionNumericBoundary(
+                    condition,
+                    scenario,
+                    query,
+                    null,
+                    column,
+                    tableAlias,
+                    false,
+                    out var boundary))
+            {
+                return false;
+            }
+
+            var rowCount = Math.Max(1, rows.Count);
+            var candidates = new List<decimal>();
+            candidates.AddRange(BuildHavingAggregateMemberCandidates(condition, column, rowCount, boundary));
+            foreach (var row in rows)
+            {
+                if (TryConvertDecimal(row.GetValue(column.ColumnName), out var currentValue))
+                {
+                    candidates.Add(currentValue);
+                }
+            }
+
+            candidates.AddRange(BuildPositiveNumericColumnCandidates(query, scenario, tableName, tableAlias, column));
+
+            foreach (var candidate in DeduplicateDecimalCandidates(candidates))
+            {
+                if (!TryNormalizeNumericCandidate(column, candidate, out var normalized, out var normalizedDecimal) ||
+                    !EvaluateHavingAggregateProjection(condition, normalizedDecimal, rowCount, boundary) ||
+                    !SatisfiesPositiveColumnConstraints(query, scenario, tableName, tableAlias, column, normalized, condition.Key))
+                {
+                    continue;
+                }
+
+                value = normalized;
+                return true;
+            }
+
+            return false;
+        }
+
+        private void ApplyComputedProductHavingAggregateCondition(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableName,
+            string tableAlias,
+            TableSchema schema,
+            List<GeneratedRow> rows,
+            ConditionInfo condition,
+            ComputedProductColumnPlan plan)
+        {
+            if (!CanAdjustComparisonColumn(schema, plan.AnchorColumn) ||
+                !CanAdjustComparisonColumn(schema, plan.AdjustableColumn) ||
+                !TryResolveConditionNumericBoundary(
+                    condition,
+                    scenario,
+                    query,
+                    null,
+                    plan.ResultColumn,
+                    tableAlias,
+                    false,
+                    out var boundary))
+            {
+                return;
+            }
+
+            if (ExistingHavingAggregateConditionSatisfied(condition, rows, plan.ResultColumn, plan, boundary))
+            {
+                return;
+            }
+
+            var rowCount = Math.Max(1, rows.Count);
+            foreach (var row in rows)
+            {
+                if (!TryBuildComputedProductHavingAggregateValues(
+                        query,
+                        scenario,
+                        tableName,
+                        tableAlias,
+                        row,
+                        rowCount,
+                        condition,
+                        plan,
+                        boundary,
+                        out var anchorValue,
+                        out var adjustableValue,
+                        out var resultValue))
+                {
+                    continue;
+                }
+
+                row.SetValue(plan.AnchorColumn.ColumnName, anchorValue);
+                row.SetValue(plan.AdjustableColumn.ColumnName, adjustableValue);
+
+                // Virtual value for preview/verification. SQL Server recomputes computed columns on insert.
+                row.SetValue(plan.ResultColumn.ColumnName, resultValue);
+            }
+        }
+
+        private bool TryBuildComputedProductHavingAggregateValues(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableName,
+            string tableAlias,
+            GeneratedRow row,
+            int rowCount,
+            ConditionInfo condition,
+            ComputedProductColumnPlan plan,
+            decimal boundary,
+            out object? anchorValue,
+            out object? adjustableValue,
+            out object? resultValue)
+        {
+            anchorValue = null;
+            adjustableValue = null;
+            resultValue = null;
+
+            var targetMemberCandidates = BuildHavingAggregateMemberCandidates(condition, plan.ResultColumn, rowCount, boundary)
+                .ToList();
+            var anchorCandidates = BuildAggregateAdjustmentCandidates(
+                query,
+                scenario,
+                tableName,
+                tableAlias,
+                plan.AnchorColumn,
+                row.GetValue(plan.AnchorColumn.ColumnName),
+                additionalCandidates: Enumerable.Empty<decimal>());
+            var baseAdjustableCandidates = BuildAggregateAdjustmentCandidates(
+                query,
+                scenario,
+                tableName,
+                tableAlias,
+                plan.AdjustableColumn,
+                row.GetValue(plan.AdjustableColumn.ColumnName),
+                additionalCandidates: targetMemberCandidates);
+
+            foreach (var rawAnchor in anchorCandidates)
+            {
+                if (!TryNormalizeNumericCandidate(plan.AnchorColumn, rawAnchor, out var normalizedAnchor, out var anchorDecimal) ||
+                    anchorDecimal == 0m ||
+                    !SatisfiesPositiveColumnConstraints(query, scenario, tableName, tableAlias, plan.AnchorColumn, normalizedAnchor))
+                {
+                    continue;
+                }
+
+                var adjustableCandidates = new List<decimal>(baseAdjustableCandidates);
+                foreach (var targetMember in targetMemberCandidates)
+                {
+                    adjustableCandidates.Add(targetMember / anchorDecimal);
+                    adjustableCandidates.Add((targetMember + GetNumericRangeStep(plan.ResultColumn)) / anchorDecimal);
+                }
+
+                foreach (var rawAdjustable in DeduplicateDecimalCandidates(adjustableCandidates))
+                {
+                    if (!TryNormalizeNumericCandidate(plan.AdjustableColumn, rawAdjustable, out var normalizedAdjustable, out var adjustableDecimal) ||
+                        !SatisfiesPositiveColumnConstraints(query, scenario, tableName, tableAlias, plan.AdjustableColumn, normalizedAdjustable))
+                    {
+                        continue;
+                    }
+
+                    if (TryGetPositiveColumnMax(plan.ResultColumn, out var resultMax) &&
+                        !IsComputedProductWithinRange(anchorDecimal, adjustableDecimal, resultMax))
+                    {
+                        continue;
+                    }
+
+                    var rawResult = anchorDecimal * adjustableDecimal;
+                    if (!TryNormalizeNumericCandidate(plan.ResultColumn, rawResult, out var normalizedResult, out var resultDecimal) ||
+                        !EvaluateHavingAggregateProjection(condition, resultDecimal, rowCount, boundary) ||
+                        !SatisfiesPositiveColumnConstraints(query, scenario, tableName, tableAlias, plan.ResultColumn, normalizedResult, condition.Key))
+                    {
+                        continue;
+                    }
+
+                    anchorValue = normalizedAnchor;
+                    adjustableValue = normalizedAdjustable;
+                    resultValue = normalizedResult;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool ExistingHavingAggregateConditionSatisfied(
+            ConditionInfo condition,
+            IEnumerable<GeneratedRow> rows,
+            ColumnSchema column,
+            ComputedProductColumnPlan? computedPlan,
+            decimal boundary)
+        {
+            var values = new List<decimal>();
+            foreach (var row in rows)
+            {
+                object? rawValue = null;
+                if (computedPlan != null &&
+                    TryConvertDecimal(row.GetValue(computedPlan.AnchorColumn.ColumnName), out var anchorValue) &&
+                    TryConvertDecimal(row.GetValue(computedPlan.AdjustableColumn.ColumnName), out var adjustableValue))
+                {
+                    rawValue = anchorValue * adjustableValue;
+                }
+                else
+                {
+                    rawValue = row.GetValue(column.ColumnName);
+                }
+
+                if (TryConvertDecimal(rawValue, out var decimalValue))
+                {
+                    values.Add(decimalValue);
+                }
+            }
+
+            if (values.Count == 0)
+                return false;
+
+            if (condition.AggregateFunc == AggregateFunction.Sum &&
+                condition.Operator is ComparisonOp.GreaterThan or ComparisonOp.GreaterThanOrEqual)
+            {
+                return values.All(value => EvaluateNumericComparison(value, condition.Operator, boundary));
+            }
+
+            var aggregateValue = condition.AggregateFunc switch
+            {
+                AggregateFunction.Sum => values.Sum(),
+                AggregateFunction.Avg => values.Average(),
+                AggregateFunction.Max => values.Max(),
+                AggregateFunction.Min => values.Min(),
+                _ => values.First()
+            };
+
+            return EvaluateNumericComparison(aggregateValue, condition.Operator, boundary);
+        }
+
+        private IEnumerable<decimal> BuildAggregateAdjustmentCandidates(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableName,
+            string tableAlias,
+            ColumnSchema column,
+            object? currentValue,
+            IEnumerable<decimal> additionalCandidates)
+        {
+            var candidates = new List<decimal>();
+            if (TryConvertDecimal(currentValue, out var currentDecimal))
+            {
+                candidates.Add(currentDecimal);
+            }
+
+            candidates.AddRange(additionalCandidates);
+            candidates.AddRange(BuildPositiveNumericColumnCandidates(query, scenario, tableName, tableAlias, column));
+            return DeduplicateDecimalCandidates(candidates);
+        }
+
+        private static IEnumerable<decimal> BuildHavingAggregateMemberCandidates(
+            ConditionInfo condition,
+            ColumnSchema column,
+            int rowCount,
+            decimal boundary)
+        {
+            var count = Math.Max(1, rowCount);
+            var step = GetNumericRangeStep(column);
+            var candidates = new List<decimal>();
+
+            void AddStandardComparisonCandidates(decimal baseBoundary)
+            {
+                switch (condition.Operator)
+                {
+                    case ComparisonOp.GreaterThan:
+                        candidates.Add(baseBoundary + step);
+                        break;
+                    case ComparisonOp.GreaterThanOrEqual:
+                        candidates.Add(baseBoundary);
+                        candidates.Add(baseBoundary + step);
+                        break;
+                    case ComparisonOp.LessThan:
+                        candidates.Add(baseBoundary - step);
+                        break;
+                    case ComparisonOp.LessThanOrEqual:
+                        candidates.Add(baseBoundary);
+                        candidates.Add(baseBoundary - step);
+                        break;
+                    case ComparisonOp.Equal:
+                        candidates.Add(baseBoundary);
+                        break;
+                    case ComparisonOp.NotEqual:
+                        candidates.Add(baseBoundary + step);
+                        candidates.Add(baseBoundary - step);
+                        break;
+                }
+            }
+
+            if (condition.AggregateFunc == AggregateFunction.Sum)
+            {
+                AddStandardComparisonCandidates(boundary / count);
+                AddStandardComparisonCandidates(boundary);
+            }
+            else
+            {
+                AddStandardComparisonCandidates(boundary);
+            }
+
+            candidates.AddRange(new[] { 1m, 2m, 5m, 10m, 100m, 1000m, 100000m, 500000m, 1000000m, 15050000m });
+            return DeduplicateDecimalCandidates(candidates);
+        }
+
+        private static bool EvaluateHavingAggregateProjection(
+            ConditionInfo condition,
+            decimal memberValue,
+            int rowCount,
+            decimal boundary)
+        {
+            var aggregateValue = condition.AggregateFunc switch
+            {
+                AggregateFunction.Sum when condition.Operator is ComparisonOp.GreaterThan or ComparisonOp.GreaterThanOrEqual or ComparisonOp.NotEqual => memberValue,
+                AggregateFunction.Sum => memberValue * Math.Max(1, rowCount),
+                AggregateFunction.Avg => memberValue,
+                AggregateFunction.Max => memberValue,
+                AggregateFunction.Min => memberValue,
+                _ => memberValue
+            };
+
+            return EvaluateNumericComparison(aggregateValue, condition.Operator, boundary);
+        }
+
+        private static bool EvaluateNumericComparison(decimal left, ComparisonOp op, decimal right) =>
+            op switch
+            {
+                ComparisonOp.Equal => left == right,
+                ComparisonOp.NotEqual => left != right,
+                ComparisonOp.GreaterThan => left > right,
+                ComparisonOp.GreaterThanOrEqual => left >= right,
+                ComparisonOp.LessThan => left < right,
+                ComparisonOp.LessThanOrEqual => left <= right,
+                _ => true
+            };
+
         private void ApplyScenarioScalarAggregateComparisonAdjustments(
             ParsedQuery query,
             BranchScenario scenario,
@@ -6151,12 +6633,15 @@ namespace SqlTestDataGenerator.DataGeneration
             string tableName,
             string tableAlias,
             ColumnSchema column,
-            object? value)
+            object? value,
+            string excludedConditionKey = "")
         {
             var generator = _valueFactory.GetGenerator(column.TypeCategory);
             foreach (var condition in query.PredicateScopes.SelectMany(s => s.Conditions))
             {
-                if (HasScalarSubqueryPlaceholder(condition) ||
+                if ((!string.IsNullOrWhiteSpace(excludedConditionKey) &&
+                     condition.Key.Equals(excludedConditionKey, StringComparison.OrdinalIgnoreCase)) ||
+                    HasScalarSubqueryPlaceholder(condition) ||
                     !ConditionTargetsColumn(query, condition, tableName, tableAlias, column.ColumnName) ||
                     !TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth) ||
                     !desiredTruth)
