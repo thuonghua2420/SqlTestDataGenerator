@@ -44,6 +44,12 @@ namespace SqlTestDataGenerator.DataGeneration
         public bool UseMaxLengthMaxValueMode { get; set; }
 
         /// <summary>
+        /// Randomizes generated unconstrained values after row generation so sample data looks less index-based.
+        /// Predicate-bound keys, relationships, and computed dependencies are left unchanged.
+        /// </summary>
+        public bool ShuffleGeneratedStringCharacters { get; set; }
+
+        /// <summary>
         /// Target number of rows generated per table for each selected scenario.
         /// </summary>
         public int RowsPerTable { get; set; } = 1;
@@ -97,6 +103,12 @@ namespace SqlTestDataGenerator.DataGeneration
                 var workingScenario = CloneScenarioDescriptor(scenario);
                 workingScenario.InsertOrder = new List<string>(insertOrder);
                 GenerateScenarioData(workingScenario, query, schemas, insertOrder, nextTableIds);
+                ApplyNegativeScenarioPinnedUniqueKeyIsolation(
+                    query,
+                    workingScenario,
+                    schemas,
+                    nextTableIds,
+                    scenarios.Any(s => s.ExpectedToReturnRows));
                 ApplyScenarioScalarAggregateComparisonAdjustments(query, workingScenario, schemas);
                 ApplyScenarioInsertSafetyAdjustments(query, workingScenario, schemas);
                 ApplyScenarioHavingAggregateComparisonAdjustments(query, workingScenario, schemas);
@@ -104,6 +116,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 EnforceScenarioForeignKeyClosure(workingScenario, schemas);
                 ApplyScenarioJoinColumnComparisonAdjustments(query, workingScenario, schemas);
                 ApplyScenarioInsertSafetyAdjustments(query, workingScenario, schemas);
+                ApplyScenarioStringShuffleAdjustments(query, workingScenario, schemas);
                 ValidateScenarioLocalForeignKeys(workingScenario, schemas);
                 dataSet.Scenarios.Add(workingScenario);
             }
@@ -181,6 +194,725 @@ namespace SqlTestDataGenerator.DataGeneration
                 {
                     ApplyComputedProductSafetyAdjustments(query, scenario, schema, row);
                 }
+            }
+        }
+
+        private void ApplyScenarioStringShuffleAdjustments(
+            ParsedQuery query,
+            BranchScenario scenario,
+            Dictionary<string, TableSchema> schemas)
+        {
+            if (!ShuffleGeneratedStringCharacters)
+                return;
+
+            var usedValueCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var row in scenario.TableRows.Values.SelectMany(r => r))
+            {
+                foreach (var rawValue in row.ColumnValues.Values)
+                {
+                    var text = Convert.ToString(rawValue, System.Globalization.CultureInfo.InvariantCulture);
+                    if (!string.IsNullOrEmpty(text))
+                    {
+                        IncrementUsedValue(usedValueCounts, text);
+                    }
+                }
+            }
+
+            foreach (var (tableName, rows) in scenario.TableRows)
+            {
+                if (!schemas.TryGetValue(tableName, out var schema))
+                    continue;
+
+                for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+                {
+                    var row = rows[rowIndex];
+                    foreach (var column in schema.Columns)
+                    {
+                        if (!CanShuffleGeneratedColumn(query, scenario, schema, column))
+                            continue;
+
+                        var rawValue = row.GetValue(column.ColumnName);
+                        if (!TryBuildShuffledGeneratedValue(
+                                tableName,
+                                column,
+                                rowIndex,
+                                rawValue,
+                                usedValueCounts,
+                                out var shuffledValue,
+                                out var shuffledValueKey))
+                        {
+                            continue;
+                        }
+
+                        var originalKey = Convert.ToString(rawValue, System.Globalization.CultureInfo.InvariantCulture);
+                        if (string.IsNullOrEmpty(originalKey))
+                            continue;
+
+                        DecrementUsedValue(usedValueCounts, originalKey);
+                        IncrementUsedValue(usedValueCounts, shuffledValueKey);
+                        row.SetValue(column.ColumnName, shuffledValue);
+                    }
+                }
+            }
+        }
+
+        private static void IncrementUsedValue(Dictionary<string, int> usedValueCounts, string value)
+        {
+            usedValueCounts.TryGetValue(value, out var count);
+            usedValueCounts[value] = count + 1;
+        }
+
+        private static void DecrementUsedValue(Dictionary<string, int> usedValueCounts, string value)
+        {
+            if (!usedValueCounts.TryGetValue(value, out var count))
+                return;
+
+            if (count <= 1)
+            {
+                usedValueCounts.Remove(value);
+                return;
+            }
+
+            usedValueCounts[value] = count - 1;
+        }
+
+        private bool CanShuffleGeneratedColumn(
+            ParsedQuery query,
+            BranchScenario scenario,
+            TableSchema schema,
+            ColumnSchema column)
+        {
+            if (column.IsComputed ||
+                column.IsIdentity ||
+                column.IsPrimaryKey ||
+                schema.PrimaryKey?.Columns.Any(c => c.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)) == true ||
+                schema.ForeignKeys.Any(fk => fk.ColumnName.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)) ||
+                IsOrderBySensitiveColumn(query, schema, column) ||
+                IsPredicatePinnedComputedSourceColumn(query, scenario, schema, column) ||
+                HasShuffleUnsafePredicateColumn(query, scenario, schema.TableName, column.ColumnName))
+            {
+                return false;
+            }
+
+            return column.TypeCategory is DataTypeCategory.String or
+                DataTypeCategory.Integer or
+                DataTypeCategory.Decimal or
+                DataTypeCategory.Float or
+                DataTypeCategory.DateTime or
+                DataTypeCategory.Time or
+                DataTypeCategory.DateTimeOffset;
+        }
+
+        private static bool IsOrderBySensitiveColumn(
+            ParsedQuery query,
+            TableSchema schema,
+            ColumnSchema column)
+        {
+            if (string.IsNullOrWhiteSpace(query.OriginalSql) ||
+                string.IsNullOrWhiteSpace(column.ColumnName) ||
+                !System.Text.RegularExpressions.Regex.IsMatch(
+                    query.OriginalSql,
+                    @"\bORDER\s+BY\b",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            {
+                return false;
+            }
+
+            var escapedColumn = System.Text.RegularExpressions.Regex.Escape(column.ColumnName);
+            if (!System.Text.RegularExpressions.Regex.IsMatch(
+                    query.OriginalSql,
+                    @"\bORDER\s+BY\b[\s\S]*\b" + escapedColumn + @"\b",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            {
+                return false;
+            }
+
+            if (column.TypeCategory is DataTypeCategory.DateTime or DataTypeCategory.DateTimeOffset or DataTypeCategory.Time)
+                return true;
+
+            return schema.PrimaryKey?.Columns.Contains(column.ColumnName, StringComparer.OrdinalIgnoreCase) == true ||
+                   column.ColumnName.Contains("Sort", StringComparison.OrdinalIgnoreCase) ||
+                   column.ColumnName.Contains("Rank", StringComparison.OrdinalIgnoreCase) ||
+                   column.ColumnName.Contains("Sequence", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private bool HasShuffleUnsafePredicateColumn(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableAlias,
+            string columnName)
+        {
+            return query.PredicateScopes
+                .SelectMany(s => s.Conditions)
+                .Any(condition =>
+                    TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth) &&
+                    desiredTruth &&
+                    IsConditionTargetingColumn(query, condition, tableAlias, columnName) &&
+                    IsShuffleUnsafePredicate(condition));
+        }
+
+        private static bool IsShuffleUnsafePredicate(ConditionInfo condition)
+        {
+            if (condition.Operator == ComparisonOp.IsNotNull &&
+                !condition.HasSubquery &&
+                !condition.IsColumnComparison &&
+                !HasScalarSubqueryPlaceholder(condition))
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool IsPredicatePinnedComputedSourceColumn(
+            ParsedQuery query,
+            BranchScenario scenario,
+            TableSchema schema,
+            ColumnSchema column)
+        {
+            if (schema.Columns.All(c => !c.IsComputed || string.IsNullOrWhiteSpace(c.ComputedExpression)))
+                return false;
+
+            return schema.Columns
+                .Where(c => c.IsComputed && !string.IsNullOrWhiteSpace(c.ComputedExpression))
+                .Any(c =>
+                    IsPredicatePinnedColumn(query, scenario, schema.TableName, c.ColumnName) &&
+                    ExtractComputedExpressionColumnNames(c.ComputedExpression, schema)
+                        .Any(name => name.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)));
+        }
+
+        private static bool TryBuildShuffledGeneratedValue(
+            string tableName,
+            ColumnSchema column,
+            int rowIndex,
+            object? rawValue,
+            Dictionary<string, int> usedValueCounts,
+            out object? shuffledValue,
+            out string shuffledValueKey)
+        {
+            shuffledValue = null;
+            shuffledValueKey = string.Empty;
+
+            var text = Convert.ToString(rawValue, System.Globalization.CultureInfo.InvariantCulture);
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return false;
+            }
+
+            if (column.TypeCategory == DataTypeCategory.String)
+            {
+                if (!TryBuildShuffledText(
+                        tableName,
+                        column,
+                        rowIndex,
+                        text,
+                        usedValueCounts,
+                        out shuffledValue,
+                        out shuffledValueKey))
+                {
+                    return false;
+                }
+
+                return !ValuesEqual(rawValue, shuffledValue);
+            }
+            if (column.TypeCategory is DataTypeCategory.DateTime or DataTypeCategory.Time or DataTypeCategory.DateTimeOffset)
+            {
+                return TryBuildShuffledTemporalValue(
+                    tableName,
+                    column,
+                    rowIndex,
+                    rawValue,
+                    text,
+                    usedValueCounts,
+                    out shuffledValue,
+                    out shuffledValueKey);
+            }
+
+            return TryBuildShuffledNumericValue(
+                tableName,
+                column,
+                rowIndex,
+                rawValue,
+                text,
+                usedValueCounts,
+                out shuffledValue,
+                out shuffledValueKey);
+        }
+
+        private static bool TryBuildShuffledText(
+            string tableName,
+            ColumnSchema column,
+            int rowIndex,
+            string value,
+            Dictionary<string, int> usedValueCounts,
+            out object? shuffledValue,
+            out string shuffledValueKey)
+        {
+            shuffledValue = null;
+            shuffledValueKey = string.Empty;
+            var sources = BuildShuffleTextSources(value, rowIndex, column);
+
+            foreach (var source in sources)
+            {
+                if (source.Length < 2 || source.Distinct().Count() < 2)
+                    continue;
+
+                for (var attempt = 0; attempt < 16; attempt++)
+                {
+                    var chars = source.ToCharArray();
+                    var random = new Random(BuildStableShuffleSeed(tableName, column.ColumnName, rowIndex, source, attempt));
+                    for (var i = chars.Length - 1; i > 0; i--)
+                    {
+                        var j = random.Next(i + 1);
+                        (chars[i], chars[j]) = (chars[j], chars[i]);
+                    }
+
+                    var candidate = new string(chars);
+                    var normalized = SqlServerValueNormalizer.NormalizeValue(column, candidate) ?? candidate;
+                    var key = Convert.ToString(normalized, System.Globalization.CultureInfo.InvariantCulture);
+                    if (!string.IsNullOrEmpty(key) &&
+                        !ValuesEqual(value, normalized) &&
+                        !usedValueCounts.ContainsKey(key))
+                    {
+                        shuffledValue = normalized;
+                        shuffledValueKey = key;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static IEnumerable<string> BuildShuffleTextSources(string value, int rowIndex, ColumnSchema column)
+        {
+            yield return value;
+
+            var rowToken = (rowIndex + 1).ToString("D4");
+            yield return value + rowToken;
+            yield return rowToken + value;
+
+            var columnToken = new string(column.ColumnName.Where(char.IsLetterOrDigit).Take(4).ToArray());
+            if (!string.IsNullOrEmpty(columnToken))
+            {
+                yield return value + columnToken + rowToken;
+            }
+        }
+
+        private static bool TryBuildShuffledNumericValue(
+            string tableName,
+            ColumnSchema column,
+            int rowIndex,
+            object? rawValue,
+            string text,
+            Dictionary<string, int> usedValueCounts,
+            out object? shuffledValue,
+            out string shuffledValueKey)
+        {
+            shuffledValue = null;
+            shuffledValueKey = string.Empty;
+
+            var baseDigits = text.Where(char.IsDigit).ToArray();
+            if (baseDigits.Length == 0)
+                return false;
+
+            var isNegative = text.TrimStart().StartsWith("-", StringComparison.Ordinal);
+            var scale = column.TypeCategory == DataTypeCategory.Decimal
+                ? Math.Max(0, column.NumericScale ?? CountFractionDigits(text))
+                : column.TypeCategory == DataTypeCategory.Float
+                    ? CountFractionDigits(text)
+                    : 0;
+
+            for (var attempt = 0; attempt < 24; attempt++)
+            {
+                var shuffledDigits = BuildNumericShuffleDigits(baseDigits, column, rowIndex, scale, attempt);
+                if (shuffledDigits.Length < 2 || shuffledDigits.Distinct().Count() < 2)
+                    continue;
+
+                var random = new Random(BuildStableShuffleSeed(tableName, column.ColumnName, rowIndex, new string(shuffledDigits), attempt));
+                for (var i = shuffledDigits.Length - 1; i > 0; i--)
+                {
+                    var j = random.Next(i + 1);
+                    (shuffledDigits[i], shuffledDigits[j]) = (shuffledDigits[j], shuffledDigits[i]);
+                }
+
+                var candidateText = ComposeNumericText(shuffledDigits, scale, isNegative);
+                if (candidateText.Equals(text, StringComparison.Ordinal))
+                    continue;
+
+                if (!decimal.TryParse(
+                        candidateText,
+                        System.Globalization.NumberStyles.Any,
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        out var parsed))
+                {
+                    continue;
+                }
+
+                var normalized = SqlServerValueNormalizer.NormalizeValue(column, parsed);
+                if (normalized == null || ValuesEqual(rawValue, normalized))
+                    continue;
+
+                var key = Convert.ToString(normalized, System.Globalization.CultureInfo.InvariantCulture);
+                if (string.IsNullOrEmpty(key) || usedValueCounts.ContainsKey(key))
+                    continue;
+
+                shuffledValue = normalized;
+                shuffledValueKey = key;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static char[] BuildNumericShuffleDigits(
+            char[] baseDigits,
+            ColumnSchema column,
+            int rowIndex,
+            int scale,
+            int attempt)
+        {
+            var rowToken = (rowIndex + 1 + attempt).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            var source = new string(baseDigits);
+            if (baseDigits.Length < 2 ||
+                baseDigits.Distinct().Count() < 2 ||
+                attempt >= 4)
+            {
+                source += rowToken;
+            }
+
+            var maxDigits = ResolveMaxShuffleNumericDigits(column, scale);
+            if (maxDigits > 0 && source.Length > maxDigits)
+            {
+                source = source[^maxDigits..];
+            }
+
+            return source.ToCharArray();
+        }
+
+        private static int ResolveMaxShuffleNumericDigits(ColumnSchema column, int scale)
+        {
+            if (column.TypeCategory == DataTypeCategory.Decimal)
+            {
+                return Math.Max(1, column.NumericPrecision ?? 18);
+            }
+
+            if (column.TypeCategory == DataTypeCategory.Integer)
+            {
+                return column.DataType.ToLowerInvariant() switch
+                {
+                    "tinyint" => 3,
+                    "smallint" => 5,
+                    "bigint" => 18,
+                    _ => 10
+                };
+            }
+
+            if (column.TypeCategory == DataTypeCategory.Float)
+            {
+                return Math.Max(4, 12 + scale);
+            }
+
+            return 0;
+        }
+
+        private static bool TryBuildShuffledTemporalValue(
+            string tableName,
+            ColumnSchema column,
+            int rowIndex,
+            object? rawValue,
+            string text,
+            Dictionary<string, int> usedValueCounts,
+            out object? shuffledValue,
+            out string shuffledValueKey)
+        {
+            shuffledValue = null;
+            shuffledValueKey = string.Empty;
+
+            var digits = text.Where(char.IsDigit).ToArray();
+            if (digits.Length == 0)
+                return false;
+
+            for (var attempt = 0; attempt < 16; attempt++)
+            {
+                var sourceDigits = (new string(digits) + (rowIndex + 1 + attempt).ToString("D4")).ToCharArray();
+                var random = new Random(BuildStableShuffleSeed(tableName, column.ColumnName, rowIndex, new string(sourceDigits), attempt));
+                for (var i = sourceDigits.Length - 1; i > 0; i--)
+                {
+                    var j = random.Next(i + 1);
+                    (sourceDigits[i], sourceDigits[j]) = (sourceDigits[j], sourceDigits[i]);
+                }
+
+                var numericSeed = BuildNumberFromDigits(sourceDigits);
+                var normalized = BuildTemporalValueFromSeed(column, rawValue, numericSeed);
+                if (normalized == null || ValuesEqual(rawValue, normalized))
+                    continue;
+
+                var key = Convert.ToString(normalized, System.Globalization.CultureInfo.InvariantCulture);
+                if (string.IsNullOrEmpty(key) || usedValueCounts.ContainsKey(key))
+                    continue;
+
+                shuffledValue = normalized;
+                shuffledValueKey = key;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static long BuildNumberFromDigits(IEnumerable<char> digits)
+        {
+            long value = 0;
+            foreach (var digit in digits.Where(char.IsDigit).Take(15))
+            {
+                value = (value * 10) + (digit - '0');
+            }
+
+            return value;
+        }
+
+        private static object? BuildTemporalValueFromSeed(ColumnSchema column, object? rawValue, long seed)
+        {
+            try
+            {
+                var baseDate = rawValue switch
+                {
+                    DateTime dt => DateTime.SpecifyKind(dt, DateTimeKind.Unspecified),
+                    DateTimeOffset dto => DateTime.SpecifyKind(dto.DateTime, DateTimeKind.Unspecified),
+                    _ => DateTime.TryParse(
+                        Convert.ToString(rawValue, System.Globalization.CultureInfo.InvariantCulture),
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.None,
+                        out var parsed)
+                        ? DateTime.SpecifyKind(parsed, DateTimeKind.Unspecified)
+                        : new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Unspecified)
+                };
+
+                var offsetMinutes = (int)(Math.Abs(seed) % (365L * 24L * 60L));
+                var candidate = new DateTime(baseDate.Year, 1, 1, 0, 0, 0, DateTimeKind.Unspecified)
+                    .AddMinutes(offsetMinutes)
+                    .AddSeconds(Math.Abs(seed / 17) % 60);
+
+                return column.TypeCategory switch
+                {
+                    DataTypeCategory.Time => candidate.TimeOfDay,
+                    DataTypeCategory.DateTimeOffset => new DateTimeOffset(candidate, TimeSpan.Zero),
+                    _ => SqlServerValueNormalizer.NormalizeValue(column, candidate)
+                };
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static int CountFractionDigits(string text)
+        {
+            var dotIndex = text.IndexOf('.', StringComparison.Ordinal);
+            if (dotIndex < 0 || dotIndex == text.Length - 1)
+                return 0;
+
+            return text[(dotIndex + 1)..].Count(char.IsDigit);
+        }
+
+        private static string ComposeNumericText(char[] digits, int scale, bool isNegative)
+        {
+            var normalizedDigits = new string(digits);
+            string numericText;
+            if (scale > 0)
+            {
+                if (normalizedDigits.Length <= scale)
+                {
+                    normalizedDigits = normalizedDigits.PadLeft(scale + 1, '0');
+                }
+
+                var split = normalizedDigits.Length - scale;
+                numericText = normalizedDigits[..split] + "." + normalizedDigits[split..];
+            }
+            else
+            {
+                numericText = normalizedDigits;
+            }
+
+            return isNegative ? "-" + numericText : numericText;
+        }
+
+        private static int BuildStableShuffleSeed(
+            string tableName,
+            string columnName,
+            int rowIndex,
+            string value,
+            int attempt)
+        {
+            unchecked
+            {
+                var hash = 17;
+                foreach (var ch in tableName)
+                    hash = (hash * 31) + ch;
+                foreach (var ch in columnName)
+                    hash = (hash * 31) + ch;
+                foreach (var ch in value)
+                    hash = (hash * 31) + ch;
+                hash = (hash * 31) + rowIndex;
+                hash = (hash * 31) + attempt;
+                return hash == int.MinValue ? int.MaxValue : Math.Abs(hash);
+            }
+        }
+
+        private void ApplyNegativeScenarioPinnedUniqueKeyIsolation(
+            ParsedQuery query,
+            BranchScenario scenario,
+            Dictionary<string, TableSchema> schemas,
+            Dictionary<string, int> nextTableIds,
+            bool selectedSetContainsReturningScenario)
+        {
+            if (!selectedSetContainsReturningScenario || scenario.ExpectedToReturnRows)
+                return;
+
+            foreach (var (tableName, rows) in scenario.TableRows.ToList())
+            {
+                if (rows.Count == 0 || !schemas.TryGetValue(tableName, out var schema))
+                    continue;
+
+                foreach (var uniqueColumn in EnumerateSingleColumnUniqueKeyColumns(schema))
+                {
+                    foreach (var alias in ResolveAliasesForTable(query, tableName))
+                    {
+                        var pinnedConditions = FindPositiveDirectUniqueKeyConditions(
+                                query,
+                                scenario,
+                                alias,
+                                uniqueColumn.ColumnName)
+                            .Where(c => !IsScenarioTestingCondition(scenario, c))
+                            .ToList();
+
+                        if (pinnedConditions.Count == 0)
+                            continue;
+
+                        var oldValues = rows
+                            .Select(r => r.GetValue(uniqueColumn.ColumnName))
+                            .Where(v => v != null && v != DBNull.Value)
+                            .Distinct(ValueObjectEqualityComparer.Instance)
+                            .ToList();
+
+                        foreach (var oldValue in oldValues)
+                        {
+                            var replacement = GeneratePinnedUniqueKeyIsolationValue(schema, uniqueColumn, nextTableIds);
+                            if (replacement == null || replacement == DBNull.Value || ValuesEqual(oldValue, replacement))
+                                continue;
+
+                            foreach (var row in rows.Where(r => ValuesEqual(r.GetValue(uniqueColumn.ColumnName), oldValue)))
+                            {
+                                row.SetValue(uniqueColumn.ColumnName, replacement);
+                            }
+
+                            PropagateScenarioKeyValueChange(
+                                scenario,
+                                schemas,
+                                tableName,
+                                uniqueColumn.ColumnName,
+                                oldValue,
+                                replacement);
+                        }
+
+                        break;
+                    }
+                }
+            }
+        }
+
+        private object? GeneratePinnedUniqueKeyIsolationValue(
+            TableSchema schema,
+            ColumnSchema column,
+            Dictionary<string, int> nextTableIds)
+        {
+            object rawValue = column.TypeCategory switch
+            {
+                DataTypeCategory.Integer => AllocateTableIdBlock(nextTableIds, schema.TableName, 1),
+                DataTypeCategory.Decimal => (decimal)AllocateTableIdBlock(nextTableIds, schema.TableName, 1),
+                DataTypeCategory.Float => (double)AllocateTableIdBlock(nextTableIds, schema.TableName, 1),
+                DataTypeCategory.Guid => Guid.NewGuid(),
+                DataTypeCategory.String => BuildSemanticString(column, AllocateTableIdBlock(nextTableIds, schema.TableName, 1), null),
+                _ => AllocateTableIdBlock(nextTableIds, schema.TableName, 1)
+            };
+
+            return SqlServerValueNormalizer.NormalizeValue(column, rawValue) ?? rawValue;
+        }
+
+        private static void PropagateScenarioKeyValueChange(
+            BranchScenario scenario,
+            Dictionary<string, TableSchema> schemas,
+            string parentTableName,
+            string parentColumnName,
+            object? oldValue,
+            object? newValue)
+        {
+            foreach (var childSchema in schemas.Values)
+            {
+                var matchingFks = childSchema.ForeignKeys
+                    .Where(fk =>
+                        fk.ReferencedTable.Equals(parentTableName, StringComparison.OrdinalIgnoreCase) &&
+                        fk.ReferencedColumn.Equals(parentColumnName, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                if (matchingFks.Count == 0 ||
+                    !scenario.TableRows.TryGetValue(childSchema.TableName, out var childRows))
+                {
+                    continue;
+                }
+
+                foreach (var fk in matchingFks)
+                {
+                    foreach (var childRow in childRows)
+                    {
+                        if (ValuesEqual(childRow.GetValue(fk.ColumnName), oldValue))
+                        {
+                            childRow.SetValue(fk.ColumnName, newValue);
+                        }
+                    }
+                }
+            }
+        }
+
+        private static bool IsScenarioTestingCondition(BranchScenario scenario, ConditionInfo condition)
+        {
+            if (!string.IsNullOrWhiteSpace(scenario.TestedCondition) &&
+                scenario.TestedCondition.Equals(condition.Key, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return scenario.TestedConditions.Any(t =>
+                t.Equals(condition.Key, StringComparison.OrdinalIgnoreCase) ||
+                t.Equals(condition.ToString(), StringComparison.OrdinalIgnoreCase));
+        }
+
+        private sealed class ValueObjectEqualityComparer : IEqualityComparer<object?>
+        {
+            public static readonly ValueObjectEqualityComparer Instance = new();
+
+            public new bool Equals(object? x, object? y) => ValuesEqual(x, y);
+
+            public int GetHashCode(object? obj)
+            {
+                if (obj == null || obj == DBNull.Value)
+                    return 0;
+
+                if (obj is byte[] bytes)
+                {
+                    unchecked
+                    {
+                        var hash = 17;
+                        foreach (var b in bytes)
+                            hash = (hash * 31) + b;
+                        return hash;
+                    }
+                }
+
+                return Convert
+                    .ToString(obj, System.Globalization.CultureInfo.InvariantCulture)
+                    ?.ToUpperInvariant()
+                    .GetHashCode() ?? 0;
             }
         }
 
@@ -351,6 +1083,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 // For tables that contribute to aggregates, create multiple rows
                 bool isAggregateSource = IsAggregateSourceTable(tableName, alias, query);
+                int requestedRows = GetRequestedRowCount();
                 int rowCount = DetermineScenarioRowCount(
                     tableName,
                     alias,
@@ -358,11 +1091,12 @@ namespace SqlTestDataGenerator.DataGeneration
                     query,
                     isAggregateSource,
                     rowMultiplier,
-                    GetRequestedRowCount());
+                    requestedRows);
                 if (specialMinimumRows.TryGetValue(tableName, out var specialMinimum))
                 {
                     rowCount = Math.Max(rowCount, specialMinimum);
                 }
+                rowCount = ApplyPinnedUniqueKeyRowCountLimit(query, scenario, schema, alias, rowCount, selfReferencePlans);
                 rowCount = ApplySelfReferenceMinimumRowCount(tableName, rowCount, selfReferencePlans);
                 int currentId = AllocateTableIdBlock(nextTableIds, tableName, rowCount);
 
@@ -418,7 +1152,13 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 int rowCount = ApplySelfReferenceMinimumRowCount(
                     tableName,
-                    GetRequestedRowCount(),
+                    ApplyPinnedUniqueKeyRowCountLimit(
+                        query,
+                        scenario,
+                        schema,
+                        alias,
+                        GetRequestedRowCount(),
+                        selfReferencePlans),
                     selfReferencePlans);
                 int currentId = AllocateTableIdBlock(nextTableIds, tableName, rowCount);
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
@@ -488,6 +1228,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     rowCount = overriddenCount;
                 }
 
+                rowCount = ApplyPinnedUniqueKeyRowCountLimit(query, scenario, schema, alias, rowCount, selfReferencePlans);
                 rowCount = ApplySelfReferenceMinimumRowCount(tableName, rowCount, selfReferencePlans);
                 if (rowCount <= 0)
                 {
@@ -568,7 +1309,13 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 int rowCount = ApplySelfReferenceMinimumRowCount(
                     tableName,
-                    GetRequestedRowCount(),
+                    ApplyPinnedUniqueKeyRowCountLimit(
+                        query,
+                        scenario,
+                        schema,
+                        alias,
+                        GetRequestedRowCount(),
+                        selfReferencePlans),
                     selfReferencePlans);
                 int currentId = AllocateTableIdBlock(nextTableIds, tableName, rowCount);
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
@@ -637,7 +1384,13 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 int rowCount = ApplySelfReferenceMinimumRowCount(
                     tableName,
-                    GetRequestedRowCount(),
+                    ApplyPinnedUniqueKeyRowCountLimit(
+                        query,
+                        scenario,
+                        schema,
+                        alias,
+                        GetRequestedRowCount(),
+                        selfReferencePlans),
                     selfReferencePlans);
                 int currentId = AllocateTableIdBlock(nextTableIds, tableName, rowCount);
                 for (int rowIdx = 0; rowIdx < rowCount; rowIdx++)
@@ -856,6 +1609,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 {
                     rowCount = countBoundaryRows.Value;
                 }
+                rowCount = ApplyPinnedUniqueKeyRowCountLimit(query, scenario, schema, alias, rowCount, selfReferencePlans);
                 rowCount = ApplySelfReferenceMinimumRowCount(tableName, rowCount, selfReferencePlans);
                 int currentId = AllocateTableIdBlock(nextTableIds, tableName, rowCount);
 
@@ -1645,7 +2399,7 @@ namespace SqlTestDataGenerator.DataGeneration
             if (condition.Operator == ComparisonOp.In && condition.InValues.Any())
             {
                 return satisfy
-                    ? generator.GenerateFromLiteral(condition.InValues[0], col)
+                    ? generator.GenerateFromLiteral(condition.InValues[Math.Abs(rowIndex) % condition.InValues.Count], col)
                     : generator.GenerateViolating(col, "=", condition.InValues[0]);
             }
 
@@ -6228,6 +6982,18 @@ namespace SqlTestDataGenerator.DataGeneration
 
             if (sameTable && sameColumn)
             {
+                if (scenario.ExpectedToReturnRows &&
+                    GetRequestedRowCount() > 1 &&
+                    targetRows.Count >= GetRequestedRowCount())
+                {
+                    ApplyMultiRowScalarAverageComparisonTarget(
+                        target,
+                        targetRows,
+                        targetValue,
+                        supportValue);
+                    return;
+                }
+
                 var useUniformFalseValue = ShouldUseUniformFalseScalarAverageValue(target);
                 foreach (var row in aggregateRows)
                 {
@@ -6243,6 +7009,142 @@ namespace SqlTestDataGenerator.DataGeneration
             foreach (var row in aggregateRows)
             {
                 row.SetValue(target.AggregateColumn.ColumnName, supportValue);
+            }
+        }
+
+        private void ApplyMultiRowScalarAverageComparisonTarget(
+            ScalarAverageComparisonTarget target,
+            List<GeneratedRow> targetRows,
+            object? targetValue,
+            object? supportValue)
+        {
+            var requestedRows = GetRequestedRowCount();
+            var targetSnapshot = targetRows
+                .Take(requestedRows)
+                .ToList();
+
+            if (targetSnapshot.Count == 0)
+                return;
+
+            foreach (var row in targetSnapshot)
+            {
+                row.SetValue(target.TargetColumn.ColumnName, targetValue);
+            }
+
+            var supportRow = CloneGeneratedRow(targetSnapshot[0]);
+            AssignDistinctGeneratedKey(target.TargetSchema, supportRow, targetRows);
+            supportRow.SetValue(target.AggregateColumn.ColumnName, supportValue);
+            PushSupportRowBehindOrderedTargets(target.TargetSchema, supportRow, targetSnapshot);
+            targetRows.Add(supportRow);
+        }
+
+        private GeneratedRow CloneGeneratedRow(GeneratedRow source)
+        {
+            var clone = new GeneratedRow { TableName = source.TableName };
+            foreach (var kvp in source.ColumnValues)
+            {
+                clone.SetValue(kvp.Key, kvp.Value);
+            }
+
+            return clone;
+        }
+
+        private void AssignDistinctGeneratedKey(
+            TableSchema schema,
+            GeneratedRow row,
+            IReadOnlyList<GeneratedRow> existingRows)
+        {
+            var keyColumn = ResolveNumericKeyColumn(schema);
+            if (keyColumn != null)
+            {
+                var maxExisting = existingRows
+                    .Select(r => r.GetValue(keyColumn.ColumnName))
+                    .Where(v => v != null && v != DBNull.Value)
+                    .Select(v => Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture))
+                    .Where(v => decimal.TryParse(v, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out _))
+                    .Select(v => decimal.Parse(v!, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture))
+                    .DefaultIfEmpty(0m)
+                    .Max();
+
+                var nextValue = maxExisting + 1m;
+                row.SetValue(
+                    keyColumn.ColumnName,
+                    SqlServerValueNormalizer.NormalizeValue(keyColumn, nextValue) ?? nextValue);
+                return;
+            }
+
+            var guidKey = schema.Columns.FirstOrDefault(c =>
+                (c.IsIdentity || c.IsPrimaryKey || schema.PrimaryKey?.Columns.Contains(c.ColumnName, StringComparer.OrdinalIgnoreCase) == true) &&
+                c.TypeCategory == DataTypeCategory.Guid);
+            if (guidKey != null)
+            {
+                row.SetValue(guidKey.ColumnName, Guid.NewGuid());
+                return;
+            }
+
+            var stringKey = schema.Columns.FirstOrDefault(c =>
+                (c.IsIdentity || c.IsPrimaryKey || schema.PrimaryKey?.Columns.Contains(c.ColumnName, StringComparer.OrdinalIgnoreCase) == true) &&
+                c.TypeCategory == DataTypeCategory.String);
+            if (stringKey != null)
+            {
+                row.SetValue(
+                    stringKey.ColumnName,
+                    BuildSemanticString(stringKey, existingRows.Count + 1, null));
+            }
+        }
+
+        private static void PushSupportRowBehindOrderedTargets(
+            TableSchema schema,
+            GeneratedRow supportRow,
+            IReadOnlyList<GeneratedRow> targetRows)
+        {
+            var orderDateColumn = schema.Columns.FirstOrDefault(c =>
+                    !c.IsComputed &&
+                    c.TypeCategory is DataTypeCategory.DateTime or DataTypeCategory.DateTimeOffset &&
+                    c.ColumnName.Contains("OrderDate", StringComparison.OrdinalIgnoreCase)) ??
+                schema.Columns.FirstOrDefault(c =>
+                    !c.IsComputed &&
+                    c.TypeCategory is DataTypeCategory.DateTime or DataTypeCategory.DateTimeOffset &&
+                    c.ColumnName.Contains("Date", StringComparison.OrdinalIgnoreCase));
+
+            if (orderDateColumn == null)
+                return;
+
+            var existingDates = targetRows
+                .Select(r => TryReadDateTime(r.GetValue(orderDateColumn.ColumnName), out var value) ? value : (DateTime?)null)
+                .Where(v => v.HasValue)
+                .Select(v => v!.Value)
+                .ToList();
+
+            if (existingDates.Count == 0)
+                return;
+
+            var supportDate = existingDates.Min().AddDays(-1);
+            supportRow.SetValue(
+                orderDateColumn.ColumnName,
+                SqlServerValueNormalizer.NormalizeValue(orderDateColumn, supportDate) ?? supportDate);
+        }
+
+        private static bool TryReadDateTime(object? rawValue, out DateTime value)
+        {
+            value = default;
+            if (rawValue == null || rawValue == DBNull.Value)
+                return false;
+
+            switch (rawValue)
+            {
+                case DateTime dateTime:
+                    value = DateTime.SpecifyKind(dateTime, DateTimeKind.Unspecified);
+                    return true;
+                case DateTimeOffset dateTimeOffset:
+                    value = DateTime.SpecifyKind(dateTimeOffset.DateTime, DateTimeKind.Unspecified);
+                    return true;
+                default:
+                    return DateTime.TryParse(
+                        Convert.ToString(rawValue, System.Globalization.CultureInfo.InvariantCulture),
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.None,
+                        out value);
             }
         }
 
@@ -6427,7 +7329,15 @@ namespace SqlTestDataGenerator.DataGeneration
             supportValue = null;
             supportDecimal = 0m;
 
-            foreach (var rawTarget in BuildScalarAverageTargetCandidates(query, scenario, target, targetRow))
+            var targetCandidates = BuildScalarAverageTargetCandidates(query, scenario, target, targetRow);
+            if (scenario.ExpectedToReturnRows && GetRequestedRowCount() > 1)
+            {
+                targetCandidates = target.TargetShouldBeHigher
+                    ? targetCandidates.OrderByDescending(v => v)
+                    : targetCandidates.OrderBy(v => v);
+            }
+
+            foreach (var rawTarget in targetCandidates)
             {
                 if (!TryNormalizeNumericCandidate(target.TargetColumn, rawTarget, out var normalizedTarget, out var normalizedTargetDecimal) ||
                     !SatisfiesScalarAverageTargetSideConstraints(query, scenario, target, normalizedTarget))
@@ -6435,7 +7345,15 @@ namespace SqlTestDataGenerator.DataGeneration
                     continue;
                 }
 
-                foreach (var rawSupport in BuildScalarAverageSupportCandidates(target.AggregateColumn, normalizedTargetDecimal, target.TargetShouldBeHigher))
+                var supportCandidates = BuildScalarAverageSupportCandidates(target.AggregateColumn, normalizedTargetDecimal, target.TargetShouldBeHigher);
+                if (scenario.ExpectedToReturnRows && GetRequestedRowCount() > 1)
+                {
+                    supportCandidates = target.TargetShouldBeHigher
+                        ? supportCandidates.OrderBy(v => v)
+                        : supportCandidates.OrderByDescending(v => v);
+                }
+
+                foreach (var rawSupport in supportCandidates)
                 {
                     if (!TryNormalizeNumericCandidate(target.AggregateColumn, rawSupport, out var normalizedSupport, out var normalizedSupportDecimal) ||
                         !SatisfiesScalarAverageSupportSideConstraints(query, scenario, target, normalizedSupport))
@@ -8844,6 +9762,107 @@ namespace SqlTestDataGenerator.DataGeneration
             var diversityFloor = GetAggregateDiversityMinimumRows(tableName, schema);
             return Math.Max(rowCount, diversityFloor);
         }
+
+        private int ApplyPinnedUniqueKeyRowCountLimit(
+            ParsedQuery query,
+            BranchScenario scenario,
+            TableSchema schema,
+            string tableAlias,
+            int rowCount,
+            Dictionary<string, SelfReferencePlan> selfReferencePlans)
+        {
+            if (rowCount <= 1 || selfReferencePlans.ContainsKey(schema.TableName))
+                return rowCount;
+
+            foreach (var column in EnumerateSingleColumnUniqueKeyColumns(schema))
+            {
+                var domainLimit = FindPositiveDirectUniqueKeyConditions(query, scenario, tableAlias, column.ColumnName)
+                    .Select(GetDirectUniqueKeyDomainSize)
+                    .Where(count => count > 0)
+                    .DefaultIfEmpty(0)
+                    .Min();
+
+                if (domainLimit > 0)
+                {
+                    return Math.Min(rowCount, domainLimit);
+                }
+            }
+
+            return rowCount;
+        }
+
+        private static IEnumerable<ColumnSchema> EnumerateSingleColumnUniqueKeyColumns(TableSchema schema)
+        {
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var column in schema.Columns)
+            {
+                if ((column.IsIdentity || column.IsPrimaryKey) &&
+                    !column.IsComputed &&
+                    seen.Add(column.ColumnName))
+                {
+                    yield return column;
+                }
+            }
+
+            if (schema.PrimaryKey?.Columns.Count == 1)
+            {
+                var column = schema.GetColumn(schema.PrimaryKey.Columns[0]);
+                if (column != null && !column.IsComputed && seen.Add(column.ColumnName))
+                {
+                    yield return column;
+                }
+            }
+
+            foreach (var unique in schema.UniqueConstraints.Where(u => u.Columns.Count == 1))
+            {
+                var column = schema.GetColumn(unique.Columns[0]);
+                if (column != null && !column.IsComputed && seen.Add(column.ColumnName))
+                {
+                    yield return column;
+                }
+            }
+        }
+
+        private static IEnumerable<ConditionInfo> FindPositiveDirectUniqueKeyConditions(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableAlias,
+            string columnName)
+        {
+            return query.PredicateScopes
+                .SelectMany(s => s.Conditions)
+                .Where(condition =>
+                    IsDirectUniqueKeyLiteralPredicate(condition) &&
+                    TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth) &&
+                    desiredTruth &&
+                    IsConditionTargetingColumn(query, condition, tableAlias, columnName));
+        }
+
+        private static bool IsDirectUniqueKeyLiteralPredicate(ConditionInfo condition)
+        {
+            if (condition.HasSubquery ||
+                condition.IsColumnComparison ||
+                HasScalarSubqueryPlaceholder(condition))
+            {
+                return false;
+            }
+
+            return condition.Operator switch
+            {
+                ComparisonOp.Equal => !string.IsNullOrWhiteSpace(condition.Value),
+                ComparisonOp.In => condition.InValues.Count > 0,
+                _ => false
+            };
+        }
+
+        private static int GetDirectUniqueKeyDomainSize(ConditionInfo condition) =>
+            condition.Operator switch
+            {
+                ComparisonOp.Equal => 1,
+                ComparisonOp.In => condition.InValues.Count,
+                _ => 0
+            };
 
         private bool IsResultCardinalityAnchorTable(string tableName, string tableAlias, ParsedQuery query)
         {

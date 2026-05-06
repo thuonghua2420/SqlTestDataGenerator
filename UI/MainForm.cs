@@ -208,7 +208,7 @@ namespace SqlTestDataGenerator.UI
             _rowsPerTableInput = new NumericUpDown
             {
                 Minimum = 1,
-                Maximum = 1000,
+                Maximum = 2500,
                 Value = 1,
                 Increment = 1,
                 Location = new Point(697, 9),
@@ -532,7 +532,7 @@ namespace SqlTestDataGenerator.UI
             _rowsPerTableInput = new NumericUpDown
             {
                 Minimum = 1,
-                Maximum = 1000,
+                Maximum = 2500,
                 Value = 1,
                 Increment = 1,
                 Location = new Point(537, 9),
@@ -944,7 +944,7 @@ namespace SqlTestDataGenerator.UI
             _rowsPerTableInput = new NumericUpDown
             {
                 Minimum = 1,
-                Maximum = 1000,
+                Maximum = 2500,
                 Value = 1,
                 Increment = 1,
                 Width = 92,
@@ -1545,7 +1545,8 @@ namespace SqlTestDataGenerator.UI
                 _dataEngine.TableSeedStarts = null;
                 _dataEngine.SampleRowsByTable = null;
                 _dataEngine.UseMaxLengthMaxValueMode = _maxLengthMaxValueCheck.Checked;
-                LogInfo($"Starting data generation with {_dataEngine.RowsPerTable} row(s)/table, mode = {(_maxLengthMaxValueCheck.Checked ? "Maxlength/MaxValue" : "Sample-based")}.");
+                _dataEngine.ShuffleGeneratedStringCharacters = true;
+                LogInfo($"Starting data generation with {_dataEngine.RowsPerTable} row(s)/table, mode = {(_maxLengthMaxValueCheck.Checked ? "Maxlength/MaxValue" : "Sample-based")}, value shuffle = enabled.");
 
                 // Get schemas from database if connected
                 _schemas = null;
