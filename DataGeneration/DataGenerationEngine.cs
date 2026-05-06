@@ -1629,7 +1629,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         object? value;
                         if (isBoundaryColumn)
                         {
-                            value = GenerateBoundaryValue(col, testedCondition!);
+                            value = GenerateBoundaryValue(col, testedCondition!, rowIdx);
                         }
                         else
                         {
@@ -2447,7 +2447,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
             if (satisfy && !UseMaxLengthMaxValueMode && IsRangeCondition(condition))
             {
-                return GenerateBoundaryValue(col, condition);
+                return GenerateBoundaryValue(col, condition, rowIndex);
             }
 
             return satisfy
@@ -8125,11 +8125,13 @@ namespace SqlTestDataGenerator.DataGeneration
             public int ReferenceDepth { get; }
         }
 
-        private object? GenerateBoundaryValue(ColumnSchema col, ConditionInfo condition)
+        private object? GenerateBoundaryValue(ColumnSchema col, ConditionInfo condition, int rowIndex = 0)
         {
             var generator = _valueFactory.GetGenerator(col.TypeCategory);
 
-            // For boundary tests, use the exact boundary value
+            if (TryGenerateDistinctBoundaryValue(col, condition, rowIndex, generator, out var distinctValue))
+                return distinctValue;
+
             return condition.Operator switch
             {
                 ComparisonOp.GreaterThanOrEqual => generator.GenerateFromLiteral(condition.Value, col),
@@ -8139,6 +8141,202 @@ namespace SqlTestDataGenerator.DataGeneration
                 ComparisonOp.Between => generator.GenerateFromLiteral(condition.Value, col), // Lower boundary
                 _ => generator.GenerateFromLiteral(condition.Value, col)
             };
+        }
+
+        private bool TryGenerateDistinctBoundaryValue(
+            ColumnSchema column,
+            ConditionInfo condition,
+            int rowIndex,
+            IValueGenerator generator,
+            out object? value)
+        {
+            value = null;
+
+            if (condition.Operator == ComparisonOp.In && condition.InValues.Count > 0)
+            {
+                value = generator.GenerateFromLiteral(condition.InValues[Math.Abs(rowIndex) % condition.InValues.Count], column);
+                return true;
+            }
+
+            if (column.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float)
+                return TryGenerateDistinctNumericBoundaryValue(column, condition, rowIndex, generator, out value);
+
+            if (column.TypeCategory is DataTypeCategory.DateTime or DataTypeCategory.DateTimeOffset)
+                return TryGenerateDistinctDateBoundaryValue(column, condition, rowIndex, generator, out value);
+
+            return false;
+        }
+
+        private bool TryGenerateDistinctNumericBoundaryValue(
+            ColumnSchema column,
+            ConditionInfo condition,
+            int rowIndex,
+            IValueGenerator generator,
+            out object? value)
+        {
+            value = null;
+            var offset = Math.Max(0, rowIndex);
+            var step = GetNumericRangeStep(column);
+            decimal candidate;
+
+            switch (condition.Operator)
+            {
+                case ComparisonOp.GreaterThan:
+                    if (!TryConvertDecimal(condition.Value, out var greaterThan))
+                        return false;
+                    candidate = greaterThan + step * (offset + 1);
+                    break;
+
+                case ComparisonOp.GreaterThanOrEqual:
+                    if (!TryConvertDecimal(condition.Value, out var greaterThanOrEqual))
+                        return false;
+                    candidate = greaterThanOrEqual + step * offset;
+                    break;
+
+                case ComparisonOp.LessThan:
+                    if (!TryConvertDecimal(condition.Value, out var lessThan))
+                        return false;
+                    candidate = lessThan - step * (offset + 1);
+                    break;
+
+                case ComparisonOp.LessThanOrEqual:
+                    if (!TryConvertDecimal(condition.Value, out var lessThanOrEqual))
+                        return false;
+                    candidate = lessThanOrEqual - step * offset;
+                    break;
+
+                case ComparisonOp.Between:
+                    if (!TryConvertDecimal(condition.Value, out var lower) ||
+                        !TryConvertDecimal(condition.SecondValue, out var upper) ||
+                        lower > upper)
+                    {
+                        return false;
+                    }
+
+                    if (condition.IsNegated)
+                    {
+                        candidate = lower - step * (offset + 1);
+                    }
+                    else
+                    {
+                        var spanSteps = decimal.Floor((upper - lower) / step);
+                        var boundedOffset = spanSteps <= 0 ? 0 : offset % (spanSteps + 1);
+                        candidate = lower + step * boundedOffset;
+                    }
+                    break;
+
+                case ComparisonOp.NotEqual:
+                    if (!TryConvertDecimal(condition.Value, out var notEqual))
+                        return false;
+                    candidate = notEqual + step * (offset + 1);
+                    break;
+
+                case ComparisonOp.Equal:
+                    if (!TryConvertDecimal(condition.Value, out var equal))
+                        return false;
+                    candidate = equal;
+                    break;
+
+                default:
+                    return false;
+            }
+
+            return TryFinalizeBoundaryCandidate(column, condition, candidate, generator, out value);
+        }
+
+        private bool TryGenerateDistinctDateBoundaryValue(
+            ColumnSchema column,
+            ConditionInfo condition,
+            int rowIndex,
+            IValueGenerator generator,
+            out object? value)
+        {
+            value = null;
+            var offset = Math.Max(0, rowIndex);
+            var step = column.DataType.Equals("date", StringComparison.OrdinalIgnoreCase)
+                ? TimeSpan.FromDays(1)
+                : TimeSpan.FromMinutes(7);
+            DateTime candidate;
+
+            switch (condition.Operator)
+            {
+                case ComparisonOp.GreaterThan:
+                    if (!TryConvertToDateTimeValue(condition.Value, out var greaterThan))
+                        return false;
+                    candidate = greaterThan.AddTicks(step.Ticks * (offset + 1));
+                    break;
+
+                case ComparisonOp.GreaterThanOrEqual:
+                    if (!TryConvertToDateTimeValue(condition.Value, out var greaterThanOrEqual))
+                        return false;
+                    candidate = greaterThanOrEqual.AddTicks(step.Ticks * offset);
+                    break;
+
+                case ComparisonOp.LessThan:
+                    if (!TryConvertToDateTimeValue(condition.Value, out var lessThan))
+                        return false;
+                    candidate = lessThan.AddTicks(-step.Ticks * (offset + 1));
+                    break;
+
+                case ComparisonOp.LessThanOrEqual:
+                    if (!TryConvertToDateTimeValue(condition.Value, out var lessThanOrEqual))
+                        return false;
+                    candidate = lessThanOrEqual.AddTicks(-step.Ticks * offset);
+                    break;
+
+                case ComparisonOp.Between:
+                    if (!TryConvertToDateTimeValue(condition.Value, out var lower) ||
+                        !TryConvertToDateTimeValue(condition.SecondValue, out var upper) ||
+                        lower > upper)
+                    {
+                        return false;
+                    }
+
+                    if (condition.IsNegated)
+                    {
+                        candidate = lower.AddTicks(-step.Ticks * (offset + 1));
+                    }
+                    else
+                    {
+                        var spanSteps = Math.Max(0, (long)((upper - lower).Ticks / step.Ticks));
+                        var boundedOffset = spanSteps == 0 ? 0 : offset % (spanSteps + 1);
+                        candidate = lower.AddTicks(step.Ticks * boundedOffset);
+                    }
+                    break;
+
+                default:
+                    return false;
+            }
+
+            object typedCandidate = column.TypeCategory == DataTypeCategory.DateTimeOffset
+                ? new DateTimeOffset(DateTime.SpecifyKind(candidate, DateTimeKind.Unspecified), TimeSpan.Zero)
+                : DateTime.SpecifyKind(candidate, DateTimeKind.Unspecified);
+
+            return TryFinalizeBoundaryCandidate(column, condition, typedCandidate, generator, out value);
+        }
+
+        private bool TryFinalizeBoundaryCandidate(
+            ColumnSchema column,
+            ConditionInfo condition,
+            object? candidate,
+            IValueGenerator generator,
+            out object? value)
+        {
+            value = null;
+
+            try
+            {
+                var normalized = SqlServerValueNormalizer.NormalizeValue(column, candidate) ?? candidate;
+                if (!EvaluateCondition(normalized, condition, null, column, generator))
+                    return false;
+
+                value = normalized;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private object? GenerateBetweenValue(ColumnSchema col, string lower, string upper, bool inside)
