@@ -114,6 +114,8 @@ namespace SqlTestDataGenerator.DataGeneration
                 ApplyScenarioHavingAggregateComparisonAdjustments(query, workingScenario, schemas);
                 ApplyScenarioInsertSafetyAdjustments(query, workingScenario, schemas);
                 EnforceScenarioForeignKeyClosure(workingScenario, schemas);
+                ApplyScenarioExpressionJoinDomainAdjustments(query, workingScenario, schemas);
+                EnforceScenarioForeignKeyClosure(workingScenario, schemas);
                 ApplyScenarioJoinColumnComparisonAdjustments(query, workingScenario, schemas);
                 ApplyScenarioInsertSafetyAdjustments(query, workingScenario, schemas);
                 ApplyScenarioStringShuffleAdjustments(query, workingScenario, schemas);
@@ -348,10 +350,15 @@ namespace SqlTestDataGenerator.DataGeneration
                     TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth) &&
                     desiredTruth &&
                     IsConditionTargetingColumn(query, condition, tableAlias, columnName) &&
-                    IsShuffleUnsafePredicate(condition));
+                    IsShuffleUnsafePredicate(condition, tableAlias, columnName, query.ResolveAlias(tableAlias), query.AliasToTableMap));
         }
 
-        private static bool IsShuffleUnsafePredicate(ConditionInfo condition)
+        private static bool IsShuffleUnsafePredicate(
+            ConditionInfo condition,
+            string tableAlias,
+            string columnName,
+            string tableName,
+            IReadOnlyDictionary<string, string> aliasMap)
         {
             if (condition.Operator == ComparisonOp.IsNotNull &&
                 !condition.HasSubquery &&
@@ -361,7 +368,121 @@ namespace SqlTestDataGenerator.DataGeneration
                 return false;
             }
 
+            if (IsLengthOnlyPredicate(condition, tableAlias, tableName, columnName, aliasMap) ||
+                IsSingleCharacterPresencePredicate(condition, tableAlias, tableName, columnName, aliasMap))
+            {
+                return false;
+            }
+
             return true;
+        }
+
+        private static bool IsLengthOnlyPredicate(
+            ConditionInfo condition,
+            string tableAlias,
+            string tableName,
+            string columnName,
+            IReadOnlyDictionary<string, string> aliasMap)
+        {
+            return condition.LeftExpression is FunctionScalarExpressionInfo function &&
+                   function.Name.Equals("LEN", StringComparison.OrdinalIgnoreCase) &&
+                   function.Arguments.Count >= 1 &&
+                   ExpressionReferencesColumn(function.Arguments[0], tableAlias, tableName, columnName, aliasMap);
+        }
+
+        private static bool IsSingleCharacterPresencePredicate(
+            ConditionInfo condition,
+            string tableAlias,
+            string tableName,
+            string columnName,
+            IReadOnlyDictionary<string, string> aliasMap)
+        {
+            if (condition.LeftExpression is not FunctionScalarExpressionInfo function ||
+                !function.Name.Equals("CHARINDEX", StringComparison.OrdinalIgnoreCase) ||
+                function.Arguments.Count < 2 ||
+                !ExpressionReferencesColumn(function.Arguments[1], tableAlias, tableName, columnName, aliasMap) ||
+                !TryGetLiteralString(function.Arguments[0], out var needle) ||
+                needle.Length != 1)
+            {
+                return false;
+            }
+
+            if (!TryConvertDecimal(condition.Value, out var boundary))
+                return false;
+
+            return condition.Operator switch
+            {
+                ComparisonOp.GreaterThan => boundary <= 0m,
+                ComparisonOp.GreaterThanOrEqual => boundary <= 1m,
+                ComparisonOp.NotEqual => boundary == 0m,
+                _ => false
+            };
+        }
+
+        private static bool ExpressionReferencesColumn(
+            ScalarExpressionInfo? expression,
+            string tableAlias,
+            string tableName,
+            string columnName,
+            IReadOnlyDictionary<string, string> aliasMap)
+        {
+            return expression switch
+            {
+                null => false,
+                ColumnScalarExpressionInfo column =>
+                    column.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase) &&
+                    TableAliasMatchesTarget(column.TableAlias, tableAlias, tableName, aliasMap),
+                FunctionScalarExpressionInfo function =>
+                    GetColumnBearingFunctionArguments(function).Any(arg =>
+                        ExpressionReferencesColumn(arg, tableAlias, tableName, columnName, aliasMap)),
+                BinaryScalarExpressionInfo binary =>
+                    ExpressionReferencesColumn(binary.Left, tableAlias, tableName, columnName, aliasMap) ||
+                    ExpressionReferencesColumn(binary.Right, tableAlias, tableName, columnName, aliasMap),
+                UnaryScalarExpressionInfo unary =>
+                    ExpressionReferencesColumn(unary.Operand, tableAlias, tableName, columnName, aliasMap),
+                CaseScalarExpressionInfo caseExpression =>
+                    ExpressionReferencesColumn(caseExpression.InputExpression, tableAlias, tableName, columnName, aliasMap) ||
+                    ExpressionReferencesColumn(caseExpression.ElseExpression, tableAlias, tableName, columnName, aliasMap) ||
+                    caseExpression.WhenClauses.Any(w =>
+                        PredicateExpressionReferencesColumn(w.Predicate, tableAlias, tableName, columnName, aliasMap) ||
+                        ExpressionReferencesColumn(w.WhenExpression, tableAlias, tableName, columnName, aliasMap) ||
+                        ExpressionReferencesColumn(w.ThenExpression, tableAlias, tableName, columnName, aliasMap)),
+                _ => false
+            };
+        }
+
+        private static bool PredicateExpressionReferencesColumn(
+            PredicateExpression? expression,
+            string tableAlias,
+            string tableName,
+            string columnName,
+            IReadOnlyDictionary<string, string> aliasMap)
+        {
+            return expression switch
+            {
+                null => false,
+                PredicateLeafExpression leaf =>
+                    ConditionTargetsColumn(aliasMap, leaf.Condition, tableName, tableAlias, columnName),
+                PredicateBinaryExpression binary =>
+                    PredicateExpressionReferencesColumn(binary.Left, tableAlias, tableName, columnName, aliasMap) ||
+                    PredicateExpressionReferencesColumn(binary.Right, tableAlias, tableName, columnName, aliasMap),
+                PredicateNotExpression not =>
+                    PredicateExpressionReferencesColumn(not.Inner, tableAlias, tableName, columnName, aliasMap),
+                _ => false
+            };
+        }
+
+        private static bool TryGetLiteralString(ScalarExpressionInfo? expression, out string value)
+        {
+            value = string.Empty;
+            if (expression is LiteralScalarExpressionInfo literal &&
+                literal.Kind == ScalarLiteralKind.String)
+            {
+                value = literal.Value;
+                return true;
+            }
+
+            return false;
         }
 
         private bool IsPredicatePinnedComputedSourceColumn(
@@ -2875,7 +2996,7 @@ namespace SqlTestDataGenerator.DataGeneration
             if (targetLength <= digits.Length)
                 return digits[^targetLength..];
 
-            return ("0" + digits).PadRight(targetLength, '0')[..targetLength];
+            return digits.PadLeft(targetLength, '0')[^targetLength..];
         }
 
         private static string ComposeSemanticLabel(string seed, string tableToken, string rowToken, int targetLength)
@@ -8887,6 +9008,61 @@ namespace SqlTestDataGenerator.DataGeneration
             }
         }
 
+        private void ApplyScenarioExpressionJoinDomainAdjustments(
+            ParsedQuery query,
+            BranchScenario scenario,
+            Dictionary<string, TableSchema> schemas)
+        {
+            foreach (var scope in query.PredicateScopes.Where(s => s.Source == ConditionSource.JoinOn))
+            {
+                foreach (var condition in scope.Conditions.Where(c => c.Operator == ComparisonOp.Equal))
+                {
+                    if (!TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth) ||
+                        !desiredTruth)
+                    {
+                        continue;
+                    }
+
+                    foreach (var table in query.Tables)
+                    {
+                        var tableAlias = table.EffectiveName;
+                        var tableName = query.ResolveAlias(tableAlias);
+                        if (!schemas.TryGetValue(tableName, out var schema) ||
+                            !scenario.TableRows.TryGetValue(tableName, out var rows) ||
+                            rows.Count == 0)
+                        {
+                            continue;
+                        }
+
+                        foreach (var column in EnumerateSingleColumnUniqueKeyColumns(schema))
+                        {
+                            if (!TryGetNonTargetComparisonExpression(
+                                    condition,
+                                    tableAlias,
+                                    tableName,
+                                    column.ColumnName,
+                                    query.AliasToTableMap,
+                                    out var expression) ||
+                                !TryInferFiniteNumericExpressionDomainValues(expression, out var domainValues))
+                            {
+                                continue;
+                            }
+
+                            var count = Math.Min(rows.Count, domainValues.Count);
+                            for (var index = 0; index < count; index++)
+                            {
+                                var normalized = SqlServerValueNormalizer.NormalizeValue(column, domainValues[index]);
+                                if (normalized != null)
+                                {
+                                    rows[index].SetValue(column.ColumnName, normalized);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         private static bool TryAdjustJoinComparisonLeftSide(
             TableSchema schema,
             ColumnSchema column,
@@ -9204,6 +9380,7 @@ namespace SqlTestDataGenerator.DataGeneration
             GeneratedRow row,
             int rowIndex)
         {
+            ApplyRightDigitRangeStringRowAdjustments(query, schema, row, rowIndex);
             ApplyQueryFunctionHintedStringRowAdjustments(query, schema, row, rowIndex);
             ApplyScalarAvgSubqueryRowAdjustments(query, scenario, schema, row, rowIndex);
 
@@ -9265,6 +9442,92 @@ namespace SqlTestDataGenerator.DataGeneration
                     : FitSemanticString(candidate, rowToken, targetLength);
                 row.SetValue(column.ColumnName, SqlServerValueNormalizer.NormalizeValue(column, candidate) ?? candidate);
             }
+        }
+
+        private void ApplyRightDigitRangeStringRowAdjustments(
+            ParsedQuery query,
+            TableSchema schema,
+            GeneratedRow row,
+            int rowIndex)
+        {
+            foreach (var column in schema.Columns.Where(c => c.TypeCategory == DataTypeCategory.String))
+            {
+                if (!TryFindRightDigitRangeHint(query, column, out var lower, out var upper))
+                    continue;
+
+                var span = Math.Max(1, upper - lower + 1);
+                var digit = (char)('0' + lower + (rowIndex % span));
+                var existing = Convert.ToString(row.GetValue(column.ColumnName), System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+                var candidate = BuildStringWithTrailingDigit(column, existing, rowIndex, digit);
+                row.SetValue(column.ColumnName, SqlServerValueNormalizer.NormalizeValue(column, candidate) ?? candidate);
+            }
+        }
+
+        private static bool TryFindRightDigitRangeHint(
+            ParsedQuery query,
+            ColumnSchema column,
+            out int lower,
+            out int upper)
+        {
+            lower = 0;
+            upper = 0;
+            if (string.IsNullOrWhiteSpace(query.OriginalSql) ||
+                string.IsNullOrWhiteSpace(column.ColumnName))
+            {
+                return false;
+            }
+
+            var escapedColumn = System.Text.RegularExpressions.Regex.Escape(column.ColumnName);
+            var rightPattern = @"RIGHT\s*\(\s*(?:(?:\[[^\]]+\])|(?:\w+))?\s*\.?\s*\[?" +
+                               escapedColumn +
+                               @"\]?\s*,\s*1\s*\)";
+            var pattern = rightPattern +
+                          @"(?:(?!\bBETWEEN\b)[\s\S]){0,240}\bBETWEEN\s+(?<lo>[0-9])\s+AND\s+(?<hi>[0-9])";
+            var match = System.Text.RegularExpressions.Regex.Match(
+                query.OriginalSql,
+                pattern,
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Singleline);
+            if (!match.Success ||
+                !int.TryParse(match.Groups["lo"].Value, out lower) ||
+                !int.TryParse(match.Groups["hi"].Value, out upper))
+            {
+                return false;
+            }
+
+            lower = Math.Clamp(lower, 0, 9);
+            upper = Math.Clamp(upper, 0, 9);
+            if (lower > upper)
+                (lower, upper) = (upper, lower);
+
+            return true;
+        }
+
+        private string BuildStringWithTrailingDigit(
+            ColumnSchema column,
+            string existing,
+            int rowIndex,
+            char digit)
+        {
+            var targetLength = !string.IsNullOrEmpty(existing)
+                ? existing.Length
+                : Math.Min(ResolveTargetStringLength(column), 64);
+            if (targetLength <= 0)
+                return string.Empty;
+
+            var candidate = !string.IsNullOrEmpty(existing)
+                ? existing
+                : IsPhoneColumn(column)
+                    ? BuildPhoneLikeString(column, rowIndex, targetLength)
+                    : Convert.ToString(BuildSemanticString(column, rowIndex, null), System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+
+            if (candidate.Length < targetLength)
+                candidate = candidate.PadLeft(targetLength, '0');
+            if (candidate.Length > targetLength)
+                candidate = candidate[^targetLength..];
+
+            var chars = candidate.ToCharArray();
+            chars[^1] = digit;
+            return new string(chars);
         }
 
         private void ApplyScalarAvgSubqueryRowAdjustments(
@@ -9976,6 +10239,7 @@ namespace SqlTestDataGenerator.DataGeneration
             {
                 var domainLimit = FindPositiveDirectUniqueKeyConditions(query, scenario, tableAlias, column.ColumnName)
                     .Select(GetDirectUniqueKeyDomainSize)
+                    .Concat(FindPositiveExpressionUniqueKeyDomainSizes(query, scenario, tableAlias, schema.TableName, column.ColumnName))
                     .Where(count => count > 0)
                     .DefaultIfEmpty(0)
                     .Min();
@@ -9987,6 +10251,240 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             return rowCount;
+        }
+
+        private static IEnumerable<int> FindPositiveExpressionUniqueKeyDomainSizes(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableAlias,
+            string tableName,
+            string columnName)
+        {
+            foreach (var condition in query.PredicateScopes.SelectMany(s => s.Conditions))
+            {
+                if (condition.Operator != ComparisonOp.Equal ||
+                    condition.HasSubquery ||
+                    condition.IsColumnComparison ||
+                    !TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth) ||
+                    !desiredTruth ||
+                    !TryGetNonTargetComparisonExpression(condition, tableAlias, tableName, columnName, query.AliasToTableMap, out var expression) ||
+                    !TryInferFiniteNumericExpressionDomainSize(expression, out var domainSize))
+                {
+                    continue;
+                }
+
+                yield return domainSize;
+            }
+        }
+
+        private static bool TryGetNonTargetComparisonExpression(
+            ConditionInfo condition,
+            string tableAlias,
+            string tableName,
+            string columnName,
+            IReadOnlyDictionary<string, string> aliasMap,
+            out ScalarExpressionInfo? expression)
+        {
+            expression = null;
+            var leftTargetsColumn = ExpressionReferencesColumn(condition.LeftExpression, tableAlias, tableName, columnName, aliasMap);
+            var rightTargetsColumn = ExpressionReferencesColumn(condition.RightExpression, tableAlias, tableName, columnName, aliasMap);
+
+            if (leftTargetsColumn && !rightTargetsColumn)
+            {
+                expression = condition.RightExpression;
+                return expression != null;
+            }
+
+            if (rightTargetsColumn && !leftTargetsColumn)
+            {
+                expression = condition.LeftExpression;
+                return expression != null;
+            }
+
+            return false;
+        }
+
+        private static bool TryInferFiniteNumericExpressionDomainSize(
+            ScalarExpressionInfo? expression,
+            out int domainSize)
+        {
+            if (TryInferFiniteNumericExpressionDomainValues(expression, out var values))
+            {
+                domainSize = values.Count;
+                return true;
+            }
+
+            domainSize = 0;
+            return false;
+        }
+
+        private static bool TryInferFiniteNumericExpressionDomainValues(
+            ScalarExpressionInfo? expression,
+            out List<decimal> domainValues)
+        {
+            var values = new HashSet<decimal>();
+            TryCollectFiniteNumericExpressionValues(expression, values);
+            TryCollectFiniteNumericExpressionTextValues(expression?.Text, values);
+
+            domainValues = values
+                .OrderBy(v => v)
+                .ToList();
+            return domainValues.Count > 0;
+        }
+
+        private static bool TryCollectFiniteNumericExpressionTextValues(string? expressionText, HashSet<decimal> values)
+        {
+            if (string.IsNullOrWhiteSpace(expressionText))
+                return false;
+
+            var collectedAny = false;
+            foreach (System.Text.RegularExpressions.Match match in System.Text.RegularExpressions.Regex.Matches(
+                         expressionText,
+                         @"\bBETWEEN\s+(?<lo>-?\d+)\s+AND\s+(?<hi>-?\d+)",
+                         System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            {
+                if (!int.TryParse(match.Groups["lo"].Value, out var lower) ||
+                    !int.TryParse(match.Groups["hi"].Value, out var upper))
+                {
+                    continue;
+                }
+
+                var start = Math.Min(lower, upper);
+                var end = Math.Max(lower, upper);
+                if (end - start > 100)
+                    continue;
+
+                for (var value = start; value <= end; value++)
+                {
+                    values.Add(value);
+                }
+
+                collectedAny = true;
+            }
+
+            foreach (System.Text.RegularExpressions.Match match in System.Text.RegularExpressions.Regex.Matches(
+                         expressionText,
+                         @"\b(?:THEN|ELSE)\s+(?<value>-?\d+)\b",
+                         System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            {
+                if (decimal.TryParse(
+                        match.Groups["value"].Value,
+                        System.Globalization.NumberStyles.Any,
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        out var value))
+                {
+                    values.Add(value);
+                    collectedAny = true;
+                }
+            }
+
+            return collectedAny;
+        }
+
+        private static bool TryCollectFiniteNumericExpressionValues(
+            ScalarExpressionInfo? expression,
+            HashSet<decimal> values)
+        {
+            switch (expression)
+            {
+                case LiteralScalarExpressionInfo literal when TryConvertDecimal(literal.Value, out var literalValue):
+                    values.Add(literalValue);
+                    return true;
+
+                case CaseScalarExpressionInfo caseExpression:
+                {
+                    var collectedAny = false;
+                    foreach (var whenClause in caseExpression.WhenClauses)
+                    {
+                        collectedAny |= TryCollectCaseWhenDomainValues(whenClause, values);
+                    }
+
+                    if (caseExpression.ElseExpression != null)
+                    {
+                        collectedAny |= TryCollectFiniteNumericExpressionValues(caseExpression.ElseExpression, values);
+                    }
+
+                    return collectedAny;
+                }
+
+                default:
+                    return false;
+            }
+        }
+
+        private static bool TryCollectCaseWhenDomainValues(
+            CaseWhenClauseInfo whenClause,
+            HashSet<decimal> values)
+        {
+            if (TryCollectFiniteNumericExpressionValues(whenClause.ThenExpression, values))
+                return true;
+
+            return TryCollectPredicateRangeDomainValues(whenClause.Predicate, whenClause.ThenExpression, values);
+        }
+
+        private static bool TryCollectPredicateRangeDomainValues(
+            PredicateExpression? predicate,
+            ScalarExpressionInfo? resultExpression,
+            HashSet<decimal> values)
+        {
+            return predicate switch
+            {
+                PredicateLeafExpression leaf =>
+                    TryCollectConditionRangeDomainValues(leaf.Condition, resultExpression, values),
+                PredicateBinaryExpression binary when binary.Operator == LogicalOp.And =>
+                    TryCollectPredicateRangeDomainValues(binary.Left, resultExpression, values) ||
+                    TryCollectPredicateRangeDomainValues(binary.Right, resultExpression, values),
+                PredicateBinaryExpression binary when binary.Operator == LogicalOp.Or =>
+                    TryCollectPredicateRangeDomainValues(binary.Left, resultExpression, values) |
+                    TryCollectPredicateRangeDomainValues(binary.Right, resultExpression, values),
+                _ => false
+            };
+        }
+
+        private static bool TryCollectConditionRangeDomainValues(
+            ConditionInfo condition,
+            ScalarExpressionInfo? resultExpression,
+            HashSet<decimal> values)
+        {
+            if (condition.Operator != ComparisonOp.Between ||
+                resultExpression == null ||
+                !ScalarExpressionTextEquals(condition.LeftExpression, resultExpression) ||
+                !TryConvertDecimal(condition.Value, out var lower) ||
+                !TryConvertDecimal(condition.SecondValue, out var upper))
+            {
+                return false;
+            }
+
+            var start = (int)Math.Ceiling(Math.Min(lower, upper));
+            var end = (int)Math.Floor(Math.Max(lower, upper));
+            if (end < start || end - start > 100)
+                return false;
+
+            for (var value = start; value <= end; value++)
+            {
+                values.Add(value);
+            }
+
+            return true;
+        }
+
+        private static bool ScalarExpressionTextEquals(ScalarExpressionInfo? left, ScalarExpressionInfo? right)
+        {
+            var leftText = NormalizeScalarExpressionText(left?.Text);
+            var rightText = NormalizeScalarExpressionText(right?.Text);
+            return !string.IsNullOrWhiteSpace(leftText) &&
+                   leftText.Equals(rightText, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string NormalizeScalarExpressionText(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return string.Empty;
+
+            return new string(text
+                .Where(ch => !char.IsWhiteSpace(ch) && ch is not '[' and not ']')
+                .ToArray())
+                .ToUpperInvariant();
         }
 
         private static IEnumerable<ColumnSchema> EnumerateSingleColumnUniqueKeyColumns(TableSchema schema)
@@ -10048,10 +10546,17 @@ namespace SqlTestDataGenerator.DataGeneration
 
             return condition.Operator switch
             {
-                ComparisonOp.Equal => !string.IsNullOrWhiteSpace(condition.Value),
+                ComparisonOp.Equal => !string.IsNullOrWhiteSpace(condition.Value) &&
+                                      IsDirectLiteralComparisonExpression(condition),
                 ComparisonOp.In => condition.InValues.Count > 0,
                 _ => false
             };
+        }
+
+        private static bool IsDirectLiteralComparisonExpression(ConditionInfo condition)
+        {
+            return condition.LeftExpression is LiteralScalarExpressionInfo ||
+                   condition.RightExpression is LiteralScalarExpressionInfo;
         }
 
         private static int GetDirectUniqueKeyDomainSize(ConditionInfo condition) =>
