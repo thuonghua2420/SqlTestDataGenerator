@@ -1524,15 +1524,31 @@ JOIN sys.schemas sp ON tp.schema_id = sp.schema_id;";
                 return 0;
 
             var colList = string.Join(", ", columns.Select(c => $"[{c.ColumnName}]"));
-            var paramNames = columns.Select((_, i) => $"@p{i}").ToList();
-            var sql = $"INSERT INTO {GetQualifiedTableName(schema)} ({colList}) VALUES ({string.Join(", ", paramNames)});";
+            var valueTokens = new List<string>();
+            var parameters = new List<(string Name, ColumnSchema Column, object Value)>();
 
-            using var cmd = CreateCommand(connection, transaction, sql);
             for (int i = 0; i < columns.Count; i++)
             {
                 var col = columns[i];
                 var value = row.GetValue(col.ColumnName) ?? DBNull.Value;
-                AddTypedParameter(cmd, paramNames[i], col, value);
+                var normalized = SqlServerValueNormalizer.NormalizeValue(col, value) ?? DBNull.Value;
+                if (normalized is SqlExpressionValue expressionValue)
+                {
+                    valueTokens.Add(expressionValue.Expression);
+                    continue;
+                }
+
+                var parameterName = $"@p{parameters.Count}";
+                valueTokens.Add(parameterName);
+                parameters.Add((parameterName, col, normalized));
+            }
+
+            var sql = $"INSERT INTO {GetQualifiedTableName(schema)} ({colList}) VALUES ({string.Join(", ", valueTokens)});";
+
+            using var cmd = CreateCommand(connection, transaction, sql);
+            foreach (var parameter in parameters)
+            {
+                AddTypedParameter(cmd, parameter.Name, parameter.Column, parameter.Value);
             }
 
             return await cmd.ExecuteNonQueryAsync(cancellationToken);
@@ -1569,7 +1585,7 @@ JOIN sys.schemas sp ON tp.schema_id = sp.schema_id;";
                 return;
             }
 
-            switch (column.DataType.ToLowerInvariant())
+            switch (column.EffectiveDataType.ToLowerInvariant())
             {
                 case "decimal":
                 case "numeric":
@@ -1601,7 +1617,7 @@ JOIN sys.schemas sp ON tp.schema_id = sp.schema_id;";
 
         private static SqlDbType ResolveSqlDbType(ColumnSchema column)
         {
-            return column.DataType.ToLowerInvariant() switch
+            return column.EffectiveDataType.ToLowerInvariant() switch
             {
                 "bigint" => SqlDbType.BigInt,
                 "int" => SqlDbType.Int,

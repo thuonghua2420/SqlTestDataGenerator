@@ -92,8 +92,23 @@ namespace SqlTestDataGenerator.Schema
                     c.NUMERIC_PRECISION,
                     c.NUMERIC_SCALE,
                     c.COLUMN_DEFAULT,
-                    c.ORDINAL_POSITION
+                    c.ORDINAL_POSITION,
+                    st.name AS SYSTEM_DATA_TYPE,
+                    CASE WHEN ut.user_type_id <> ut.system_type_id THEN 1 ELSE 0 END AS IS_USER_DEFINED_TYPE
                 FROM INFORMATION_SCHEMA.COLUMNS c
+                JOIN sys.schemas ss
+                    ON ss.name = c.TABLE_SCHEMA
+                JOIN sys.tables tt
+                    ON tt.name = c.TABLE_NAME
+                   AND tt.schema_id = ss.schema_id
+                JOIN sys.columns sc
+                    ON sc.object_id = tt.object_id
+                   AND sc.name = c.COLUMN_NAME
+                JOIN sys.types ut
+                    ON ut.user_type_id = sc.user_type_id
+                JOIN sys.types st
+                    ON st.user_type_id = sc.system_type_id
+                   AND st.system_type_id = sc.system_type_id
                 WHERE c.TABLE_NAME = @TableName
                   AND c.TABLE_SCHEMA = @SchemaName
                 ORDER BY c.ORDINAL_POSITION";
@@ -119,6 +134,8 @@ namespace SqlTestDataGenerator.Schema
                     SchemaName = schemaName,
                     ColumnName = reader.GetString(0),
                     DataType = reader.GetString(1),
+                    SystemDataType = reader.IsDBNull(8) ? reader.GetString(1) : reader.GetString(8),
+                    IsUserDefinedType = !reader.IsDBNull(9) && Convert.ToInt32(reader.GetValue(9)) == 1,
                     IsNullable = reader.GetString(2) == "YES",
                     MaxLength = maxLength,
                     NumericPrecision = reader.IsDBNull(4) ? null : (int?)Convert.ToInt32(reader.GetValue(4)),

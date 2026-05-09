@@ -1,4 +1,5 @@
 using SqlTestDataGenerator.DataGeneration.Models;
+using SqlTestDataGenerator.Schema;
 using SqlTestDataGenerator.Schema.Models;
 using System.Globalization;
 using System.Text;
@@ -287,6 +288,7 @@ namespace SqlTestDataGenerator.Output
 
             return value switch
             {
+                SqlExpressionValue expressionValue => expressionValue.Expression,
                 bool b => b ? "1" : "0",
                 int i => i.ToString(),
                 long l => l.ToString(),

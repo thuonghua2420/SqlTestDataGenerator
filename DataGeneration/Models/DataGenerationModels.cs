@@ -65,6 +65,9 @@ namespace SqlTestDataGenerator.DataGeneration.Models
         /// <summary>Tables in dependency order for INSERT</summary>
         public List<string> InsertOrder { get; set; } = new();
 
+        /// <summary>Errors discovered during the output validation phase</summary>
+        public List<string> ValidationErrors { get; set; } = new();
+
         public void AddRow(string tableName, GeneratedRow row)
         {
             if (!TableRows.ContainsKey(tableName))

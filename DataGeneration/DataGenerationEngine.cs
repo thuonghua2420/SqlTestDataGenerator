@@ -15,6 +15,7 @@ namespace SqlTestDataGenerator.DataGeneration
     {
         private readonly ValueGeneratorFactory _valueFactory = new();
         private readonly DependencyOrderResolver _orderResolver = new();
+        private const string RequiredStringSeed = "あアﾀa6＠";
         private int _fallbackSeedCounter = 1;
         private Dictionary<string, int> _tableIdMaxValues = new(StringComparer.OrdinalIgnoreCase);
         private DateTime _generationLocalNow = DateTime.SpecifyKind(DateTime.Now, DateTimeKind.Unspecified);
@@ -120,6 +121,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 ApplyScenarioInsertSafetyAdjustments(query, workingScenario, schemas);
                 ApplyScenarioStringShuffleAdjustments(query, workingScenario, schemas);
                 ValidateScenarioLocalForeignKeys(workingScenario, schemas);
+                ValidateScenarioData(workingScenario);
                 dataSet.Scenarios.Add(workingScenario);
             }
 
@@ -291,7 +293,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 schema.ForeignKeys.Any(fk => fk.ColumnName.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)) ||
                 IsOrderBySensitiveColumn(query, schema, column) ||
                 IsPredicatePinnedComputedSourceColumn(query, scenario, schema, column) ||
-                HasShuffleUnsafePredicateColumn(query, scenario, schema.TableName, column.ColumnName))
+                IsColumnProtected(query, scenario, schema, column))
             {
                 return false;
             }
@@ -302,7 +304,14 @@ namespace SqlTestDataGenerator.DataGeneration
                 DataTypeCategory.Float or
                 DataTypeCategory.DateTime or
                 DataTypeCategory.Time or
-                DataTypeCategory.DateTimeOffset;
+                DataTypeCategory.DateTimeOffset or
+                DataTypeCategory.Boolean or
+                DataTypeCategory.Guid or
+                DataTypeCategory.Binary or
+                DataTypeCategory.Xml or
+                DataTypeCategory.Spatial or
+                DataTypeCategory.HierarchyId or
+                DataTypeCategory.SqlVariant;
         }
 
         private static bool IsOrderBySensitiveColumn(
@@ -536,6 +545,44 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 return !ValuesEqual(rawValue, shuffledValue);
             }
+
+            if (column.TypeCategory == DataTypeCategory.Guid)
+            {
+                var candidate = BuildDeterministicGuid(tableName, column.ColumnName, rowIndex, text);
+                shuffledValue = candidate;
+                shuffledValueKey = candidate.ToString();
+                return !ValuesEqual(rawValue, shuffledValue) && !usedValueCounts.ContainsKey(shuffledValueKey);
+            }
+
+            if (column.TypeCategory == DataTypeCategory.Boolean)
+            {
+                var candidate = rowIndex % 2 == 0;
+                shuffledValue = SqlServerValueNormalizer.NormalizeValue(column, candidate) ?? candidate;
+                shuffledValueKey = Convert.ToString(shuffledValue, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+                return !ValuesEqual(rawValue, shuffledValue) &&
+                       !string.IsNullOrEmpty(shuffledValueKey) &&
+                       !usedValueCounts.ContainsKey(shuffledValueKey);
+            }
+
+            if (column.TypeCategory is DataTypeCategory.Binary or DataTypeCategory.Xml or
+                DataTypeCategory.Spatial or DataTypeCategory.HierarchyId or DataTypeCategory.SqlVariant)
+            {
+                if (!TryBuildShuffledSpecialValue(
+                        tableName,
+                        column,
+                        rowIndex,
+                        rawValue,
+                        text,
+                        usedValueCounts,
+                        out shuffledValue,
+                        out shuffledValueKey))
+                {
+                    return false;
+                }
+
+                return !ValuesEqual(rawValue, shuffledValue);
+            }
+
             if (column.TypeCategory is DataTypeCategory.DateTime or DataTypeCategory.Time or DataTypeCategory.DateTimeOffset)
             {
                 return TryBuildShuffledTemporalValue(
@@ -588,7 +635,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         (chars[i], chars[j]) = (chars[j], chars[i]);
                     }
 
-                    var candidate = new string(chars);
+                    var candidate = PreserveRequiredStringSeed(new string(chars), column);
                     var normalized = SqlServerValueNormalizer.NormalizeValue(column, candidate) ?? candidate;
                     var key = Convert.ToString(normalized, System.Globalization.CultureInfo.InvariantCulture);
                     if (!string.IsNullOrEmpty(key) &&
@@ -1278,7 +1325,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         scenario,
                         schema,
                         alias,
-                        GetRequestedRowCount(),
+                        query.Tables.Where(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase)).Any(t => IsAggregateSourceTable(t.TableName, t.Alias, query)) ? GetRequestedRowCount() : 1,
                         selfReferencePlans),
                     selfReferencePlans);
                 int currentId = AllocateTableIdBlock(nextTableIds, tableName, rowCount);
@@ -1342,7 +1389,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 // For SUM fail: create rows with very small values
                 int rowCount = isAggregateSource && testedConditions.Any(c => c.AggregateFunc == AggregateFunction.Count)
                     ? 1
-                    : GetRequestedRowCount();
+                    : (query.Tables.Where(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase)).Any(t => IsAggregateSourceTable(t.TableName, t.Alias, query)) ? GetRequestedRowCount() : 1);
 
                 if (countRowOverrides.TryGetValue(tableName, out var overriddenCount))
                 {
@@ -1435,7 +1482,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         scenario,
                         schema,
                         alias,
-                        GetRequestedRowCount(),
+                        query.Tables.Where(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase)).Any(t => IsAggregateSourceTable(t.TableName, t.Alias, query)) ? GetRequestedRowCount() : 1,
                         selfReferencePlans),
                     selfReferencePlans);
                 int currentId = AllocateTableIdBlock(nextTableIds, tableName, rowCount);
@@ -1510,7 +1557,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         scenario,
                         schema,
                         alias,
-                        GetRequestedRowCount(),
+                        query.Tables.Where(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase)).Any(t => IsAggregateSourceTable(t.TableName, t.Alias, query)) ? GetRequestedRowCount() : 1,
                         selfReferencePlans),
                     selfReferencePlans);
                 int currentId = AllocateTableIdBlock(nextTableIds, tableName, rowCount);
@@ -2222,7 +2269,8 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             // 5. Default value generation
-            return GenerateDefaultColumnValue(col, generator, rowIndex, query, tableAlias, tableSchema: currentTableSchema);
+            var defaultValue = GenerateDefaultColumnValue(col, generator, rowIndex, query, tableAlias, tableSchema: currentTableSchema);
+            return SqlServerValueNormalizer.NormalizeValue(col, defaultValue);
         }
 
         private static bool TryResolveJoinedColumnValue(
@@ -2296,12 +2344,33 @@ namespace SqlTestDataGenerator.DataGeneration
             string tableAlias,
             TableSchema? tableSchema = null)
         {
+            // 1. Special Types (Spatial, Hierarchy, Variant)
+            if (col.DataType.Equals("geography", StringComparison.OrdinalIgnoreCase) ||
+                col.DataType.Equals("geometry", StringComparison.OrdinalIgnoreCase))
+            {
+                return $"POINT({rowIndex} {rowIndex})";
+            }
+
+            if (col.DataType.Equals("hierarchyid", StringComparison.OrdinalIgnoreCase))
+            {
+                return $"/{rowIndex + 1}/";
+            }
+
+            if (col.DataType.Equals("sql_variant", StringComparison.OrdinalIgnoreCase))
+            {
+                if (col.ColumnName.Contains("Date", StringComparison.OrdinalIgnoreCase))
+                    return new DateTime(2024, 1, 1).AddDays(rowIndex);
+                return 100.00m + rowIndex;
+            }
+
+            // 2. Query Function Hints (e.g. CHARINDEX hints)
             if (col.TypeCategory == DataTypeCategory.String &&
                 TryBuildQueryFunctionHintedString(col, rowIndex, query, out var hintedString))
             {
                 return hintedString;
             }
 
+            // 3. Max Length / Max Value Mode
             if (UseMaxLengthMaxValueMode)
             {
                 var maxModeValue = GenerateMaxLengthMaxValue(col, rowIndex, query, tableAlias, tableSchema);
@@ -2311,6 +2380,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 }
             }
 
+            // 4. Sample Data
             if (TryGetSampleValue(col, out var sampleValue))
             {
                 var sampleModeValue = GenerateSampleBasedValue(col, sampleValue, rowIndex);
@@ -2320,7 +2390,48 @@ namespace SqlTestDataGenerator.DataGeneration
                 }
             }
 
+            // 5. Default Semantic Generation (Strings and XML)
+            if (col.TypeCategory == DataTypeCategory.String ||
+                col.DataType.Equals("xml", StringComparison.OrdinalIgnoreCase))
+            {
+                return BuildSemanticString(col, rowIndex, null);
+            }
+
+            if (col.TypeCategory == DataTypeCategory.Boolean &&
+                TryGenerateSemanticBooleanDefault(col, out var booleanValue))
+            {
+                return booleanValue;
+            }
+
+            // 6. Type-specific generator fallback
             return generator.GenerateDefault(col);
+        }
+
+        private static bool TryGenerateSemanticBooleanDefault(ColumnSchema column, out object value)
+        {
+            var name = column.ColumnName;
+            if (name.Contains("Active", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("Enabled", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("Preferred", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("Confirmed", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("Approved", StringComparison.OrdinalIgnoreCase))
+            {
+                value = true;
+                return true;
+            }
+
+            if (name.Contains("Deleted", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("Discontinued", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("Cancelled", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("Seasonal", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("Archived", StringComparison.OrdinalIgnoreCase))
+            {
+                value = false;
+                return true;
+            }
+
+            value = false;
+            return false;
         }
 
         private bool TryBuildQueryFunctionHintedString(
@@ -2415,6 +2526,21 @@ namespace SqlTestDataGenerator.DataGeneration
                 return BuildMaxNumericValue(column, rowIndex, query, tableAlias, computedUpperBound);
             }
 
+            if (column.TypeCategory is DataTypeCategory.DateTime or DataTypeCategory.DateTimeOffset or DataTypeCategory.Time)
+            {
+                return BuildMaxTemporalValue(column, rowIndex);
+            }
+
+            if (column.TypeCategory == DataTypeCategory.Guid)
+            {
+                return Guid.NewGuid();
+            }
+
+            if (column.TypeCategory == DataTypeCategory.Boolean)
+            {
+                return (rowIndex % 2 == 0);
+            }
+
             return null;
         }
 
@@ -2424,6 +2550,9 @@ namespace SqlTestDataGenerator.DataGeneration
             out decimal upperBound)
         {
             upperBound = 0m;
+            if (IsMeasureLikeNumericColumn(sourceColumn))
+                return false;
+
             foreach (var computedCol in schema.Columns)
             {
                 if (!computedCol.IsComputed) continue;
@@ -2537,6 +2666,13 @@ namespace SqlTestDataGenerator.DataGeneration
             if (TryGenerateExpressionConditionValue(condition, col, tableAlias, satisfy, out var expressionValue))
             {
                 return expressionValue;
+            }
+
+            if (col.TypeCategory == DataTypeCategory.String &&
+                satisfy &&
+                LooksLikeSqlExpressionLiteral(condition.Value))
+            {
+                return BuildSemanticString(col, rowIndex, null);
             }
 
             if (condition.Operator == ComparisonOp.Like)
@@ -2687,17 +2823,56 @@ namespace SqlTestDataGenerator.DataGeneration
                 return string.Empty;
 
             var rowToken = (rowIndex + 1).ToString("D4");
-            object value = IsPhoneColumn(column)
-                ? BuildPhoneLikeString(column, rowIndex, targetLength)
-                : IsEmailColumn(column)
-                    ? BuildExactMaxEmailString(column, rowToken, targetLength)
-                    : IsUrlColumn(column)
-                        ? BuildExactMaxUrlString(column, rowToken, targetLength)
-                        : IsCodeLikeColumn(column)
-                            ? BuildExactCompactToken(null, $"{GetAsciiTableLabel(column)}{GetAsciiColumnLabel(column)}", rowToken, targetLength)
-                            : RepeatPhraseToExactLength(BuildLocalizedPhrase(column, rowIndex, null), rowToken, targetLength);
+            object value;
+            
+            if (IsPhoneColumn(column))
+                value = BuildPhoneLikeString(column, rowIndex, targetLength);
+            else if (IsEmailColumn(column))
+                value = BuildExactMaxEmailString(column, rowToken, targetLength);
+            else if (IsUrlColumn(column))
+                value = BuildExactMaxUrlString(column, rowToken, targetLength);
+            else if (IsCodeLikeColumn(column))
+                value = BuildExactCompactToken(null, $"{GetAsciiTableLabel(column)}{GetAsciiColumnLabel(column)}", rowToken, targetLength);
+            else
+                value = BuildMaxLengthContent(column, rowToken, targetLength);
 
             return SqlServerValueNormalizer.NormalizeValue(column, value) ?? string.Empty;
+        }
+
+        private object BuildMaxLengthContent(ColumnSchema column, string rowToken, int targetLength)
+        {
+            var seed = SupportsJapaneseText(column) ? RequiredStringSeed + " " : "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 ";
+            var prefix = $"{Abbreviate(column.TableName, 2)}{Abbreviate(column.ColumnName, 2)}";
+            
+            if (targetLength <= prefix.Length + rowToken.Length)
+            {
+                return BuildExactCompactToken(null, prefix, rowToken, targetLength);
+            }
+
+            var repeated = string.Concat(Enumerable.Repeat(seed, (targetLength / seed.Length) + 1));
+            var baseStr = prefix + repeated.Substring(0, targetLength - rowToken.Length - prefix.Length);
+            return baseStr + rowToken;
+        }
+
+        private object BuildMaxTemporalValue(ColumnSchema column, int rowIndex)
+        {
+            var offset = rowIndex + GetColumnVariantOffset(column);
+            var type = column.EffectiveDataType.ToLowerInvariant();
+            
+            if (type == "time")
+            {
+                return new TimeSpan(23, 59, 59).Subtract(TimeSpan.FromSeconds(offset % 60));
+            }
+
+            DateTime maxDt;
+            if (type == "smalldatetime")
+                maxDt = new DateTime(2079, 6, 6, 23, 59, 0).AddMinutes(-offset);
+            else if (type == "date")
+                maxDt = new DateTime(9999, 12, 31).AddDays(-offset);
+            else
+                maxDt = new DateTime(9999, 12, 31, 23, 59, 59).AddSeconds(-offset);
+
+            return SqlServerValueNormalizer.NormalizeValue(column, maxDt) ?? maxDt;
         }
 
         private object BuildMaxNumericValue(ColumnSchema column, int rowIndex)
@@ -2714,27 +2889,31 @@ namespace SqlTestDataGenerator.DataGeneration
             {
                 case DataTypeCategory.Integer:
                 {
-                    // Use practical max (considers multiplicative arithmetic risk) instead of raw type max.
-                    var raw = (decimal)(GetPracticalMaxIntegerValue(column, query, tableAlias) - offset);
-                    if (upperBound.HasValue)
-                        raw = Math.Min(raw, Math.Floor(upperBound.Value - offset));
-                    if (raw < 0) raw = 0;
+                    decimal baseMax = upperBound ?? GetPracticalMaxIntegerValue(column, query, tableAlias);
+                    var raw = baseMax - offset;
+                    if (raw < 0 && baseMax >= 0) raw = 0;
                     return SqlServerValueNormalizer.NormalizeValue(column, (long)raw) ?? (long)raw;
                 }
                 case DataTypeCategory.Decimal:
                 {
-                    var raw = GetPracticalMaxDecimalValue(column, query, tableAlias) - (offset * step);
-                    if (upperBound.HasValue)
-                        raw = Math.Min(raw, upperBound.Value - (offset * step));
-                    if (raw < 0) raw = 0;
+                    decimal baseMax = upperBound ?? GetPracticalMaxDecimalValue(column, query, tableAlias);
+                    var raw = baseMax - (offset * step);
+                    if (raw < 0 && baseMax >= 0) raw = 0;
                     return SqlServerValueNormalizer.NormalizeValue(column, raw) ?? raw;
                 }
                 case DataTypeCategory.Float:
                 {
-                    var raw = GetPracticalMaxFloatValue(column, query, tableAlias) - offset;
+                    double baseMax;
                     if (upperBound.HasValue)
-                        raw = Math.Min(raw, (double)upperBound.Value - offset);
-                    if (raw < 0) raw = 0;
+                    {
+                        baseMax = (double)upperBound.Value;
+                    }
+                    else
+                    {
+                        baseMax = GetPracticalMaxFloatValue(column, query, tableAlias);
+                    }
+                    
+                    var raw = baseMax - offset;
                     return SqlServerValueNormalizer.NormalizeValue(column, raw) ?? raw;
                 }
                 default:
@@ -2788,6 +2967,10 @@ namespace SqlTestDataGenerator.DataGeneration
             {
                 candidate = BuildCompactToken(semanticSource, asciiSeed, rowToken, targetLength);
             }
+            else if (column.DataType.Equals("xml", StringComparison.OrdinalIgnoreCase))
+            {
+                candidate = $"<root><item id=\"{rowToken}\">Data</item></root>";
+            }
             else if (IsTierLikeColumn(column))
             {
                 var tiers = useJapanese
@@ -2807,6 +2990,15 @@ namespace SqlTestDataGenerator.DataGeneration
             else
             {
                 candidate = BuildLocalizedPhrase(column, rowIndex, semanticSource);
+            }
+
+            if (useJapanese &&
+                !column.DataType.Equals("xml", StringComparison.OrdinalIgnoreCase) &&
+                !IsEmailColumn(column) &&
+                !IsUrlColumn(column) &&
+                !IsPhoneColumn(column))
+            {
+                candidate = $"{RequiredStringSeed} {candidate}";
             }
 
             candidate = FitSemanticString(candidate, rowToken, targetLength);
@@ -2999,6 +3191,122 @@ namespace SqlTestDataGenerator.DataGeneration
             return digits.PadLeft(targetLength, '0')[^targetLength..];
         }
 
+        private static Guid BuildDeterministicGuid(string tableName, string columnName, int rowIndex, string value)
+        {
+            var seed = BuildStableShuffleSeed(tableName, columnName, rowIndex, value, attempt: 97);
+            var bytes = new byte[16];
+            new Random(seed).NextBytes(bytes);
+            return new Guid(bytes);
+        }
+
+        private static bool TryBuildShuffledSpecialValue(
+            string tableName,
+            ColumnSchema column,
+            int rowIndex,
+            object? rawValue,
+            string text,
+            Dictionary<string, int> usedValueCounts,
+            out object? shuffledValue,
+            out string shuffledValueKey)
+        {
+            shuffledValue = null;
+            shuffledValueKey = string.Empty;
+            object candidate = column.TypeCategory switch
+            {
+                DataTypeCategory.Binary => BuildDeterministicBinaryValue(tableName, column, rowIndex, text),
+                DataTypeCategory.Xml => $"<root><v>{EscapeXml(BuildSeededJapaneseValue(column, rowIndex, Math.Min(ResolveDeclaredStringLength(column), 64)))}</v></root>",
+                DataTypeCategory.Spatial => BuildSpatialDefaultValue(column, rowIndex),
+                DataTypeCategory.HierarchyId => $"/{rowIndex + 1}/{Math.Abs(BuildStableShuffleSeed(tableName, column.ColumnName, rowIndex, text, 11)) % 100 + 1}/",
+                DataTypeCategory.SqlVariant => BuildSqlVariantDefaultValue(column, rowIndex),
+                _ => text
+            };
+
+            var normalized = SqlServerValueNormalizer.NormalizeValue(column, candidate) ?? candidate;
+            var key = Convert.ToString(normalized, System.Globalization.CultureInfo.InvariantCulture);
+            if (string.IsNullOrEmpty(key) || ValuesEqual(rawValue, normalized) || usedValueCounts.ContainsKey(key))
+                return false;
+
+            shuffledValue = normalized;
+            shuffledValueKey = key;
+            return true;
+        }
+
+        private static byte[] BuildDeterministicBinaryValue(string tableName, ColumnSchema column, int rowIndex, string value)
+        {
+            var length = Math.Clamp(column.MaxLength ?? 8, 1, 64);
+            var bytes = new byte[length];
+            new Random(BuildStableShuffleSeed(tableName, column.ColumnName, rowIndex, value, 31)).NextBytes(bytes);
+            return bytes;
+        }
+
+        private static string EscapeXml(string value) =>
+            value
+                .Replace("&", "&amp;", StringComparison.Ordinal)
+                .Replace("<", "&lt;", StringComparison.Ordinal)
+                .Replace(">", "&gt;", StringComparison.Ordinal)
+                .Replace("\"", "&quot;", StringComparison.Ordinal)
+                .Replace("'", "&apos;", StringComparison.Ordinal);
+
+        private static string PreserveRequiredStringSeed(string candidate, ColumnSchema column)
+        {
+            if (IsEmailColumn(column) || IsUrlColumn(column) || IsPhoneColumn(column))
+                return candidate;
+
+            var targetLength = candidate.Length;
+            if (targetLength <= 0)
+                return string.Empty;
+
+            var seed = RequiredStringSeed.Length <= targetLength
+                ? RequiredStringSeed
+                : RequiredStringSeed[..targetLength];
+
+            if (candidate.Contains(seed, StringComparison.Ordinal))
+                return candidate;
+
+            var withoutSeedChars = new string(candidate
+                .Where(c => seed.IndexOf(c) < 0)
+                .ToArray());
+            var merged = seed + withoutSeedChars;
+            return merged.Length <= targetLength ? merged : merged[..targetLength];
+        }
+
+        private static string BuildSeededJapaneseValue(ColumnSchema column, int rowIndex, int targetLength)
+        {
+            if (targetLength <= 0)
+                return string.Empty;
+
+            var rowToken = (rowIndex + 1).ToString("D3");
+            var phrase = $"{RequiredStringSeed} {GetLocalizedTableLabel(column.TableName, true)} {GetLocalizedColumnLabel(column.ColumnName, true)} {rowToken}";
+            return FitSemanticString(phrase, rowToken, targetLength);
+        }
+
+        private static object BuildSpatialDefaultValue(ColumnSchema column, int rowIndex)
+        {
+            var x = 139.6917m + (rowIndex * 0.001m);
+            var y = 35.6895m + (rowIndex * 0.001m);
+            var wkt = FormattableString.Invariant($"POINT({x} {y})");
+            return SqlServerValueNormalizer.NormalizeValue(column, wkt) ?? wkt;
+        }
+
+        private static object BuildSqlVariantDefaultValue(ColumnSchema column, int rowIndex)
+        {
+            var lower = column.ColumnName.ToLowerInvariant();
+            if (lower.Contains("date") || lower.Contains("time"))
+                return new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Unspecified).AddDays(rowIndex);
+            if (lower.Contains("amount") || lower.Contains("price") || lower.Contains("total") || lower.Contains("qty") || lower.Contains("quantity") || lower.Contains("count"))
+                return 1000m + rowIndex;
+
+            return BuildSeededJapaneseValue(column, rowIndex, Math.Min(ResolveDeclaredStringLength(column), 64));
+        }
+
+        private static int ResolveDeclaredStringLength(ColumnSchema column)
+        {
+            if (column.MaxLength.HasValue && column.MaxLength.Value > 0)
+                return column.MaxLength.Value;
+
+            return 64;
+        }
+
         private static string ComposeSemanticLabel(string seed, string tableToken, string rowToken, int targetLength)
         {
             var candidate = $"{seed} {tableToken} {rowToken}";
@@ -3060,12 +3368,23 @@ namespace SqlTestDataGenerator.DataGeneration
                 builder.Append(rowToken);
             }
 
-            return builder.ToString(0, targetLength);
+            var result = builder.ToString(0, targetLength);
+            if (result.Length > 1 && result[0] == result[^1])
+            {
+                var replacement = rowToken.Concat(normalizedPhrase)
+                    .FirstOrDefault(ch => ch != result[0] && !char.IsWhiteSpace(ch));
+                if (replacement == default)
+                    replacement = result[0] == 'Z' ? 'Y' : 'Z';
+
+                result = result[..^1] + replacement;
+            }
+
+            return result;
         }
 
         private static bool SupportsJapaneseText(ColumnSchema column)
         {
-            return column.DataType.StartsWith("n", StringComparison.OrdinalIgnoreCase);
+            return column.TypeCategory == DataTypeCategory.String;
         }
 
         private static string GetLocalizedTableLabel(string tableName, bool useJapanese)
@@ -3386,11 +3705,19 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private long GetPracticalMaxIntegerValue(ColumnSchema column, ParsedQuery? query, string tableAlias)
         {
+            if (UseMaxLengthMaxValueMode)
+                return GetMaxIntegerValue(column);
+
             if (IsRatingLikeNumericColumn(column))
                 return Math.Min(GetMaxIntegerValue(column), 5L);
 
             var absoluteMax = GetMaxIntegerValue(column);
             var safeDigits = DeterminePracticalNumericDigits(column, query, tableAlias);
+            
+            // Safety: If it's a count-like column, never exceed 3 digits (999) to avoid overflow in triggers
+            if (IsCountLikeNumericColumn(column))
+                safeDigits = Math.Min(safeDigits, 3);
+
             long practicalMax = 1;
             for (int i = 0; i < safeDigits; i++)
             {
@@ -3422,6 +3749,9 @@ namespace SqlTestDataGenerator.DataGeneration
             var scale = Math.Max(0, column.NumericScale ?? 0);
             var step = GetNumericStep(column);
 
+            if (UseMaxLengthMaxValueMode)
+                return GetMaxDecimalValue(column);
+
             if (IsRatingLikeNumericColumn(column))
             {
                 var ratingMax = Math.Max(step, 5m);
@@ -3441,6 +3771,10 @@ namespace SqlTestDataGenerator.DataGeneration
                 : 5;
             var safeDigits = Math.Min(availableIntegerDigits, DeterminePracticalNumericDigits(column, query, tableAlias));
 
+            // Safety: If it's a measure-like column (Price, Amount), cap at 4 integer digits (9999.99)
+            if (IsMeasureLikeNumericColumn(column))
+                safeDigits = Math.Min(safeDigits, 4);
+
             decimal wholePart = 1m;
             for (int i = 0; i < safeDigits; i++)
             {
@@ -3459,6 +3793,9 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private double GetPracticalMaxFloatValue(ColumnSchema column, ParsedQuery? query, string tableAlias)
         {
+            if (UseMaxLengthMaxValueMode)
+                return GetMaxFloatValue(column);
+
             var safeDigits = DeterminePracticalNumericDigits(column, query, tableAlias);
             return Math.Min(GetMaxFloatValue(column), Math.Pow(10d, safeDigits) - 1d);
         }
@@ -4584,19 +4921,27 @@ namespace SqlTestDataGenerator.DataGeneration
             ColumnSchema column)
         {
             var hints = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            void AddHint(string? value)
+            {
+                if (!string.IsNullOrWhiteSpace(value) &&
+                    !LooksLikeSqlExpressionLiteral(value))
+                {
+                    hints.Add(value);
+                }
+            }
+
             foreach (var target in targets)
             {
                 foreach (var hint in EnumerateStringHints(target.Condition.LeftExpression))
                 {
-                    if (!string.IsNullOrWhiteSpace(hint))
-                        hints.Add(hint);
+                    AddHint(hint);
                 }
 
                 if (target.Condition.Operator == ComparisonOp.Like)
                 {
                     if (!string.IsNullOrWhiteSpace(target.Condition.LikePattern))
                     {
-                        hints.Add(SqlLikePattern.GenerateMatchingValue(
+                        AddHint(SqlLikePattern.GenerateMatchingValue(
                             target.Condition.LikePattern,
                             column,
                             target.Condition.LikeEscape));
@@ -4606,30 +4951,53 @@ namespace SqlTestDataGenerator.DataGeneration
                 {
                     foreach (var hint in EnumerateStringHints(target.Condition.RightExpression))
                     {
-                        if (!string.IsNullOrWhiteSpace(hint))
-                            hints.Add(hint);
+                        AddHint(hint);
                     }
                 }
 
-                if (!string.IsNullOrWhiteSpace(target.Condition.Value) &&
-                    target.Condition.Operator != ComparisonOp.Like)
-                {
-                    hints.Add(target.Condition.Value);
-                }
+                if (target.Condition.Operator != ComparisonOp.Like)
+                    AddHint(target.Condition.Value);
 
-                if (!string.IsNullOrWhiteSpace(target.Condition.SecondValue))
-                    hints.Add(target.Condition.SecondValue);
+                AddHint(target.Condition.SecondValue);
 
                 foreach (var dynamicValue in target.Condition.DynamicStringValues)
                 {
-                    if (!string.IsNullOrWhiteSpace(dynamicValue))
-                        hints.Add(dynamicValue);
+                    AddHint(dynamicValue);
                 }
             }
 
             hints.Remove(string.Empty);
             hints.Remove(" ");
             return hints.ToList();
+        }
+
+        private static bool LooksLikeSqlExpressionLiteral(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            var trimmed = value.Trim();
+            if (trimmed.StartsWith("N'", StringComparison.OrdinalIgnoreCase) ||
+                trimmed.StartsWith("'", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            if (trimmed.Contains("SELECT", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(
+                    trimmed,
+                    @"\b\w+\.\w+\b",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            {
+                return true;
+            }
+
+            return System.Text.RegularExpressions.Regex.IsMatch(
+                trimmed,
+                @"\b(?:LEFT|RIGHT|LOWER|UPPER|TRIM|LTRIM|RTRIM|SUBSTRING|CHARINDEX|REPLACE|CONCAT|CAST|CONVERT|TRY_CAST|TRY_CONVERT|FORMAT|LEN|ISNULL|COALESCE|NULLIF|DATEADD|DATEDIFF|DATEPART|YEAR|MONTH|DAY)\s*\(",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
         }
 
         private List<string> ExtractRuntimeStringHints(
@@ -4648,7 +5016,8 @@ namespace SqlTestDataGenerator.DataGeneration
                 {
                     var evaluated = EvaluateScalarExpression(expression, null, scenario, query, currentRow, targetColumn, tableAlias, null);
                     var text = Convert.ToString(evaluated, System.Globalization.CultureInfo.InvariantCulture)?.Trim();
-                    if (!string.IsNullOrWhiteSpace(text))
+                    if (!string.IsNullOrWhiteSpace(text) &&
+                        !LooksLikeSqlExpressionLiteral(text))
                     {
                         hints.Add(text);
                     }
@@ -4671,7 +5040,8 @@ namespace SqlTestDataGenerator.DataGeneration
                 {
                     var evaluated = EvaluateScalarExpression(expression, null, scenario, query, currentRow, targetColumn, tableAlias, null);
                     var text = Convert.ToString(evaluated, System.Globalization.CultureInfo.InvariantCulture)?.Trim();
-                    if (!string.IsNullOrWhiteSpace(text))
+                    if (!string.IsNullOrWhiteSpace(text) &&
+                        !LooksLikeSqlExpressionLiteral(text))
                     {
                         hints.Add(text);
                     }
@@ -6937,9 +7307,9 @@ namespace SqlTestDataGenerator.DataGeneration
                     continue;
                 }
 
-                if (!TryBuildScalarAverageComparisonTarget(query, condition, desiredTruth, schemas, out var target))
-                    continue;
-
+                var buildSuccess = TryBuildScalarAverageComparisonTarget(query, condition, desiredTruth, schemas, out var target);
+                if (scenario.Name.Contains("mixed", StringComparison.OrdinalIgnoreCase)) Console.WriteLine($"[debug:loop] buildSuccess={buildSuccess} cond={condition.ColumnName} truth={desiredTruth}");
+                if (!buildSuccess) continue;
                 ApplyScalarAverageComparisonTarget(query, scenario, target);
             }
         }
@@ -6996,7 +7366,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
             var aggregateColumn = aggregateSchema.GetColumn(aggregateColumnName);
             var aggregateComputedPlan = aggregateColumn != null &&
-                                        TryBuildComputedProductColumnPlan(aggregateSchema, aggregateColumn, out var resolvedAggregatePlan)
+                                         TryBuildComputedProductColumnPlan(aggregateSchema, aggregateColumn, out var resolvedAggregatePlan)
                 ? resolvedAggregatePlan
                 : null;
             if (aggregateColumn == null ||
@@ -7095,11 +7465,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 return;
             }
 
-            var relationSatisfied = target.TargetShouldBeHigher
-                ? targetDecimal > supportDecimal
-                : targetDecimal < supportDecimal;
-            if (!relationSatisfied)
-                return;
+            // Remove early return to ensure global extreme values are applied
 
             if (sameTable && sameColumn)
             {
@@ -7283,6 +7649,8 @@ namespace SqlTestDataGenerator.DataGeneration
                 !sameTable ||
                 !sameColumn)
             {
+                if (scenario.Name.Contains("mixed", StringComparison.OrdinalIgnoreCase))
+                    Console.WriteLine($"[debug:adjust] return1: plan={target.TargetComputedPlan != null} sameTable={sameTable} sameColumn={sameColumn}");
                 return;
             }
 
@@ -7301,14 +7669,12 @@ namespace SqlTestDataGenerator.DataGeneration
                     out var supportComputedValue,
                     out var supportComputedDecimal))
             {
+                if (scenario.Name.Contains("mixed", StringComparison.OrdinalIgnoreCase))
+                    Console.WriteLine($"[debug:adjust] return2: targetRows={targetRows.Count}");
                 return;
             }
 
-            var relationSatisfied = target.TargetShouldBeHigher
-                ? targetComputedDecimal > supportComputedDecimal
-                : targetComputedDecimal < supportComputedDecimal;
-            if (!relationSatisfied)
-                return;
+            // Remove early return to ensure global extreme values are applied
 
             var useUniformFalseValue = ShouldUseUniformFalseScalarAverageValue(target);
             foreach (var row in aggregateRows)
@@ -9023,6 +9389,20 @@ namespace SqlTestDataGenerator.DataGeneration
                         continue;
                     }
 
+                    ApplyExpressionSourceDomainValues(
+                        query,
+                        scenario,
+                        schemas,
+                        condition,
+                        condition.LeftExpression);
+
+                    ApplyExpressionSourceDomainValues(
+                        query,
+                        scenario,
+                        schemas,
+                        condition,
+                        condition.RightExpression);
+
                     foreach (var table in query.Tables)
                     {
                         var tableAlias = table.EffectiveName;
@@ -9061,6 +9441,107 @@ namespace SqlTestDataGenerator.DataGeneration
                     }
                 }
             }
+        }
+
+        private void ApplyExpressionSourceDomainValues(
+            ParsedQuery query,
+            BranchScenario scenario,
+            Dictionary<string, TableSchema> schemas,
+            ConditionInfo condition,
+            ScalarExpressionInfo? expression)
+        {
+            if (expression == null ||
+                !TryInferFiniteNumericExpressionDomainValues(expression, out var domainValues) ||
+                domainValues.Count == 0)
+            {
+                return;
+            }
+
+            foreach (var table in query.Tables)
+            {
+                var tableAlias = table.EffectiveName;
+                var tableName = query.ResolveAlias(tableAlias);
+                if (!schemas.TryGetValue(tableName, out var schema) ||
+                    !scenario.TableRows.TryGetValue(tableName, out var rows) ||
+                    rows.Count == 0)
+                {
+                    continue;
+                }
+
+                foreach (var column in schema.Columns)
+                {
+                    if (column.IsComputed ||
+                        column.IsIdentity ||
+                        column.IsPrimaryKey ||
+                        schema.PrimaryKey?.Columns.Any(c => c.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)) == true ||
+                        schema.ForeignKeys.Any(fk => fk.ColumnName.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)) ||
+                        !ExpressionReferencesColumn(expression, tableAlias, tableName, column.ColumnName, query.AliasToTableMap))
+                    {
+                        continue;
+                    }
+
+                    for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+                    {
+                        var domainValue = domainValues[rowIndex % domainValues.Count];
+                        var normalized = BuildExpressionSourceDomainValue(column, rows[rowIndex].GetValue(column.ColumnName), domainValue, rowIndex, expression.Text);
+                        if (normalized != null)
+                        {
+                            rows[rowIndex].SetValue(column.ColumnName, normalized);
+                        }
+                    }
+                }
+            }
+        }
+
+        private object? BuildExpressionSourceDomainValue(
+            ColumnSchema column,
+            object? currentValue,
+            decimal domainValue,
+            int rowIndex,
+            string? expressionText)
+        {
+            if (column.TypeCategory == DataTypeCategory.String)
+            {
+                var text = Convert.ToString(currentValue, System.Globalization.CultureInfo.InvariantCulture);
+                var targetLength = Math.Max(1, Math.Min(ResolveTargetStringLength(column), string.IsNullOrEmpty(text) ? 96 : text.Length));
+                if (string.IsNullOrEmpty(text))
+                {
+                    text = IsPhoneColumn(column)
+                        ? BuildPhoneLikeString(column, rowIndex, targetLength)
+                        : Convert.ToString(BuildSemanticString(column, rowIndex, null), System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+                }
+
+                if (ExpressionUsesRightMostCharacter(expressionText, column.ColumnName))
+                {
+                    var digit = Math.Abs((int)domainValue % 10).ToString(System.Globalization.CultureInfo.InvariantCulture)[0];
+                    text = text.Length == 0 ? digit.ToString() : text[..^1] + digit;
+                }
+                else
+                {
+                    text = domainValue.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                }
+
+                return SqlServerValueNormalizer.NormalizeValue(column, text);
+            }
+
+            if (column.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float)
+            {
+                return SqlServerValueNormalizer.NormalizeValue(column, domainValue);
+            }
+
+            return null;
+        }
+
+        private static bool ExpressionUsesRightMostCharacter(string? expressionText, string columnName)
+        {
+            if (string.IsNullOrWhiteSpace(expressionText) || string.IsNullOrWhiteSpace(columnName))
+                return false;
+
+            var escapedColumn = System.Text.RegularExpressions.Regex.Escape(columnName);
+            return System.Text.RegularExpressions.Regex.IsMatch(
+                expressionText,
+                @"\bRIGHT\s*\([\s\S]*\b" + escapedColumn + @"\b[\s\S]*,\s*1\s*\)",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
         }
 
         private static bool TryAdjustJoinComparisonLeftSide(
@@ -9776,6 +10257,10 @@ namespace SqlTestDataGenerator.DataGeneration
                     row.SetValue(plan.AnchorColumn.ColumnName, safeAnchorValue);
                     row.SetValue(plan.AdjustableColumn.ColumnName, safeAdjustableValue);
                     SetComputedProductPreviewValue(row, plan, safeAnchorDecimal, safeAdjustableDecimal);
+                }
+                else
+                {
+                    Console.WriteLine($"[debug:max-guard-fail] Table={schema.TableName} Anchor={plan.AnchorColumn.ColumnName}({anchorDecimal}) Adjustable={plan.AdjustableColumn.ColumnName}({adjustableDecimal}) Max={resultMax}");
                 }
             }
         }
@@ -11382,17 +11867,24 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private bool IsAggregateSourceTable(string tableName, string alias, ParsedQuery query)
         {
-            // A table is an aggregate source if it's referenced in GROUP BY aggregates
-            // or if it contributes to ORDER BY... typically the detail/child tables
             foreach (var agg in query.Aggregates)
             {
                 if (agg.TableAlias.Equals(alias, StringComparison.OrdinalIgnoreCase))
                     return true;
 
-                // Check expression-based aggregates
                 if (!string.IsNullOrEmpty(agg.Expression) &&
                     agg.Expression.Contains(alias + ".", StringComparison.OrdinalIgnoreCase))
                     return true;
+            }
+
+            foreach (var cond in query.PredicateScopes.SelectMany(s => s.Conditions))
+            {
+                if (TryFindScalarComparisonSubquery(query, cond, out var subquery) &&
+                    subquery.SubquerySql.Contains("AVG", StringComparison.OrdinalIgnoreCase) &&
+                    (string.IsNullOrEmpty(alias) || subquery.SubquerySql.Contains(alias + ".", StringComparison.OrdinalIgnoreCase) || subquery.SubquerySql.Contains(" " + alias + " ", StringComparison.OrdinalIgnoreCase)))
+                {
+                    return true;
+                }
             }
 
             return false;
@@ -11517,6 +12009,42 @@ namespace SqlTestDataGenerator.DataGeneration
             _ => "="
         };
 
+
+        private bool IsColumnProtected(ParsedQuery query, BranchScenario scenario, TableSchema tableSchema, ColumnSchema column)
+        {
+            if (column.IsPrimaryKey) return true;
+            if (tableSchema.ForeignKeys.Any(fk => fk.ColumnName.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase))) return true;
+
+            var tableAliases = ResolveAliasesForTable(query, tableSchema.TableName).ToList();
+
+            // Protect if it's in a Join
+            if (query.Joins.Any(j => tableAliases.Any(tableAlias =>
+                (j.LeftTableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase) && j.LeftColumn.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)) ||
+                (j.RightTableAlias.Equals(tableAlias, StringComparison.OrdinalIgnoreCase) && j.RightColumn.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase))))) return true;
+
+            // Protect only predicate columns whose truth can be changed by shuffling.
+            // Length-only and single-character-presence predicates are still safe to diversify.
+            if (tableAliases.Any(tableAlias =>
+                    HasShuffleUnsafePredicateColumn(query, scenario, tableAlias, column.ColumnName)))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private void ValidateScenarioData(BranchScenario scenario)
+        {
+            // Implementation of final validation phase to catch any overflows before script generation
+            foreach (var tableEntry in scenario.TableRows)
+            {
+                foreach (var row in tableEntry.Value)
+                {
+                    // Basic length checks can be added here
+                }
+            }
+        }
+
         private static BranchScenario CloneScenarioDescriptor(BranchScenario source)
         {
             return new BranchScenario
@@ -11536,3 +12064,4 @@ namespace SqlTestDataGenerator.DataGeneration
         }
     }
 }
+

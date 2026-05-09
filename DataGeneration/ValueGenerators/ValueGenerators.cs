@@ -642,7 +642,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
         public IValueGenerator GetGenerator(DataTypeCategory category)
         {
             return _generators.FirstOrDefault(g => g.CanHandle(category))
-                   ?? new StringValueGenerator(); // fallback
+                   ?? _generators.First(g => g is StringValueGenerator);
         }
 
         public IntegerValueGenerator IntegerGenerator =>

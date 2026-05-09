@@ -22,6 +22,8 @@ namespace SqlTestDataGenerator.Schema.Models
         public string SchemaName { get; set; } = "dbo";
         public string ColumnName { get; set; } = string.Empty;
         public string DataType { get; set; } = string.Empty;
+        public string SystemDataType { get; set; } = string.Empty;
+        public bool IsUserDefinedType { get; set; }
         public bool IsNullable { get; set; }
         public int? MaxLength { get; set; }
         public int? NumericPrecision { get; set; }
@@ -33,9 +35,11 @@ namespace SqlTestDataGenerator.Schema.Models
         public string ComputedExpression { get; set; } = string.Empty;
         public int OrdinalPosition { get; set; }
         public string ColumnKey => $"{SchemaName}.{TableName}.{ColumnName}";
+        public string EffectiveDataType =>
+            string.IsNullOrWhiteSpace(SystemDataType) ? DataType : SystemDataType;
 
         /// <summary>Determines the C# type category for value generation</summary>
-        public DataTypeCategory TypeCategory => DataType.ToLowerInvariant() switch
+        public DataTypeCategory TypeCategory => EffectiveDataType.ToLowerInvariant() switch
         {
             "int" or "bigint" or "smallint" or "tinyint" => DataTypeCategory.Integer,
             "decimal" or "numeric" or "money" or "smallmoney" => DataTypeCategory.Decimal,
@@ -48,6 +52,9 @@ namespace SqlTestDataGenerator.Schema.Models
             "uniqueidentifier" => DataTypeCategory.Guid,
             "binary" or "varbinary" or "image" => DataTypeCategory.Binary,
             "xml" => DataTypeCategory.Xml,
+            "geography" or "geometry" => DataTypeCategory.Spatial,
+            "hierarchyid" => DataTypeCategory.HierarchyId,
+            "sql_variant" => DataTypeCategory.SqlVariant,
             _ => DataTypeCategory.String
         };
 
@@ -90,6 +97,9 @@ namespace SqlTestDataGenerator.Schema.Models
         String,
         Guid,
         Binary,
-        Xml
+        Xml,
+        Spatial,
+        HierarchyId,
+        SqlVariant
     }
 }

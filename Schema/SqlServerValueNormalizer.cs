@@ -4,6 +4,20 @@ using System.Text;
 
 namespace SqlTestDataGenerator.Schema
 {
+    public sealed class SqlExpressionValue
+    {
+        public SqlExpressionValue(string expression, string displayValue)
+        {
+            Expression = expression;
+            DisplayValue = displayValue;
+        }
+
+        public string Expression { get; }
+        public string DisplayValue { get; }
+
+        public override string ToString() => DisplayValue;
+    }
+
     /// <summary>
     /// Normalizes CLR values to SQL Server-compatible runtime values based on column schema.
     /// This keeps generation, validation, and execution aligned to the same final representation.
@@ -15,7 +29,10 @@ namespace SqlTestDataGenerator.Schema
             if (value == null || value == DBNull.Value)
                 return null;
 
-            return column.DataType.ToLowerInvariant() switch
+            if (value is SqlExpressionValue)
+                return value;
+
+            return column.EffectiveDataType.ToLowerInvariant() switch
             {
                 "bigint" or "int" or "smallint" or "tinyint" => NormalizeInteger(column, value),
                 "decimal" or "numeric" or "money" or "smallmoney" => NormalizeDecimal(column, value),
@@ -28,6 +45,10 @@ namespace SqlTestDataGenerator.Schema
                 "uniqueidentifier" => NormalizeGuid(value),
                 "binary" or "varbinary" or "image" => NormalizeBinary(column, value),
                 "xml" => NormalizeXml(value),
+                "geography" => NormalizeSpatial("geography", value),
+                "geometry" => NormalizeSpatial("geometry", value),
+                "hierarchyid" => NormalizeHierarchyId(value),
+                "sql_variant" => NormalizeSqlVariant(value),
                 _ => value
             };
         }
@@ -37,7 +58,7 @@ namespace SqlTestDataGenerator.Schema
             var parsed = ConvertToDecimal(value);
             var integral = decimal.Truncate(parsed);
 
-            return column.DataType.ToLowerInvariant() switch
+            return column.EffectiveDataType.ToLowerInvariant() switch
             {
                 "tinyint" => (byte)Clamp(integral, byte.MinValue, byte.MaxValue),
                 "smallint" => (short)Clamp(integral, short.MinValue, short.MaxValue),
@@ -65,7 +86,7 @@ namespace SqlTestDataGenerator.Schema
         private static object NormalizeFloat(ColumnSchema column, object value)
         {
             var parsed = ConvertToDouble(value);
-            return column.DataType.Equals("real", StringComparison.OrdinalIgnoreCase)
+            return column.EffectiveDataType.Equals("real", StringComparison.OrdinalIgnoreCase)
                 ? (object)(float)parsed
                 : parsed;
         }
@@ -91,7 +112,7 @@ namespace SqlTestDataGenerator.Schema
             var dateTime = ToDateTime(value);
             dateTime = DateTime.SpecifyKind(dateTime, DateTimeKind.Unspecified);
 
-            return column.DataType.ToLowerInvariant() switch
+            return column.EffectiveDataType.ToLowerInvariant() switch
             {
                 "date" => dateTime.Date,
                 "smalldatetime" => new DateTime(
@@ -183,6 +204,54 @@ namespace SqlTestDataGenerator.Schema
             };
         }
 
+        private static object NormalizeSpatial(string typeName, object value)
+        {
+            var text = Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                text = typeName.Equals("geography", StringComparison.OrdinalIgnoreCase)
+                    ? "POINT(139.6917 35.6895)"
+                    : "POINT(139.6917 35.6895)";
+            }
+
+            if (text.Contains("::", StringComparison.Ordinal))
+            {
+                return new SqlExpressionValue(text, text);
+            }
+
+            var escaped = text.Replace("'", "''", StringComparison.Ordinal);
+            var srid = typeName.Equals("geography", StringComparison.OrdinalIgnoreCase) ? 4326 : 0;
+            return new SqlExpressionValue(
+                $"{typeName}::STGeomFromText(N'{escaped}', {srid})",
+                text);
+        }
+
+        private static object NormalizeHierarchyId(object value)
+        {
+            var text = Convert.ToString(value, CultureInfo.InvariantCulture) ?? "/1/";
+            if (string.IsNullOrWhiteSpace(text))
+                text = "/1/";
+
+            if (text.Contains("::", StringComparison.Ordinal))
+                return new SqlExpressionValue(text, text);
+
+            if (!text.StartsWith("/", StringComparison.Ordinal))
+                text = "/" + text;
+            if (!text.EndsWith("/", StringComparison.Ordinal))
+                text += "/";
+
+            var escaped = text.Replace("'", "''", StringComparison.Ordinal);
+            return new SqlExpressionValue($"hierarchyid::Parse(N'{escaped}')", text);
+        }
+
+        private static object NormalizeSqlVariant(object value)
+        {
+            if (value is string s)
+                return NormalizeString(new ColumnSchema { DataType = "nvarchar", MaxLength = 4000 }, s);
+
+            return value;
+        }
+
         private static DateTime ToDateTime(object value)
         {
             return value switch
@@ -239,7 +308,7 @@ namespace SqlTestDataGenerator.Schema
             if (column.NumericScale.HasValue)
                 return Math.Max(0, column.NumericScale.Value);
 
-            return column.DataType.ToLowerInvariant() switch
+            return column.EffectiveDataType.ToLowerInvariant() switch
             {
                 "money" or "smallmoney" => 4,
                 _ => 0
@@ -251,7 +320,7 @@ namespace SqlTestDataGenerator.Schema
             if (column.NumericPrecision.HasValue)
                 return Math.Max(1, column.NumericPrecision.Value);
 
-            return column.DataType.ToLowerInvariant() switch
+            return column.EffectiveDataType.ToLowerInvariant() switch
             {
                 "money" => 19,
                 "smallmoney" => 10,
