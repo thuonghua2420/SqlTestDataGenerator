@@ -592,6 +592,8 @@ namespace SqlTestDataGenerator.Database
 
                 EnsureRequiredColumns(schema, kvp.Value);
                 NormalizeRowValues(schema, kvp.Value);
+                ApplyComputedProductInsertSafety(schema, kvp.Value);
+                NormalizeRowValues(schema, kvp.Value);
             }
 
             await EnsurePrimaryKeysAsync(
@@ -1246,6 +1248,321 @@ namespace SqlTestDataGenerator.Database
             }
         }
 
+        private static void ApplyComputedProductInsertSafety(TableSchema schema, IEnumerable<GeneratedRow> rows)
+        {
+            var plans = schema.Columns
+                .Where(c => c.IsComputed)
+                .Select(c => TryBuildComputedProductInsertPlan(schema, c, out var plan) ? plan : null)
+                .Where(p => p != null)
+                .Select(p => p!)
+                .ToList();
+            plans.AddRange(BuildImplicitProductInsertPlans(schema));
+
+            if (plans.Count == 0)
+                return;
+
+            foreach (var row in rows)
+            {
+                foreach (var plan in plans)
+                {
+                    if (!TryGetColumnPositiveMax(plan.ResultColumn, out var resultMax) ||
+                        !TryConvertDecimal(row.GetValue(plan.LeftColumn.ColumnName), out var left) ||
+                        !TryConvertDecimal(row.GetValue(plan.RightColumn.ColumnName), out var right) ||
+                        IsProductWithinMax(left, right, resultMax))
+                    {
+                        continue;
+                    }
+
+                    var keepLeft = IsMeasureLikeNumericColumn(plan.LeftColumn) && !IsMeasureLikeNumericColumn(plan.RightColumn);
+                    var keepColumn = keepLeft ? plan.LeftColumn : plan.RightColumn;
+                    var reduceColumn = keepLeft ? plan.RightColumn : plan.LeftColumn;
+                    var keepValue = keepLeft ? left : right;
+
+                    if (keepValue == 0m)
+                    {
+                        keepValue = 1m;
+                        row.SetValue(keepColumn.ColumnName, SqlServerValueNormalizer.NormalizeValue(keepColumn, keepValue));
+                    }
+
+                    var reduced = BuildSafeFactorForComputedProduct(reduceColumn, resultMax, keepValue);
+                    row.SetValue(reduceColumn.ColumnName, reduced);
+
+                    if (!TryConvertDecimal(reduced, out var reducedDecimal))
+                        continue;
+
+                    var finalLeft = keepLeft ? keepValue : reducedDecimal;
+                    var finalRight = keepLeft ? reducedDecimal : keepValue;
+                    if (!IsProductWithinMax(finalLeft, finalRight, resultMax))
+                    {
+                        row.SetValue(plan.LeftColumn.ColumnName, SqlServerValueNormalizer.NormalizeValue(plan.LeftColumn, 1m));
+                        row.SetValue(plan.RightColumn.ColumnName, BuildSafeFactorForComputedProduct(plan.RightColumn, resultMax, 1m));
+                    }
+                }
+            }
+        }
+
+        private static object? BuildSafeFactorForComputedProduct(ColumnSchema column, decimal resultMax, decimal otherFactor)
+        {
+            var limit = otherFactor == 0m ? resultMax : resultMax / Math.Abs(otherFactor);
+            if (limit <= 0m)
+                limit = 1m;
+
+            var sign = otherFactor < 0m ? -1m : 1m;
+            var candidate = RoundTowardZeroForColumn(column, limit) * sign;
+            if (candidate == 0m && resultMax > 0m)
+                candidate = column.TypeCategory == DataTypeCategory.Integer ? sign : GetStepForColumn(column) * sign;
+
+            return SqlServerValueNormalizer.NormalizeValue(column, candidate);
+        }
+
+        private static IEnumerable<ComputedProductInsertPlan> BuildImplicitProductInsertPlans(TableSchema schema)
+        {
+            var quantityColumns = schema.Columns
+                .Where(c =>
+                    !c.IsComputed &&
+                    c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
+                    IsQuantityLikeNumericColumn(c))
+                .ToList();
+            if (quantityColumns.Count == 0)
+                yield break;
+
+            var measureColumns = schema.Columns
+                .Where(c =>
+                    !c.IsComputed &&
+                    c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
+                    IsProductFactorMeasureColumn(c))
+                .ToList();
+            if (measureColumns.Count == 0)
+                yield break;
+
+            foreach (var quantity in quantityColumns)
+            {
+                foreach (var measure in measureColumns)
+                {
+                    if (quantity.ColumnName.Equals(measure.ColumnName, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    yield return new ComputedProductInsertPlan(measure, quantity, measure);
+                }
+            }
+        }
+
+        private static decimal RoundTowardZeroForColumn(ColumnSchema column, decimal value)
+        {
+            value = Math.Abs(value);
+            if (column.TypeCategory == DataTypeCategory.Integer)
+                return decimal.Floor(value);
+
+            var scale = Math.Min(28, Math.Max(0, column.NumericScale ?? 0));
+            if (scale == 0)
+                return decimal.Floor(value);
+
+            var factor = 1m;
+            for (var i = 0; i < scale; i++)
+                factor *= 10m;
+
+            return decimal.Floor(value * factor) / factor;
+        }
+
+        private static decimal GetStepForColumn(ColumnSchema column)
+        {
+            var scale = Math.Min(28, Math.Max(0, column.NumericScale ?? 0));
+            decimal step = 1m;
+            for (var i = 0; i < scale; i++)
+                step /= 10m;
+            return step;
+        }
+
+        private static bool TryBuildComputedProductInsertPlan(
+            TableSchema schema,
+            ColumnSchema computedColumn,
+            out ComputedProductInsertPlan plan)
+        {
+            plan = null!;
+            if (!IsComputedNumericProductResultColumn(computedColumn))
+            {
+                return false;
+            }
+
+            var referencedColumns = new List<ColumnSchema>();
+            if (!string.IsNullOrWhiteSpace(computedColumn.ComputedExpression) &&
+                computedColumn.ComputedExpression.Contains('*', StringComparison.Ordinal))
+            {
+                referencedColumns = ExtractComputedExpressionColumnNames(computedColumn.ComputedExpression, schema)
+                    .Where(c => !c.Equals(computedColumn.ColumnName, StringComparison.OrdinalIgnoreCase))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Select(schema.GetColumn)
+                    .Where(c => c != null &&
+                                !c.IsComputed &&
+                                c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float)
+                    .Cast<ColumnSchema>()
+                    .ToList();
+            }
+
+            if (referencedColumns.Count == 0)
+            {
+                var quantity = schema.Columns.FirstOrDefault(c =>
+                    !c.IsComputed &&
+                    c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
+                    c.ColumnName.Contains("Quantity", StringComparison.OrdinalIgnoreCase));
+                var measure = schema.Columns.FirstOrDefault(c =>
+                    !c.IsComputed &&
+                    c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
+                    IsMeasureLikeNumericColumn(c));
+
+                if (quantity != null && measure != null)
+                {
+                    referencedColumns.Add(quantity);
+                    referencedColumns.Add(measure);
+                }
+            }
+
+            if (referencedColumns.Count != 2)
+                return false;
+
+            plan = new ComputedProductInsertPlan(computedColumn, referencedColumns[0], referencedColumns[1]);
+            return true;
+        }
+
+        private static bool IsComputedNumericProductResultColumn(ColumnSchema column)
+        {
+            if (!column.IsComputed)
+                return false;
+
+            return column.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float ||
+                   column.NumericPrecision.HasValue ||
+                   column.NumericScale.HasValue ||
+                   column.ColumnName.Contains("Total", StringComparison.OrdinalIgnoreCase) ||
+                   column.ColumnName.Contains("Amount", StringComparison.OrdinalIgnoreCase) ||
+                   column.ColumnName.Contains("Computed", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static IEnumerable<string> ExtractComputedExpressionColumnNames(string expression, TableSchema schema)
+        {
+            var knownColumns = schema.Columns
+                .Select(c => c.ColumnName)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var regex = new System.Text.RegularExpressions.Regex(
+                @"\[(?<bracket>[^\]]+)\]|\b(?<bare>[A-Za-z_][A-Za-z0-9_]*)\b",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+            foreach (System.Text.RegularExpressions.Match match in regex.Matches(expression))
+            {
+                var name = match.Groups["bracket"].Success
+                    ? match.Groups["bracket"].Value
+                    : match.Groups["bare"].Value;
+                if (knownColumns.Contains(name))
+                    yield return name;
+            }
+        }
+
+        private static bool TryGetColumnPositiveMax(ColumnSchema column, out decimal max)
+        {
+            max = 0m;
+            object? normalized;
+            try
+            {
+                normalized = column.TypeCategory switch
+                {
+                    DataTypeCategory.Integer => SqlServerValueNormalizer.NormalizeValue(column, long.MaxValue),
+                    DataTypeCategory.Decimal => SqlServerValueNormalizer.NormalizeValue(column, decimal.MaxValue),
+                    DataTypeCategory.Float => SqlServerValueNormalizer.NormalizeValue(column, 999999999999999d),
+                    DataTypeCategory.String when column.NumericPrecision.HasValue || column.NumericScale.HasValue =>
+                        SqlServerValueNormalizer.NormalizeValue(
+                            new ColumnSchema
+                            {
+                                TableName = column.TableName,
+                                SchemaName = column.SchemaName,
+                                ColumnName = column.ColumnName,
+                                DataType = "decimal",
+                                NumericPrecision = column.NumericPrecision,
+                                NumericScale = column.NumericScale
+                            },
+                            decimal.MaxValue),
+                    _ => null
+                };
+            }
+            catch
+            {
+                return false;
+            }
+
+            return TryConvertDecimal(normalized, out max) && max > 0m;
+        }
+
+        private static bool IsProductWithinMax(decimal left, decimal right, decimal max)
+        {
+            try
+            {
+                return Math.Abs(left * right) <= max;
+            }
+            catch (OverflowException)
+            {
+                return false;
+            }
+        }
+
+        private static bool TryConvertDecimal(object? value, out decimal result)
+        {
+            result = 0m;
+            if (value == null || value == DBNull.Value)
+                return false;
+
+            try
+            {
+                result = Convert.ToDecimal(value, System.Globalization.CultureInfo.InvariantCulture);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsMeasureLikeNumericColumn(ColumnSchema column)
+        {
+            var name = column.ColumnName;
+            return name.Contains("Price", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Cost", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Amount", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Total", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Balance", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Revenue", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Fee", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsProductFactorMeasureColumn(ColumnSchema column)
+        {
+            var name = column.ColumnName;
+            return name.Contains("Price", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Cost", StringComparison.OrdinalIgnoreCase) ||
+                   (name.Contains("Amount", StringComparison.OrdinalIgnoreCase) &&
+                    !name.Contains("Total", StringComparison.OrdinalIgnoreCase)) ||
+                   name.Contains("Fee", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsQuantityLikeNumericColumn(ColumnSchema column)
+        {
+            var name = column.ColumnName;
+            return name.Contains("Quantity", StringComparison.OrdinalIgnoreCase) ||
+                   name.Equals("Qty", StringComparison.OrdinalIgnoreCase) ||
+                   name.EndsWith("Qty", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private sealed class ComputedProductInsertPlan
+        {
+            public ComputedProductInsertPlan(ColumnSchema resultColumn, ColumnSchema leftColumn, ColumnSchema rightColumn)
+            {
+                ResultColumn = resultColumn;
+                LeftColumn = leftColumn;
+                RightColumn = rightColumn;
+            }
+
+            public ColumnSchema ResultColumn { get; }
+            public ColumnSchema LeftColumn { get; }
+            public ColumnSchema RightColumn { get; }
+        }
+
         private static bool IsConstraintConflict(SqlException ex)
         {
             return ex.Number == 547 ||
@@ -1551,7 +1868,61 @@ JOIN sys.schemas sp ON tp.schema_id = sp.schema_id;";
                 AddTypedParameter(cmd, parameter.Name, parameter.Column, parameter.Value);
             }
 
-            return await cmd.ExecuteNonQueryAsync(cancellationToken);
+            try
+            {
+                return await cmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+            catch (SqlException ex) when (IsArithmeticOverflow(ex))
+            {
+                throw new InvalidOperationException(
+                    BuildArithmeticOverflowDiagnostic(schema, row, columns, ex),
+                    ex);
+            }
+        }
+
+        private static bool IsArithmeticOverflow(SqlException ex) =>
+            ex.Number == 8115 ||
+            ex.Message.Contains("Arithmetic overflow", StringComparison.OrdinalIgnoreCase);
+
+        private static string BuildArithmeticOverflowDiagnostic(
+            TableSchema schema,
+            GeneratedRow row,
+            IReadOnlyList<ColumnSchema> columns,
+            SqlException ex)
+        {
+            var numericValues = columns
+                .Where(c => c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float)
+                .Select(c => $"{c.ColumnName}={FormatDiagnosticValue(row.GetValue(c.ColumnName))} ({c.EffectiveDataType}{FormatNumericShape(c)})")
+                .ToList();
+
+            var detail = numericValues.Count == 0
+                ? "No numeric insert parameters were present."
+                : string.Join(", ", numericValues);
+
+            return $"Arithmetic overflow while inserting [{schema.SchemaName}.{schema.TableName}]. " +
+                   $"Numeric values: {detail}. SQL Server said: {ex.Message}";
+        }
+
+        private static string FormatNumericShape(ColumnSchema column)
+        {
+            if (column.TypeCategory != DataTypeCategory.Decimal)
+                return string.Empty;
+
+            return column.NumericPrecision.HasValue || column.NumericScale.HasValue
+                ? $"({column.NumericPrecision?.ToString() ?? "?"},{column.NumericScale?.ToString() ?? "?"})"
+                : string.Empty;
+        }
+
+        private static string FormatDiagnosticValue(object? value)
+        {
+            if (value == null || value == DBNull.Value)
+                return "NULL";
+
+            if (value is byte[] bytes)
+                return $"0x{Convert.ToHexString(bytes.Take(16).ToArray())}{(bytes.Length > 16 ? "..." : string.Empty)}";
+
+            var text = Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+            return text.Length <= 80 ? text : text[..80] + "...";
         }
 
         private static async Task<int> ExecuteNonQueryAsync(

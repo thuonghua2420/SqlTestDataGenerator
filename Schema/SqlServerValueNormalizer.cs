@@ -306,7 +306,7 @@ namespace SqlTestDataGenerator.Schema
         private static int GetScale(ColumnSchema column)
         {
             if (column.NumericScale.HasValue)
-                return Math.Max(0, column.NumericScale.Value);
+                return Math.Min(28, Math.Max(0, column.NumericScale.Value));
 
             return column.EffectiveDataType.ToLowerInvariant() switch
             {
@@ -343,6 +343,7 @@ namespace SqlTestDataGenerator.Schema
 
         private static decimal Pow10(int exponent)
         {
+            exponent = Math.Min(28, Math.Max(0, exponent));
             decimal result = 1m;
             for (int i = 0; i < exponent; i++)
             {
@@ -354,11 +355,25 @@ namespace SqlTestDataGenerator.Schema
 
         private static decimal GetMaxAbsValue(ColumnSchema column, decimal step)
         {
+            var type = column.EffectiveDataType.ToLowerInvariant();
+            if (type == "money")
+                return 922337203685477.5807m;
+            if (type == "smallmoney")
+                return 214748.3647m;
+
             var precision = GetPrecision(column);
             var scale = GetScale(column);
             var integerDigits = Math.Max(0, precision - scale);
-            var wholePartLimit = Pow10(integerDigits);
-            var max = wholePartLimit - step;
+
+            // SQL decimal/numeric can go up to precision 38, but CLR decimal cannot
+            // represent all 38 digits. Use the largest insertable value that still
+            // fits the declared integer digit budget instead of overflowing locally
+            // or creating a parameter SQL Server cannot convert.
+            var safeIntegerDigits = Math.Min(integerDigits, 28);
+            var wholePartLimit = Pow10(safeIntegerDigits);
+            var max = safeIntegerDigits + scale <= 28
+                ? wholePartLimit - step
+                : wholePartLimit - 1m;
             return max > 0m ? max : step;
         }
     }

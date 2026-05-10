@@ -2576,7 +2576,50 @@ namespace SqlTestDataGenerator.DataGeneration
                 upperBound = limit;
                 return true;
             }
+
+            if (IsQuantityLikeNumericColumn(sourceColumn) &&
+                schema.Columns.Any(c => c.IsComputed && IsComputedNumericProductResultColumn(c)) &&
+                TryGetImplicitProductUpperBound(schema, sourceColumn, out upperBound))
+            {
+                return true;
+            }
+
             return false;
+        }
+
+        private static bool TryGetImplicitProductUpperBound(
+            TableSchema schema,
+            ColumnSchema quantityColumn,
+            out decimal upperBound)
+        {
+            upperBound = 0m;
+            var measureColumn = schema.Columns.FirstOrDefault(c =>
+                !c.IsComputed &&
+                c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
+                IsProductFactorMeasureColumn(c));
+            if (measureColumn == null ||
+                !TryGetPositiveColumnMax(measureColumn, out var measureMax) ||
+                measureMax <= 0m)
+            {
+                return false;
+            }
+
+            var resultColumn = schema.Columns.FirstOrDefault(c =>
+                c.IsComputed &&
+                (c.ColumnName.Contains("Total", StringComparison.OrdinalIgnoreCase) ||
+                 c.ColumnName.Contains("Amount", StringComparison.OrdinalIgnoreCase) ||
+                 c.ColumnName.Contains("Computed", StringComparison.OrdinalIgnoreCase)));
+
+            var resultMax = resultColumn != null && TryGetPositiveColumnMax(resultColumn, out var explicitResultMax)
+                ? explicitResultMax
+                : measureMax;
+
+            var limit = resultMax / measureMax;
+            if (limit <= 0m)
+                return false;
+
+            upperBound = Math.Max(GetNumericRangeStep(quantityColumn), limit);
+            return true;
         }
 
         private object? GenerateSampleBasedValue(ColumnSchema column, object? sampleValue, int rowIndex)
@@ -3680,8 +3723,9 @@ namespace SqlTestDataGenerator.DataGeneration
         {
             if (column.NumericScale.HasValue && column.NumericScale.Value > 0)
             {
+                var scale = Math.Min(28, column.NumericScale.Value);
                 decimal step = 1m;
-                for (int i = 0; i < column.NumericScale.Value; i++)
+                for (int i = 0; i < scale; i++)
                 {
                     step /= 10m;
                 }
@@ -3730,17 +3774,26 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private static decimal GetMaxDecimalValue(ColumnSchema column)
         {
+            var type = column.EffectiveDataType.ToLowerInvariant();
+            if (type == "money")
+                return 922337203685477.5807m;
+            if (type == "smallmoney")
+                return 214748.3647m;
+
             var scale = Math.Max(0, column.NumericScale ?? 0);
             var precision = Math.Max(1, column.NumericPrecision ?? 18);
             var integerDigits = Math.Max(0, precision - scale);
+            var safeIntegerDigits = Math.Min(integerDigits, 28);
             decimal wholePart = 1m;
-            for (int i = 0; i < integerDigits; i++)
+            for (int i = 0; i < safeIntegerDigits; i++)
             {
                 wholePart *= 10m;
             }
 
             var step = GetNumericStep(column);
-            var max = wholePart - step;
+            var max = safeIntegerDigits + Math.Min(scale, 28) <= 28
+                ? wholePart - step
+                : wholePart - 1m;
             return max > 0m ? max : step;
         }
 
@@ -3914,6 +3967,24 @@ namespace SqlTestDataGenerator.DataGeneration
                    name.Contains("Salary", StringComparison.OrdinalIgnoreCase) ||
                    name.Contains("Revenue", StringComparison.OrdinalIgnoreCase) ||
                    name.Contains("Fee", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsProductFactorMeasureColumn(ColumnSchema column)
+        {
+            var name = column.ColumnName;
+            return name.Contains("Price", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Cost", StringComparison.OrdinalIgnoreCase) ||
+                   (name.Contains("Amount", StringComparison.OrdinalIgnoreCase) &&
+                    !name.Contains("Total", StringComparison.OrdinalIgnoreCase)) ||
+                   name.Contains("Fee", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsQuantityLikeNumericColumn(ColumnSchema column)
+        {
+            var name = column.ColumnName;
+            return name.Contains("Quantity", StringComparison.OrdinalIgnoreCase) ||
+                   name.Equals("Qty", StringComparison.OrdinalIgnoreCase) ||
+                   name.EndsWith("Qty", StringComparison.OrdinalIgnoreCase);
         }
 
         private static bool IsRateLikeNumericColumn(ColumnSchema column)
@@ -4388,7 +4459,7 @@ namespace SqlTestDataGenerator.DataGeneration
             if (column.TypeCategory == DataTypeCategory.Integer)
                 return 1m;
 
-            var scale = column.NumericScale ?? 0;
+            var scale = Math.Min(28, column.NumericScale ?? 0);
             if (scale <= 0)
                 return 1m;
 
@@ -4460,6 +4531,21 @@ namespace SqlTestDataGenerator.DataGeneration
             AddCandidate(baseCandidate.Replace(" ", string.Empty, StringComparison.Ordinal));
             AddCandidate($"A{baseCandidate}Z");
 
+            foreach (var target in targets.Where(t => t.DesiredTruth && t.Condition.Operator == ComparisonOp.Like))
+            {
+                if (TryBuildLikePreservingCandidate(
+                        column,
+                        rowIndex,
+                        target.Condition.LikePattern,
+                        target.Condition.LikeEscape,
+                        targetLength,
+                        UseMaxLengthMaxValueMode,
+                        out var likeCandidate))
+                {
+                    candidates.Add(likeCandidate);
+                }
+            }
+
             var hints = ExtractStringHints(targets, column);
             foreach (var hint in hints)
             {
@@ -4517,6 +4603,236 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             return false;
+        }
+
+        private static bool TryBuildLikePreservingCandidate(
+            ColumnSchema column,
+            int rowIndex,
+            string pattern,
+            string? escape,
+            int targetLength,
+            bool exactLength,
+            out string candidate)
+        {
+            candidate = string.Empty;
+            if (string.IsNullOrEmpty(pattern) || targetLength <= 0)
+                return false;
+
+            var minimal = SqlLikePattern.GenerateMatchingValue(pattern, column, escape);
+            if (!exactLength)
+            {
+                candidate = minimal;
+                return SqlLikePattern.IsMatch(candidate, pattern, escape);
+            }
+
+            var suffix = TryExtractSimpleLikeSuffix(pattern, escape, out var extractedSuffix)
+                ? extractedSuffix
+                : string.Empty;
+            var prefix = TryExtractSimpleLikePrefix(pattern, escape, out var extractedPrefix)
+                ? extractedPrefix
+                : string.Empty;
+            var contains = TryExtractSimpleLikeContains(pattern, escape, out var extractedContains)
+                ? extractedContains
+                : string.Empty;
+            var rowToken = (rowIndex + 1).ToString("D3");
+
+            IEnumerable<string> BuildCandidates()
+            {
+                if (IsEmailColumn(column) && !string.IsNullOrWhiteSpace(suffix))
+                {
+                    var emailSuffix = suffix.Contains('@', StringComparison.Ordinal)
+                        ? suffix
+                        : "@" + suffix.TrimStart('@');
+                    var localLength = targetLength - emailSuffix.Length;
+                    if (localLength > 0)
+                    {
+                        var local = BuildExactLengthAsciiToken(column, rowIndex, localLength);
+                        yield return local.ToLowerInvariant() + emailSuffix.ToLowerInvariant();
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(prefix) && prefix.Length <= targetLength)
+                {
+                    yield return prefix + BuildExactLengthAsciiToken(column, rowIndex, targetLength - prefix.Length);
+                }
+
+                if (!string.IsNullOrEmpty(suffix) && suffix.Length <= targetLength)
+                {
+                    yield return BuildExactLengthAsciiToken(column, rowIndex, targetLength - suffix.Length) + suffix;
+                }
+
+                if (!string.IsNullOrEmpty(contains) && contains.Length <= targetLength)
+                {
+                    var leftLength = Math.Max(0, (targetLength - contains.Length) / 2);
+                    var rightLength = targetLength - contains.Length - leftLength;
+                    yield return BuildExactLengthAsciiToken(column, rowIndex, leftLength) +
+                                 contains +
+                                 BuildExactLengthAsciiToken(column, rowIndex + 17, rightLength);
+                }
+
+                if (minimal.Length < targetLength && PatternStartsWithPercentWildcard(pattern, escape))
+                {
+                    yield return BuildExactLengthAsciiToken(column, rowIndex, targetLength - minimal.Length) + minimal;
+                }
+
+                if (minimal.Length < targetLength && PatternEndsWithPercentWildcard(pattern, escape))
+                {
+                    yield return minimal + BuildExactLengthAsciiToken(column, rowIndex, targetLength - minimal.Length);
+                }
+
+                yield return minimal.Length <= targetLength
+                    ? minimal
+                    : minimal[..targetLength];
+
+                yield return rowToken.Length >= targetLength
+                    ? rowToken[^targetLength..]
+                    : BuildExactLengthAsciiToken(column, rowIndex, targetLength);
+            }
+
+            foreach (var rawCandidate in BuildCandidates())
+            {
+                var normalizedText = rawCandidate.Length <= targetLength
+                    ? rawCandidate
+                    : rawCandidate[..targetLength];
+                var normalized = SqlServerValueNormalizer.NormalizeValue(column, normalizedText)?.ToString() ?? normalizedText;
+                if (SqlLikePattern.IsMatch(normalized, pattern, escape))
+                {
+                    candidate = normalized;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static string BuildExactLengthAsciiToken(ColumnSchema column, int rowIndex, int length)
+        {
+            if (length <= 0)
+                return string.Empty;
+
+            var rowToken = (rowIndex + 1).ToString("D3");
+            var baseToken = new string(
+                $"{column.TableName}{column.ColumnName}{rowToken}"
+                    .Where(char.IsLetterOrDigit)
+                    .ToArray());
+            if (string.IsNullOrEmpty(baseToken))
+                baseToken = "Value" + rowToken;
+
+            var builder = new System.Text.StringBuilder(length);
+            while (builder.Length < length)
+            {
+                if (builder.Length > 0)
+                    builder.Append('_');
+                builder.Append(baseToken);
+            }
+
+            return builder.ToString(0, length);
+        }
+
+        private static bool TryExtractSimpleLikeSuffix(string pattern, string? escape, out string suffix)
+        {
+            suffix = string.Empty;
+            if (!PatternStartsWithPercentWildcard(pattern, escape))
+                return false;
+
+            var raw = pattern[1..];
+            if (ContainsUnescapedLikeWildcard(raw, escape))
+                return false;
+
+            suffix = UnescapeLikeLiteral(raw, escape);
+            return !string.IsNullOrEmpty(suffix);
+        }
+
+        private static bool TryExtractSimpleLikePrefix(string pattern, string? escape, out string prefix)
+        {
+            prefix = string.Empty;
+            if (!PatternEndsWithPercentWildcard(pattern, escape))
+                return false;
+
+            var raw = pattern[..^1];
+            if (ContainsUnescapedLikeWildcard(raw, escape))
+                return false;
+
+            prefix = UnescapeLikeLiteral(raw, escape);
+            return !string.IsNullOrEmpty(prefix);
+        }
+
+        private static bool TryExtractSimpleLikeContains(string pattern, string? escape, out string contains)
+        {
+            contains = string.Empty;
+            if (!PatternStartsWithPercentWildcard(pattern, escape) ||
+                !PatternEndsWithPercentWildcard(pattern, escape) ||
+                pattern.Length < 3)
+            {
+                return false;
+            }
+
+            var raw = pattern[1..^1];
+            if (ContainsUnescapedLikeWildcard(raw, escape))
+                return false;
+
+            contains = UnescapeLikeLiteral(raw, escape);
+            return !string.IsNullOrEmpty(contains);
+        }
+
+        private static bool PatternStartsWithPercentWildcard(string pattern, string? escape) =>
+            pattern.Length > 0 &&
+            pattern[0] == '%' &&
+            !IsEscapedLikePosition(pattern, 0, escape);
+
+        private static bool PatternEndsWithPercentWildcard(string pattern, string? escape) =>
+            pattern.Length > 0 &&
+            pattern[^1] == '%' &&
+            !IsEscapedLikePosition(pattern, pattern.Length - 1, escape);
+
+        private static bool ContainsUnescapedLikeWildcard(string value, string? escape)
+        {
+            for (var i = 0; i < value.Length; i++)
+            {
+                if ((value[i] == '%' || value[i] == '_' || value[i] == '[') &&
+                    !IsEscapedLikePosition(value, i, escape))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool IsEscapedLikePosition(string value, int index, string? escape)
+        {
+            if (string.IsNullOrEmpty(escape) || index <= 0)
+                return false;
+
+            var escapeChar = escape[0];
+            var count = 0;
+            for (var i = index - 1; i >= 0 && value[i] == escapeChar; i--)
+            {
+                count++;
+            }
+
+            return count % 2 == 1;
+        }
+
+        private static string UnescapeLikeLiteral(string value, string? escape)
+        {
+            if (string.IsNullOrEmpty(escape))
+                return value;
+
+            var escapeChar = escape[0];
+            var builder = new System.Text.StringBuilder(value.Length);
+            for (var i = 0; i < value.Length; i++)
+            {
+                if (value[i] == escapeChar && i + 1 < value.Length)
+                {
+                    builder.Append(value[++i]);
+                    continue;
+                }
+
+                builder.Append(value[i]);
+            }
+
+            return builder.ToString();
         }
 
         private bool TryResolveFunctionAwareTemporalValue(
@@ -7331,7 +7647,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     ComparisonOp.NotEqual) ||
                 string.IsNullOrWhiteSpace(condition.ColumnName) ||
                 !TryFindScalarComparisonSubquery(query, condition, out var subquery) ||
-                !subquery.SubquerySql.Contains("AVG", StringComparison.OrdinalIgnoreCase) ||
+                !IsSupportedScalarComparisonAggregateSubquery(subquery) ||
                 string.IsNullOrWhiteSpace(subquery.SelectColumn))
             {
                 return false;
@@ -7396,6 +7712,27 @@ namespace SqlTestDataGenerator.DataGeneration
                 desiredTruth,
                 targetShouldBeHigher);
             return true;
+        }
+
+        private static bool IsSupportedScalarComparisonAggregateSubquery(SubqueryInfo subquery)
+        {
+            return ContainsAggregateFunctionCall(subquery.SubquerySql, "AVG") ||
+                   ContainsAggregateFunctionCall(subquery.SubquerySql, "MIN") ||
+                   ContainsAggregateFunctionCall(subquery.SubquerySql, "MAX");
+        }
+
+        private static bool ContainsAggregateFunctionCall(string? sql, string functionName)
+        {
+            if (string.IsNullOrWhiteSpace(sql) ||
+                string.IsNullOrWhiteSpace(functionName))
+            {
+                return false;
+            }
+
+            return System.Text.RegularExpressions.Regex.IsMatch(
+                sql,
+                $@"\b{System.Text.RegularExpressions.Regex.Escape(functionName)}\s*\(",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
         }
 
         private static bool TryResolveScalarAverageTargetOrdering(
@@ -7644,6 +7981,19 @@ namespace SqlTestDataGenerator.DataGeneration
             bool sameTable,
             bool sameColumn)
         {
+            if (target.TargetComputedPlan != null &&
+                target.AggregateComputedPlan == null &&
+                !sameTable)
+            {
+                ApplyComputedTargetToScalarAggregateComparison(
+                    query,
+                    scenario,
+                    target,
+                    targetRows,
+                    aggregateRows);
+                return;
+            }
+
             if (target.TargetComputedPlan == null ||
                 target.AggregateComputedPlan == null ||
                 !sameTable ||
@@ -7692,6 +8042,151 @@ namespace SqlTestDataGenerator.DataGeneration
                     target.TargetComputedPlan.ResultColumn.ColumnName,
                     isTargetRow || useUniformFalseValue ? targetComputedValue : supportComputedValue);
             }
+        }
+
+        private void ApplyComputedTargetToScalarAggregateComparison(
+            ParsedQuery query,
+            BranchScenario scenario,
+            ScalarAverageComparisonTarget target,
+            List<GeneratedRow> targetRows,
+            List<GeneratedRow> aggregateRows)
+        {
+            if (target.TargetComputedPlan == null ||
+                targetRows.Count == 0 ||
+                aggregateRows.Count == 0)
+            {
+                return;
+            }
+
+            var targetRow = targetRows[0];
+            if (!TryBuildComputedTargetToScalarAggregateValuePair(
+                    query,
+                    scenario,
+                    target,
+                    target.TargetComputedPlan,
+                    out var targetAnchorValue,
+                    out var targetAdjustValue,
+                    out var targetComputedValue,
+                    out _,
+                    out var aggregateValue,
+                    out _))
+            {
+                return;
+            }
+
+            targetRow.SetValue(target.TargetComputedPlan.AnchorColumn.ColumnName, targetAnchorValue);
+            targetRow.SetValue(target.TargetComputedPlan.AdjustableColumn.ColumnName, targetAdjustValue);
+            targetRow.SetValue(target.TargetComputedPlan.ResultColumn.ColumnName, targetComputedValue);
+
+            foreach (var row in aggregateRows)
+            {
+                row.SetValue(target.AggregateColumn.ColumnName, aggregateValue);
+            }
+        }
+
+        private bool TryBuildComputedTargetToScalarAggregateValuePair(
+            ParsedQuery query,
+            BranchScenario scenario,
+            ScalarAverageComparisonTarget target,
+            ComputedProductColumnPlan plan,
+            out object? targetAnchorValue,
+            out object? targetAdjustValue,
+            out object? targetComputedValue,
+            out decimal targetComputedDecimal,
+            out object? aggregateValue,
+            out decimal aggregateDecimal)
+        {
+            targetAnchorValue = null;
+            targetAdjustValue = null;
+            targetComputedValue = null;
+            targetComputedDecimal = 0m;
+            aggregateValue = null;
+            aggregateDecimal = 0m;
+
+            var anchorCandidates = BuildPositiveNumericColumnCandidates(
+                    query,
+                    scenario,
+                    target.TargetTableName,
+                    target.TargetAlias,
+                    plan.AnchorColumn)
+                .Where(v => v > 0m);
+            var adjustCandidates = BuildPositiveNumericColumnCandidates(
+                query,
+                scenario,
+                target.TargetTableName,
+                target.TargetAlias,
+                plan.AdjustableColumn);
+
+            anchorCandidates = target.TargetShouldBeHigher
+                ? anchorCandidates.OrderByDescending(v => v)
+                : anchorCandidates.OrderBy(v => v);
+            adjustCandidates = target.TargetShouldBeHigher
+                ? adjustCandidates.OrderByDescending(v => v)
+                : adjustCandidates.OrderBy(v => v);
+
+            foreach (var rawAnchor in anchorCandidates)
+            {
+                if (!TryNormalizeNumericCandidate(plan.AnchorColumn, rawAnchor, out var normalizedAnchor, out var anchorDecimal) ||
+                    anchorDecimal <= 0m ||
+                    !SatisfiesPositiveColumnConstraints(query, scenario, target.TargetTableName, target.TargetAlias, plan.AnchorColumn, normalizedAnchor))
+                {
+                    continue;
+                }
+
+                foreach (var rawAdjust in adjustCandidates)
+                {
+                    if (!TryNormalizeNumericCandidate(plan.AdjustableColumn, rawAdjust, out var normalizedAdjust, out var adjustDecimal) ||
+                        !SatisfiesPositiveColumnConstraints(query, scenario, target.TargetTableName, target.TargetAlias, plan.AdjustableColumn, normalizedAdjust))
+                    {
+                        continue;
+                    }
+
+                    var rawComputed = anchorDecimal * adjustDecimal;
+                    if (!TryNormalizeNumericCandidate(plan.ResultColumn, rawComputed, out var normalizedComputed, out var normalizedComputedDecimal))
+                    {
+                        continue;
+                    }
+
+                    var supportCandidates = BuildScalarAverageSupportCandidates(
+                            target.AggregateColumn,
+                            normalizedComputedDecimal,
+                            target.TargetShouldBeHigher)
+                        .Concat(BuildPositiveNumericColumnCandidates(
+                            query,
+                            scenario,
+                            target.AggregateTableName,
+                            target.AggregateAlias,
+                            target.AggregateColumn));
+                    supportCandidates = target.TargetShouldBeHigher
+                        ? supportCandidates.OrderBy(v => v)
+                        : supportCandidates.OrderByDescending(v => v);
+
+                    foreach (var rawAggregate in supportCandidates)
+                    {
+                        if (!TryNormalizeNumericCandidate(target.AggregateColumn, rawAggregate, out var normalizedAggregate, out var normalizedAggregateDecimal) ||
+                            !SatisfiesScalarAverageSupportSideConstraints(query, scenario, target, normalizedAggregate))
+                        {
+                            continue;
+                        }
+
+                        var relationSatisfied = target.TargetShouldBeHigher
+                            ? normalizedComputedDecimal > normalizedAggregateDecimal
+                            : normalizedComputedDecimal < normalizedAggregateDecimal;
+                        if (!relationSatisfied)
+                            continue;
+
+                        targetAnchorValue = normalizedAnchor;
+                        targetAdjustValue = normalizedAdjust;
+                        targetComputedValue = normalizedComputed;
+                        targetComputedDecimal = normalizedComputedDecimal;
+                        aggregateValue = normalizedAggregate;
+                        aggregateDecimal = normalizedAggregateDecimal;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
         }
 
         private static bool ShouldUseUniformFalseScalarAverageValue(ScalarAverageComparisonTarget target)
@@ -8199,9 +8694,15 @@ namespace SqlTestDataGenerator.DataGeneration
             // the schema reader may not always populate TypeCategory correctly for computed columns,
             // and we can still determine if it is numeric from source column types.
             // Only skip if TypeCategory is explicitly a non-numeric, non-computed known type.
-            if (column.TypeCategory is DataTypeCategory.String or DataTypeCategory.Boolean or
+            if (column.TypeCategory is DataTypeCategory.Boolean or
                 DataTypeCategory.DateTime or DataTypeCategory.Time or DataTypeCategory.DateTimeOffset or
                 DataTypeCategory.Guid or DataTypeCategory.Binary or DataTypeCategory.Xml)
+            {
+                return false;
+            }
+
+            if (column.TypeCategory == DataTypeCategory.String &&
+                !IsComputedNumericProductResultColumn(column))
             {
                 return false;
             }
@@ -8236,6 +8737,25 @@ namespace SqlTestDataGenerator.DataGeneration
                 }
             }
 
+            if (referencedColumns.Count == 0 &&
+                IsComputedNumericProductResultColumn(column))
+            {
+                var quantity = schema.Columns.FirstOrDefault(c =>
+                    !c.IsComputed &&
+                    c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
+                    c.ColumnName.Contains("Quantity", StringComparison.OrdinalIgnoreCase));
+                var measure = schema.Columns.FirstOrDefault(c =>
+                    !c.IsComputed &&
+                    c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
+                    IsMeasureLikeNumericColumn(c));
+
+                if (quantity != null && measure != null)
+                {
+                    referencedColumns.Add(quantity);
+                    referencedColumns.Add(measure);
+                }
+            }
+
             if (referencedColumns.Count != 2 ||
                 (!string.IsNullOrWhiteSpace(column.ComputedExpression) &&
                  !column.ComputedExpression.Contains('*', StringComparison.Ordinal)))
@@ -8249,6 +8769,19 @@ namespace SqlTestDataGenerator.DataGeneration
             var anchor = referencedColumns.First(c => !c.ColumnName.Equals(adjustable.ColumnName, StringComparison.OrdinalIgnoreCase));
             plan = new ComputedProductColumnPlan(column, anchor, adjustable);
             return true;
+        }
+
+        private static bool IsComputedNumericProductResultColumn(ColumnSchema column)
+        {
+            if (!column.IsComputed)
+                return false;
+
+            return column.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float ||
+                   column.NumericPrecision.HasValue ||
+                   column.NumericScale.HasValue ||
+                   column.ColumnName.Contains("Total", StringComparison.OrdinalIgnoreCase) ||
+                   column.ColumnName.Contains("Amount", StringComparison.OrdinalIgnoreCase) ||
+                   column.ColumnName.Contains("Computed", StringComparison.OrdinalIgnoreCase);
         }
 
         private static IEnumerable<string> ExtractComputedExpressionColumnNames(string expression, TableSchema schema)
