@@ -122,6 +122,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 ApplyScenarioStringShuffleAdjustments(query, workingScenario, schemas);
                 ValidateScenarioLocalForeignKeys(workingScenario, schemas);
                 ValidateScenarioData(workingScenario);
+                ApplyScenarioRecordOrderShuffle(workingScenario);
                 dataSet.Scenarios.Add(workingScenario);
             }
 
@@ -258,6 +259,94 @@ namespace SqlTestDataGenerator.DataGeneration
                     }
                 }
             }
+        }
+
+        private void ApplyScenarioRecordOrderShuffle(BranchScenario scenario)
+        {
+            if (!ShuffleGeneratedStringCharacters)
+                return;
+
+            foreach (var (tableName, rows) in scenario.TableRows)
+            {
+                if (rows.Count < 2)
+                    continue;
+
+                ShuffleRowsInPlace(tableName, scenario.Name, rows);
+            }
+        }
+
+        private static void ShuffleRowsInPlace(
+            string tableName,
+            string scenarioName,
+            List<GeneratedRow> rows)
+        {
+            var original = rows.ToList();
+            var signature = BuildRowOrderSignature(rows);
+            var random = new Random(BuildStableShuffleSeed(
+                tableName,
+                "__record_order__",
+                rows.Count,
+                scenarioName + "|" + signature,
+                attempt: 0));
+
+            for (var i = rows.Count - 1; i > 0; i--)
+            {
+                var j = random.Next(i + 1);
+                (rows[i], rows[j]) = (rows[j], rows[i]);
+            }
+
+            if (!RowsHaveSameReferenceOrder(rows, original))
+                return;
+
+            var offsetSeed = BuildStableShuffleSeed(
+                tableName,
+                "__record_order_offset__",
+                rows.Count,
+                scenarioName + "|" + signature,
+                attempt: 1);
+            var offset = (offsetSeed % (rows.Count - 1)) + 1;
+            var rotated = rows.Skip(offset).Concat(rows.Take(offset)).ToList();
+            rows.Clear();
+            rows.AddRange(rotated);
+        }
+
+        private static string BuildRowOrderSignature(IReadOnlyList<GeneratedRow> rows)
+        {
+            var builder = new System.Text.StringBuilder();
+            foreach (var row in rows.Take(16))
+            {
+                builder.Append(row.TableName);
+                builder.Append(':');
+                foreach (var value in row.ColumnValues
+                             .OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase)
+                             .Take(8))
+                {
+                    builder.Append(value.Key);
+                    builder.Append('=');
+                    builder.Append(Convert.ToString(value.Value, System.Globalization.CultureInfo.InvariantCulture));
+                    builder.Append(';');
+                }
+
+                builder.Append('|');
+            }
+
+            return builder.ToString();
+        }
+
+        private static bool RowsHaveSameReferenceOrder(
+            IReadOnlyList<GeneratedRow> rows,
+            IReadOnlyList<GeneratedRow> original)
+        {
+            if (rows.Count != original.Count)
+                return false;
+
+            for (var i = 0; i < rows.Count; i++)
+            {
+                if (!ReferenceEquals(rows[i], original[i]))
+                    return false;
+            }
+
+            return true;
         }
 
         private static void IncrementUsedValue(Dictionary<string, int> usedValueCounts, string value)
@@ -767,7 +856,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
             if (column.TypeCategory == DataTypeCategory.Integer)
             {
-                return column.DataType.ToLowerInvariant() switch
+                return column.EffectiveDataType.ToLowerInvariant() switch
                 {
                     "tinyint" => 3,
                     "smallint" => 5,
@@ -1194,7 +1283,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private static int GetIntegerTypeMaxValue(ColumnSchema column)
         {
-            return column.DataType.ToLowerInvariant() switch
+            return column.EffectiveDataType.ToLowerInvariant() switch
             {
                 "tinyint" => byte.MaxValue,
                 "smallint" => short.MaxValue,
@@ -2345,18 +2434,18 @@ namespace SqlTestDataGenerator.DataGeneration
             TableSchema? tableSchema = null)
         {
             // 1. Special Types (Spatial, Hierarchy, Variant)
-            if (col.DataType.Equals("geography", StringComparison.OrdinalIgnoreCase) ||
-                col.DataType.Equals("geometry", StringComparison.OrdinalIgnoreCase))
+            if (col.EffectiveDataType.Equals("geography", StringComparison.OrdinalIgnoreCase) ||
+                col.EffectiveDataType.Equals("geometry", StringComparison.OrdinalIgnoreCase))
             {
                 return $"POINT({rowIndex} {rowIndex})";
             }
 
-            if (col.DataType.Equals("hierarchyid", StringComparison.OrdinalIgnoreCase))
+            if (col.EffectiveDataType.Equals("hierarchyid", StringComparison.OrdinalIgnoreCase))
             {
                 return $"/{rowIndex + 1}/";
             }
 
-            if (col.DataType.Equals("sql_variant", StringComparison.OrdinalIgnoreCase))
+            if (col.EffectiveDataType.Equals("sql_variant", StringComparison.OrdinalIgnoreCase))
             {
                 if (col.ColumnName.Contains("Date", StringComparison.OrdinalIgnoreCase))
                     return new DateTime(2024, 1, 1).AddDays(rowIndex);
@@ -2392,7 +2481,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
             // 5. Default Semantic Generation (Strings and XML)
             if (col.TypeCategory == DataTypeCategory.String ||
-                col.DataType.Equals("xml", StringComparison.OrdinalIgnoreCase))
+                col.EffectiveDataType.Equals("xml", StringComparison.OrdinalIgnoreCase))
             {
                 return BuildSemanticString(col, rowIndex, null);
             }
@@ -2899,7 +2988,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private object BuildMaxTemporalValue(ColumnSchema column, int rowIndex)
         {
-            var offset = rowIndex + GetColumnVariantOffset(column);
+            var offset = BuildNonLinearTemporalOffset(column, rowIndex);
             var type = column.EffectiveDataType.ToLowerInvariant();
             
             if (type == "time")
@@ -2925,7 +3014,6 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private object BuildMaxNumericValue(ColumnSchema column, int rowIndex, ParsedQuery? query, string tableAlias, decimal? upperBound = null)
         {
-            var offset = rowIndex + GetColumnVariantOffset(column);
             var step = GetNumericStep(column);
 
             switch (column.TypeCategory)
@@ -2933,6 +3021,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 case DataTypeCategory.Integer:
                 {
                     decimal baseMax = upperBound ?? GetPracticalMaxIntegerValue(column, query, tableAlias);
+                    var offset = BuildNonLinearNumericOffset(column, rowIndex, 1m, baseMax);
                     var raw = baseMax - offset;
                     if (raw < 0 && baseMax >= 0) raw = 0;
                     return SqlServerValueNormalizer.NormalizeValue(column, (long)raw) ?? (long)raw;
@@ -2940,6 +3029,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 case DataTypeCategory.Decimal:
                 {
                     decimal baseMax = upperBound ?? GetPracticalMaxDecimalValue(column, query, tableAlias);
+                    var offset = BuildNonLinearNumericOffset(column, rowIndex, step, baseMax);
                     var raw = baseMax - (offset * step);
                     if (raw < 0 && baseMax >= 0) raw = 0;
                     return SqlServerValueNormalizer.NormalizeValue(column, raw) ?? raw;
@@ -2956,12 +3046,91 @@ namespace SqlTestDataGenerator.DataGeneration
                         baseMax = GetPracticalMaxFloatValue(column, query, tableAlias);
                     }
                     
+                    var offset = (double)BuildNonLinearNumericOffset(column, rowIndex, 1m, (decimal)Math.Min(baseMax, 1_000_000d));
                     var raw = baseMax - offset;
                     return SqlServerValueNormalizer.NormalizeValue(column, raw) ?? raw;
                 }
                 default:
                     return 0;
             }
+        }
+
+        private decimal BuildNonLinearNumericOffset(
+            ColumnSchema column,
+            int rowIndex,
+            decimal step,
+            decimal baseMax)
+        {
+            if (step <= 0m || baseMax <= 0m)
+                return Math.Max(0, rowIndex);
+
+            var maxSteps = decimal.Floor(baseMax / step);
+            if (maxSteps <= 0m)
+                return 0m;
+
+            var index = Math.Max(0, rowIndex);
+            if (index == 0)
+                return 0m;
+
+            var requestedRows = Math.Max(1, GetRequestedRowCount());
+            var effectiveRows = Math.Max(requestedRows, index + 1);
+            var minimumNeeded = effectiveRows - 1m;
+            if (maxSteps <= minimumNeeded)
+                return Math.Min(index, maxSteps);
+
+            var variantRoom = Math.Min(7m, Math.Max(0m, maxSteps - minimumNeeded));
+            var baseOffset = variantRoom <= 0m
+                ? 0m
+                : GetColumnVariantOffset(column) % (int)(variantRoom + 1m);
+            var remaining = maxSteps - baseOffset - minimumNeeded;
+            if (remaining < 0m)
+            {
+                baseOffset = 0m;
+                remaining = maxSteps - minimumNeeded;
+            }
+
+            var spread = Math.Min(remaining, Math.Max(8m, effectiveRows * 11m));
+            var denominator = Math.Max(1m, (effectiveRows - 1m) * (effectiveRows - 1m));
+            var curved = decimal.Floor(spread * index * index / denominator);
+            var offset = baseOffset + index + curved;
+            return offset > maxSteps ? maxSteps : offset;
+        }
+
+        private int BuildNonLinearTemporalOffset(ColumnSchema column, int rowIndex)
+        {
+            var index = Math.Max(0, rowIndex);
+            if (index == 0)
+                return 0;
+
+            var requestedRows = Math.Max(1, GetRequestedRowCount());
+            var effectiveRows = Math.Max(requestedRows, index + 1);
+            var type = column.EffectiveDataType.ToLowerInvariant();
+            var maxSteps = type switch
+            {
+                "time" => 24 * 60 * 60 - 1,
+                "smalldatetime" => 365,
+                "date" => 365,
+                _ => 365 * 24 * 60
+            };
+
+            var minimumNeeded = effectiveRows - 1;
+            if (maxSteps <= minimumNeeded)
+                return Math.Min(index, maxSteps);
+
+            var variantRoom = Math.Min(7, Math.Max(0, maxSteps - minimumNeeded));
+            var baseOffset = variantRoom <= 0 ? 0 : GetColumnVariantOffset(column) % (variantRoom + 1);
+            var remaining = maxSteps - baseOffset - minimumNeeded;
+            if (remaining < 0)
+            {
+                baseOffset = 0;
+                remaining = maxSteps - minimumNeeded;
+            }
+
+            var spread = Math.Min(remaining, Math.Max(8, effectiveRows * 11));
+            var denominator = Math.Max(1, (effectiveRows - 1) * (effectiveRows - 1));
+            var curved = spread * index * index / denominator;
+            var offset = baseOffset + index + curved;
+            return Math.Min(offset, maxSteps);
         }
 
         private object MutateSampleString(ColumnSchema column, object sampleValue, int rowIndex)
@@ -3010,7 +3179,7 @@ namespace SqlTestDataGenerator.DataGeneration
             {
                 candidate = BuildCompactToken(semanticSource, asciiSeed, rowToken, targetLength);
             }
-            else if (column.DataType.Equals("xml", StringComparison.OrdinalIgnoreCase))
+            else if (column.EffectiveDataType.Equals("xml", StringComparison.OrdinalIgnoreCase))
             {
                 candidate = $"<root><item id=\"{rowToken}\">Data</item></root>";
             }
@@ -3036,7 +3205,7 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             if (useJapanese &&
-                !column.DataType.Equals("xml", StringComparison.OrdinalIgnoreCase) &&
+                !column.EffectiveDataType.Equals("xml", StringComparison.OrdinalIgnoreCase) &&
                 !IsEmailColumn(column) &&
                 !IsUrlColumn(column) &&
                 !IsPhoneColumn(column))
@@ -3626,7 +3795,7 @@ namespace SqlTestDataGenerator.DataGeneration
             var normalized = SqlServerValueNormalizer.NormalizeValue(column, sampleValue);
             var source = normalized is DateTime dt ? dt : DateTime.Now;
             var offset = rowIndex + GetColumnVariantOffset(column);
-            var mutated = column.DataType.Equals("date", StringComparison.OrdinalIgnoreCase)
+            var mutated = column.EffectiveDataType.Equals("date", StringComparison.OrdinalIgnoreCase)
                 ? source.AddDays(offset)
                 : source.AddMinutes(offset * 7);
             return SqlServerValueNormalizer.NormalizeValue(column, mutated) ?? mutated;
@@ -3738,7 +3907,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private static long GetMaxIntegerValue(ColumnSchema column)
         {
-            return column.DataType.ToLowerInvariant() switch
+            return column.EffectiveDataType.ToLowerInvariant() switch
             {
                 "tinyint" => byte.MaxValue,
                 "smallint" => short.MaxValue,
@@ -3840,7 +4009,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private static double GetMaxFloatValue(ColumnSchema column)
         {
-            var digits = column.DataType.Equals("real", StringComparison.OrdinalIgnoreCase) ? 7 : 15;
+            var digits = column.EffectiveDataType.Equals("real", StringComparison.OrdinalIgnoreCase) ? 7 : 15;
             return Math.Pow(10d, digits) - 1d;
         }
 
@@ -3855,7 +4024,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private int DeterminePracticalNumericDigits(ColumnSchema column, ParsedQuery? query, string tableAlias)
         {
-            var typeDigits = column.DataType.ToLowerInvariant() switch
+            var typeDigits = column.EffectiveDataType.ToLowerInvariant() switch
             {
                 "tinyint" => 3,
                 "smallint" => 5,
@@ -9273,7 +9442,7 @@ namespace SqlTestDataGenerator.DataGeneration
         {
             value = null;
             var offset = Math.Max(0, rowIndex);
-            var step = column.DataType.Equals("date", StringComparison.OrdinalIgnoreCase)
+            var step = column.EffectiveDataType.Equals("date", StringComparison.OrdinalIgnoreCase)
                 ? TimeSpan.FromDays(1)
                 : TimeSpan.FromMinutes(7);
             DateTime candidate;
@@ -10629,7 +10798,10 @@ namespace SqlTestDataGenerator.DataGeneration
                     {
                         var unitPriceCol = schema.GetColumn(unitPriceColumnName);
                         var step = unitPriceCol != null ? GetNumericStep(unitPriceCol) : 0.01m;
-                        unitPrice = Math.Max(0m, maxUnitPrice - ((decimal)rowIndex * step));
+                        var offset = unitPriceCol != null
+                            ? BuildNonLinearNumericOffset(unitPriceCol, rowIndex, step, maxUnitPrice)
+                            : rowIndex;
+                        unitPrice = Math.Max(0m, maxUnitPrice - (offset * step));
                         if (unitPriceCol != null)
                         {
                             var normalized = SqlServerValueNormalizer.NormalizeValue(unitPriceCol, unitPrice);
@@ -11099,11 +11271,15 @@ namespace SqlTestDataGenerator.DataGeneration
             int maxDigits,
             int fallback)
         {
-            var raw = BuildAdjustedMaxInteger(query, schema, columnName, rowIndex, extraOffset, fallback);
+            var raw = BuildAdjustedMaxInteger(query, schema, columnName, 0, 0, fallback);
             var safeCap = maxDigits <= 0
                 ? raw
                 : (int)Math.Min(raw, Math.Pow(10, Math.Max(1, maxDigits)) - 1);
-            var candidate = safeCap - rowIndex;
+            var column = schema.Columns.FirstOrDefault(c => c.ColumnName.Equals(columnName, StringComparison.OrdinalIgnoreCase));
+            var offset = column != null
+                ? BuildNonLinearNumericOffset(column, rowIndex, 1m, Math.Max(1, safeCap)) + Math.Max(0, extraOffset)
+                : rowIndex;
+            var candidate = safeCap - (int)offset;
             return candidate > 0 ? candidate : Math.Max(1, fallback);
         }
 
@@ -11120,7 +11296,7 @@ namespace SqlTestDataGenerator.DataGeneration
             if (column == null)
                 return fallback;
 
-            var queryAwareMax = BuildAdjustedMaxDecimal(query, schema, columnName, rowIndex, extraOffset, fallback);
+            var queryAwareMax = BuildAdjustedMaxDecimal(query, schema, columnName, 0, 0, fallback);
             var scale = Math.Max(0, column.NumericScale ?? 0);
             var integerDigits = column.NumericPrecision.HasValue
                 ? Math.Max(1, column.NumericPrecision.Value - scale)
@@ -11138,7 +11314,8 @@ namespace SqlTestDataGenerator.DataGeneration
             var step = GetNumericStep(column);
             var safeMax = wholePart - step;
             safeMax = Math.Min(safeMax, queryAwareMax);
-            var candidate = safeMax - ((rowIndex + extraOffset) * step);
+            var offset = BuildNonLinearNumericOffset(column, rowIndex, step, safeMax) + Math.Max(0, extraOffset);
+            var candidate = safeMax - (offset * step);
             if (candidate <= 0m)
                 candidate = step;
 

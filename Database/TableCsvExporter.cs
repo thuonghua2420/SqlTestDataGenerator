@@ -320,7 +320,7 @@ namespace SqlTestDataGenerator.Database
 
         private static string BuildFileName(DirectInsertTableInfo table)
         {
-            var rawName = $"{NormalizeSchema(table.SchemaName)}.{table.TableName}.csv";
+            var rawName = $"{table.TableName}.csv";
             foreach (var invalid in Path.GetInvalidFileNameChars())
             {
                 rawName = rawName.Replace(invalid, '_');

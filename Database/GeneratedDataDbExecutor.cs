@@ -269,6 +269,11 @@ namespace SqlTestDataGenerator.Database
                         fkValue = GenerateSyntheticValue(fkColumn);
                         row.SetValue(fk.ColumnName, fkValue);
                     }
+                    else
+                    {
+                        fkValue = SqlServerValueNormalizer.NormalizeValue(fkColumn, fkValue) ?? DBNull.Value;
+                        row.SetValue(fk.ColumnName, fkValue);
+                    }
 
                     var referencedSchemaName = NormalizeSchema(fk.ReferencedSchema);
                     if (!schemas.TryGetValue(fk.ReferencedTable, out var referencedSchema))
@@ -281,12 +286,14 @@ namespace SqlTestDataGenerator.Database
                     if (FindPlannedRowByColumn(plannedRows, fk.ReferencedTable, fk.ReferencedColumn, fkValue) != null)
                         continue;
 
+                    var referencedColumn = referencedSchema.GetColumn(fk.ReferencedColumn);
                     var existsInDb = await ReferencedValueExistsAsync(
                         connection,
                         transaction,
                         referencedSchemaName,
                         fk.ReferencedTable,
                         fk.ReferencedColumn,
+                        referencedColumn,
                         fkValue!,
                         refExistsCache,
                         cancellationToken);
@@ -336,6 +343,9 @@ namespace SqlTestDataGenerator.Database
                         $"Required FK column [{schema.SchemaName}.{schema.TableName}.{fk.ColumnName}] has no value.");
                 }
 
+                fkValue = SqlServerValueNormalizer.NormalizeValue(fkColumn, fkValue) ?? DBNull.Value;
+                row.SetValue(fk.ColumnName, fkValue);
+
                 var referencedSchemaName = NormalizeSchema(fk.ReferencedSchema);
                 var referencedTableKey = BuildTableKey(referencedSchemaName, fk.ReferencedTable);
 
@@ -345,12 +355,18 @@ namespace SqlTestDataGenerator.Database
                     continue;
                 }
 
+                var referencedSchema = schemas.TryGetValue(fk.ReferencedTable, out var resolvedReferencedSchema)
+                    ? resolvedReferencedSchema
+                    : null;
+                var referencedColumn = referencedSchema?.GetColumn(fk.ReferencedColumn);
+
                 var exists = await ReferencedValueExistsAsync(
                     connection,
                     transaction,
                     referencedSchemaName,
                     fk.ReferencedTable,
                     fk.ReferencedColumn,
+                    referencedColumn,
                     fkValue!,
                     refExistsCache,
                     cancellationToken);
@@ -392,7 +408,12 @@ namespace SqlTestDataGenerator.Database
             object matchValue)
         {
             var row = new GeneratedRow { TableName = schema.TableName };
-            row.SetValue(matchColumn, matchValue);
+            var matchColumnSchema = schema.GetColumn(matchColumn);
+            row.SetValue(
+                matchColumn,
+                matchColumnSchema == null
+                    ? matchValue
+                    : SqlServerValueNormalizer.NormalizeValue(matchColumnSchema, matchValue) ?? DBNull.Value);
 
             foreach (var pkColumnName in schema.PrimaryKey?.Columns ?? Enumerable.Empty<string>())
             {
@@ -621,6 +642,8 @@ namespace SqlTestDataGenerator.Database
                     clearTableKeys,
                     uniqueExistsCache,
                     cancellationToken);
+
+                NormalizeRowValues(schema, rows);
             }
         }
 
@@ -817,12 +840,24 @@ namespace SqlTestDataGenerator.Database
                         if (IsNullValue(value))
                             continue;
 
+                        var fkColumn = schema.GetColumn(fk.ColumnName);
+                        if (fkColumn != null)
+                        {
+                            value = SqlServerValueNormalizer.NormalizeValue(fkColumn, value) ?? DBNull.Value;
+                            row.SetValue(fk.ColumnName, value);
+                        }
+
+                        var referencedColumn = schemas.TryGetValue(fk.ReferencedTable, out var referencedSchema)
+                            ? referencedSchema.GetColumn(fk.ReferencedColumn)
+                            : null;
+
                         var exists = await ReferencedValueExistsAsync(
                             connection,
                             transaction,
                             NormalizeSchema(fk.ReferencedSchema),
                             fk.ReferencedTable,
                             fk.ReferencedColumn,
+                            referencedColumn,
                             value!,
                             existsCache,
                             cancellationToken);
@@ -919,7 +954,7 @@ namespace SqlTestDataGenerator.Database
                 {
                     var paramName = $"@p{i}";
                     predicates.Add($"[{col.ColumnName}] = {paramName}");
-                    cmd.Parameters.AddWithValue(paramName, value!);
+                    AddTypedParameter(cmd, paramName, col, value!);
                 }
             }
 
@@ -1761,17 +1796,24 @@ JOIN sys.schemas sp ON tp.schema_id = sp.schema_id;";
             string schemaName,
             string tableName,
             string columnName,
+            ColumnSchema? column,
             object value,
             Dictionary<string, bool> cache,
             CancellationToken cancellationToken)
         {
-            var key = $"{schemaName}.{tableName}.{columnName}|{BuildValueKey(value)}";
+            var normalizedValue = column == null
+                ? value
+                : SqlServerValueNormalizer.NormalizeValue(column, value) ?? DBNull.Value;
+            var key = $"{schemaName}.{tableName}.{columnName}|{BuildValueKey(normalizedValue)}";
             if (cache.TryGetValue(key, out var cached))
                 return cached;
 
             var sql = $"SELECT TOP (1) 1 FROM [{schemaName}].[{tableName}] WHERE [{columnName}] = @v;";
             using var cmd = CreateCommand(connection, transaction, sql);
-            cmd.Parameters.AddWithValue("@v", value);
+            if (column == null)
+                cmd.Parameters.AddWithValue("@v", normalizedValue);
+            else
+                AddTypedParameter(cmd, "@v", column, normalizedValue);
 
             var result = await cmd.ExecuteScalarAsync(cancellationToken);
             var exists = result != null && result != DBNull.Value;

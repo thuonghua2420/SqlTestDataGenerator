@@ -22,7 +22,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
             if (!string.IsNullOrWhiteSpace(column.ColumnKey))
                 return column.ColumnKey;
 
-            return $"{column.ColumnName}|{column.DataType}|{column.MaxLength}|{column.NumericPrecision}|{column.NumericScale}";
+            return $"{column.ColumnName}|{column.EffectiveDataType}|{column.MaxLength}|{column.NumericPrecision}|{column.NumericScale}";
         }
 
         public static int GetColumnVariantOffset(ColumnSchema column, int modulus)
@@ -107,7 +107,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
 
         private static object NormalizeIntegerForType(long value, ColumnSchema column)
         {
-            return column.DataType.ToLowerInvariant() switch
+            return column.EffectiveDataType.ToLowerInvariant() switch
             {
                 "tinyint" => (byte)Math.Clamp(value, byte.MinValue, byte.MaxValue),
                 "smallint" => (short)Math.Clamp(value, short.MinValue, short.MaxValue),
@@ -181,7 +181,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
         {
             if (IsFloatingType(column))
             {
-                return column.DataType.Equals("real", StringComparison.OrdinalIgnoreCase)
+                return column.EffectiveDataType.Equals("real", StringComparison.OrdinalIgnoreCase)
                     ? (object)(float)(sequence + 0.125d)
                     : sequence + 0.125d;
             }
@@ -207,7 +207,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
             if (IsFloatingType(column))
             {
                 var dbl = (double)value;
-                return column.DataType.Equals("real", StringComparison.OrdinalIgnoreCase)
+                return column.EffectiveDataType.Equals("real", StringComparison.OrdinalIgnoreCase)
                     ? (object)(float)dbl
                     : dbl;
             }
@@ -226,15 +226,15 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
         }
 
         private static bool IsFloatingType(ColumnSchema column) =>
-            column.DataType.Equals("float", StringComparison.OrdinalIgnoreCase) ||
-            column.DataType.Equals("real", StringComparison.OrdinalIgnoreCase);
+            column.EffectiveDataType.Equals("float", StringComparison.OrdinalIgnoreCase) ||
+            column.EffectiveDataType.Equals("real", StringComparison.OrdinalIgnoreCase);
 
         private static int GetScale(ColumnSchema column)
         {
             if (column.NumericScale.HasValue)
                 return Math.Max(0, column.NumericScale.Value);
 
-            return column.DataType.ToLowerInvariant() switch
+            return column.EffectiveDataType.ToLowerInvariant() switch
             {
                 "money" or "smallmoney" => 4,
                 _ => 0
@@ -246,7 +246,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
             if (column.NumericPrecision.HasValue)
                 return Math.Max(1, column.NumericPrecision.Value);
 
-            return column.DataType.ToLowerInvariant() switch
+            return column.EffectiveDataType.ToLowerInvariant() switch
             {
                 "money" => 19,
                 "smallmoney" => 10,
@@ -437,7 +437,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
         public object GenerateDefault(ColumnSchema column)
         {
             var sequence = NextSequence(column) + ValueGeneratorKeyHelper.GetColumnVariantOffset(column, 365);
-            var next = column.DataType.Equals("date", StringComparison.OrdinalIgnoreCase)
+            var next = column.EffectiveDataType.Equals("date", StringComparison.OrdinalIgnoreCase)
                 ? BaseDateTime.AddDays(sequence)
                 : BaseDateTime.AddMinutes(sequence);
             return NormalizeDateValue(next, column);
@@ -486,7 +486,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
 
         private static object NormalizeDateValue(DateTime value, ColumnSchema column)
         {
-            return column.DataType.ToLowerInvariant() switch
+            return column.EffectiveDataType.ToLowerInvariant() switch
             {
                 "date" => value.Date,
                 "smalldatetime" => new DateTime(
