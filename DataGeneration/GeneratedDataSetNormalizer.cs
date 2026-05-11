@@ -24,7 +24,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         foreach (var kvp in row.ColumnValues.ToList())
                         {
                             var column = schema.GetColumn(kvp.Key);
-                            if (column == null || column.IsComputed)
+                            if (column == null || column.IsComputed || column.IsStoreGenerated)
                                 continue;
 
                             row.SetValue(kvp.Key, SqlServerValueNormalizer.NormalizeValue(column, kvp.Value));

@@ -119,6 +119,8 @@ namespace SqlTestDataGenerator.DataGeneration
                 EnforceScenarioForeignKeyClosure(workingScenario, schemas);
                 ApplyScenarioJoinColumnComparisonAdjustments(query, workingScenario, schemas);
                 ApplyScenarioInsertSafetyAdjustments(query, workingScenario, schemas);
+                EnforceScenarioUniqueKeyDiversity(query, workingScenario, schemas);
+                EnforceScenarioForeignKeyClosure(workingScenario, schemas);
                 ApplyScenarioStringShuffleAdjustments(query, workingScenario, schemas);
                 ValidateScenarioLocalForeignKeys(workingScenario, schemas);
                 ValidateScenarioData(workingScenario);
@@ -376,6 +378,7 @@ namespace SqlTestDataGenerator.DataGeneration
             ColumnSchema column)
         {
             if (column.IsComputed ||
+                column.IsStoreGenerated ||
                 column.IsIdentity ||
                 column.IsPrimaryKey ||
                 schema.PrimaryKey?.Columns.Any(c => c.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)) == true ||
@@ -1131,6 +1134,246 @@ namespace SqlTestDataGenerator.DataGeneration
             }
         }
 
+        private void EnforceScenarioUniqueKeyDiversity(
+            ParsedQuery query,
+            BranchScenario scenario,
+            Dictionary<string, TableSchema> schemas)
+        {
+            foreach (var (tableName, rows) in scenario.TableRows.ToList())
+            {
+                if (rows.Count < 2 || !schemas.TryGetValue(tableName, out var schema))
+                    continue;
+
+                foreach (var keyColumn in EnumerateSingleColumnUniqueKeyColumns(schema))
+                {
+                    if (HasFiniteDirectUniqueKeyDomain(query, scenario, schema.TableName, keyColumn.ColumnName))
+                        continue;
+
+                    var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    var duplicateOriginalKeys = rows
+                        .Select(row => BuildValueKey(row.GetValue(keyColumn.ColumnName)))
+                        .Where(key => !string.IsNullOrEmpty(key))
+                        .GroupBy(key => key, StringComparer.OrdinalIgnoreCase)
+                        .Where(group => group.Count() > 1)
+                        .Select(group => group.Key)
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                    var replacementsByOldValue = new Dictionary<string, List<object?>>(StringComparer.OrdinalIgnoreCase);
+                    var changed = false;
+
+                    for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+                    {
+                        var row = rows[rowIndex];
+                        var currentValue = row.GetValue(keyColumn.ColumnName);
+                        var currentKey = BuildValueKey(currentValue);
+                        if (!string.IsNullOrEmpty(currentKey) &&
+                            used.Add(currentKey) &&
+                            SatisfiesPositiveDirectPredicates(query, scenario, schema, keyColumn, currentValue))
+                        {
+                            if (duplicateOriginalKeys.Contains(currentKey))
+                            {
+                                AddOrdinalKeyReplacement(replacementsByOldValue, currentKey, currentValue);
+                            }
+                            continue;
+                        }
+
+                        if (!TryBuildDistinctUniqueKeyValue(
+                                query,
+                                scenario,
+                                schema,
+                                keyColumn,
+                                currentValue,
+                                rowIndex,
+                                used,
+                                out var replacement))
+                        {
+                            continue;
+                        }
+
+                        AddOrdinalKeyReplacement(
+                            replacementsByOldValue,
+                            string.IsNullOrEmpty(currentKey) ? "<NULL>" : currentKey,
+                            replacement);
+                        row.SetValue(keyColumn.ColumnName, replacement);
+                        changed = true;
+                    }
+
+                    if (changed)
+                    {
+                        PropagateOrdinalKeyReplacements(
+                            scenario,
+                            schemas,
+                            schema.TableName,
+                            keyColumn.ColumnName,
+                            replacementsByOldValue);
+                    }
+                }
+            }
+        }
+
+        private static void AddOrdinalKeyReplacement(
+            Dictionary<string, List<object?>> replacementsByOldValue,
+            string oldKey,
+            object? replacement)
+        {
+            if (!replacementsByOldValue.TryGetValue(oldKey, out var replacements))
+            {
+                replacements = new List<object?>();
+                replacementsByOldValue[oldKey] = replacements;
+            }
+
+            replacements.Add(replacement);
+        }
+
+        private static bool HasFiniteDirectUniqueKeyDomain(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableAlias,
+            string columnName)
+        {
+            return FindPositiveDirectUniqueKeyConditions(query, scenario, tableAlias, columnName)
+                .Select(GetDirectUniqueKeyDomainSize)
+                .Any(size => size > 0);
+        }
+
+        private bool TryBuildDistinctUniqueKeyValue(
+            ParsedQuery query,
+            BranchScenario scenario,
+            TableSchema schema,
+            ColumnSchema column,
+            object? currentValue,
+            int rowIndex,
+            HashSet<string> used,
+            out object? replacement)
+        {
+            replacement = null;
+            var generator = _valueFactory.GetGenerator(column.TypeCategory);
+
+            for (var attempt = 1; attempt <= Math.Max(32, RowsPerTable * 2); attempt++)
+            {
+                object? candidate = column.TypeCategory switch
+                {
+                    DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float =>
+                        BuildDistinctNumericKeyCandidate(column, currentValue, rowIndex, attempt),
+                    DataTypeCategory.Guid => Guid.NewGuid(),
+                    DataTypeCategory.String => BuildSemanticString(column, rowIndex + attempt, null),
+                    DataTypeCategory.DateTime => new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Unspecified).AddMinutes(rowIndex + attempt),
+                    DataTypeCategory.DateTimeOffset => new DateTimeOffset(2024, 1, 1, 0, 0, 0, TimeSpan.Zero).AddMinutes(rowIndex + attempt),
+                    DataTypeCategory.Time => TimeSpan.FromSeconds((rowIndex + attempt) % (24 * 60 * 60)),
+                    _ => generator.GenerateDefault(column)
+                };
+
+                candidate = SqlServerValueNormalizer.NormalizeValue(column, candidate) ?? candidate;
+                var key = BuildValueKey(candidate);
+                if (string.IsNullOrEmpty(key) ||
+                    used.Contains(key) ||
+                    !SatisfiesPositiveDirectPredicates(query, scenario, schema, column, candidate))
+                {
+                    continue;
+                }
+
+                used.Add(key);
+                replacement = candidate;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static object BuildDistinctNumericKeyCandidate(
+            ColumnSchema column,
+            object? currentValue,
+            int rowIndex,
+            int attempt)
+        {
+            var step = GetNumericRangeStep(column);
+            var baseValue = TryConvertDecimal(
+                    Convert.ToString(currentValue, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty,
+                    out var parsed)
+                ? parsed
+                : 0m;
+
+            return baseValue + step * (rowIndex + attempt);
+        }
+
+        private bool SatisfiesPositiveDirectPredicates(
+            ParsedQuery query,
+            BranchScenario scenario,
+            TableSchema schema,
+            ColumnSchema column,
+            object? candidate)
+        {
+            var generator = _valueFactory.GetGenerator(column.TypeCategory);
+            foreach (var alias in ResolveAliasesForTable(query, schema.TableName))
+            {
+                foreach (var scope in query.PredicateScopes.Where(s => s.Source != ConditionSource.Having))
+                {
+                    foreach (var condition in scope.Conditions)
+                    {
+                        if (condition.AggregateFunc != null ||
+                            condition.HasSubquery ||
+                            condition.IsColumnComparison ||
+                            HasScalarSubqueryPlaceholder(condition) ||
+                            !TryGetDesiredTruthForCondition(scenario, condition, defaultTruth: true, out var desiredTruth) ||
+                            !desiredTruth ||
+                            !IsConditionTargetingColumn(query, condition, alias, column.ColumnName))
+                        {
+                            continue;
+                        }
+
+                        if (!EvaluateCondition(candidate, condition, null, column, generator))
+                            return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        private static void PropagateOrdinalKeyReplacements(
+            BranchScenario scenario,
+            Dictionary<string, TableSchema> schemas,
+            string parentTableName,
+            string parentColumnName,
+            Dictionary<string, List<object?>> replacementsByOldValue)
+        {
+            if (replacementsByOldValue.Count == 0)
+                return;
+
+            foreach (var childSchema in schemas.Values)
+            {
+                var matchingFks = childSchema.ForeignKeys
+                    .Where(fk =>
+                        fk.ReferencedTable.Equals(parentTableName, StringComparison.OrdinalIgnoreCase) &&
+                        fk.ReferencedColumn.Equals(parentColumnName, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                if (matchingFks.Count == 0 ||
+                    !scenario.TableRows.TryGetValue(childSchema.TableName, out var childRows))
+                {
+                    continue;
+                }
+
+                foreach (var fk in matchingFks)
+                {
+                    foreach (var group in childRows
+                                 .Select((row, index) => (row, index))
+                                 .Where(item => replacementsByOldValue.ContainsKey(BuildValueKey(item.row.GetValue(fk.ColumnName))))
+                                 .GroupBy(item => BuildValueKey(item.row.GetValue(fk.ColumnName))))
+                    {
+                        var replacements = replacementsByOldValue[group.Key];
+                        if (replacements.Count == 0)
+                            continue;
+
+                        var ordinal = 0;
+                        foreach (var (row, _) in group.OrderBy(item => item.index))
+                        {
+                            row.SetValue(fk.ColumnName, replacements[ordinal % replacements.Count]);
+                            ordinal++;
+                        }
+                    }
+                }
+            }
+        }
+
         private static bool IsScenarioTestingCondition(BranchScenario scenario, ConditionInfo condition)
         {
             if (!string.IsNullOrWhiteSpace(scenario.TestedCondition) &&
@@ -1364,7 +1607,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                     foreach (var col in schema.Columns)
                     {
-                        if (col.IsComputed) continue;
+                        if (col.IsComputed || col.IsStoreGenerated) continue;
 
                         var value = GenerateColumnValue(scenario, col, alias, query, schemas,
                             tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
@@ -1425,7 +1668,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                     foreach (var col in schema.Columns)
                     {
-                        if (col.IsComputed) continue;
+                        if (col.IsComputed || col.IsStoreGenerated) continue;
 
                         var value = GenerateColumnValue(scenario, col, alias, query, schemas,
                             tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
@@ -1500,7 +1743,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                     foreach (var col in schema.Columns)
                     {
-                        if (col.IsComputed) continue;
+                        if (col.IsComputed || col.IsStoreGenerated) continue;
 
                         // For SUM/AVG failures, use tiny values for the aggregate column
                         bool useSmallValue = isAggregateSource &&
@@ -1582,7 +1825,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                     foreach (var col in schema.Columns)
                     {
-                        if (col.IsComputed) continue;
+                        if (col.IsComputed || col.IsStoreGenerated) continue;
 
                         // For the FK column that references the missing table, use a non-existent ID
                         bool isMissingFK = testedJoin != null &&
@@ -1657,7 +1900,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                     foreach (var col in schema.Columns)
                     {
-                        if (col.IsComputed) continue;
+                        if (col.IsComputed || col.IsStoreGenerated) continue;
 
                         var value = GenerateColumnValue(scenario, col, alias, query, schemas,
                             tableRowIds, referenceableTableIds, referencedTableIdPools, selfReferencePlans,
@@ -1877,7 +2120,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                     foreach (var col in schema.Columns)
                     {
-                        if (col.IsComputed) continue;
+                        if (col.IsComputed || col.IsStoreGenerated) continue;
 
                         bool isBoundaryColumn = testedCondition != null &&
                             testedCondition.AggregateFunc is not AggregateFunction.Count and not AggregateFunction.CountDistinct &&
@@ -2005,15 +2248,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
             return condition.Operator is
                 ComparisonOp.Equal or
-                ComparisonOp.NotEqual or
-                ComparisonOp.GreaterThan or
-                ComparisonOp.GreaterThanOrEqual or
-                ComparisonOp.LessThan or
-                ComparisonOp.LessThanOrEqual or
                 ComparisonOp.In or
-                ComparisonOp.NotIn or
-                ComparisonOp.Between or
-                ComparisonOp.Like or
                 ComparisonOp.IsNull;
         }
 
@@ -2142,6 +2377,23 @@ namespace SqlTestDataGenerator.DataGeneration
             return ValuesEqual(existing, value);
         }
 
+        private static string BuildValueKey(object? value)
+        {
+            if (value == null || value == DBNull.Value)
+                return string.Empty;
+
+            return value switch
+            {
+                DateTime dt => dt.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+                DateTimeOffset dto => dto.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+                TimeSpan ts => ts.ToString("c", System.Globalization.CultureInfo.InvariantCulture),
+                Guid guid => guid.ToString("D"),
+                byte[] bytes => Convert.ToBase64String(bytes),
+                IFormattable formattable => formattable.ToString(null, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty,
+                _ => Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty
+            };
+        }
+
         private static bool TryGetForcedColumnValue(
             Dictionary<string, object?> forcedValues,
             string tableName,
@@ -2190,7 +2442,8 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             // Always generate explicit values for IDENTITY columns so scripts can include full rows.
-            if (col.IsIdentity)
+            if (col.IsIdentity &&
+                !HasDirectValuePredicate(query, scenario, tableAlias, col.ColumnName))
             {
                 return rowId;
             }
@@ -2433,6 +2686,11 @@ namespace SqlTestDataGenerator.DataGeneration
             string tableAlias,
             TableSchema? tableSchema = null)
         {
+            if (col.IsStoreGenerated)
+            {
+                return DBNull.Value;
+            }
+
             // 1. Special Types (Spatial, Hierarchy, Variant)
             if (col.EffectiveDataType.Equals("geography", StringComparison.OrdinalIgnoreCase) ||
                 col.EffectiveDataType.Equals("geometry", StringComparison.OrdinalIgnoreCase))
@@ -2684,6 +2942,7 @@ namespace SqlTestDataGenerator.DataGeneration
             upperBound = 0m;
             var measureColumn = schema.Columns.FirstOrDefault(c =>
                 !c.IsComputed &&
+                !c.IsStoreGenerated &&
                 c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
                 IsProductFactorMeasureColumn(c));
             if (measureColumn == null ||
@@ -7257,8 +7516,10 @@ namespace SqlTestDataGenerator.DataGeneration
             string columnName)
         {
             return query.PredicateScopes
+                .Where(s => s.Source != ConditionSource.Having)
                 .SelectMany(s => s.Conditions)
                 .Any(condition =>
+                    condition.AggregateFunc == null &&
                     !condition.HasSubquery &&
                     !condition.IsColumnComparison &&
                     !HasScalarSubqueryPlaceholder(condition) &&
@@ -8093,10 +8354,12 @@ namespace SqlTestDataGenerator.DataGeneration
         {
             var orderDateColumn = schema.Columns.FirstOrDefault(c =>
                     !c.IsComputed &&
+                    !c.IsStoreGenerated &&
                     c.TypeCategory is DataTypeCategory.DateTime or DataTypeCategory.DateTimeOffset &&
                     c.ColumnName.Contains("OrderDate", StringComparison.OrdinalIgnoreCase)) ??
                 schema.Columns.FirstOrDefault(c =>
                     !c.IsComputed &&
+                    !c.IsStoreGenerated &&
                     c.TypeCategory is DataTypeCategory.DateTime or DataTypeCategory.DateTimeOffset &&
                     c.ColumnName.Contains("Date", StringComparison.OrdinalIgnoreCase));
 
@@ -8882,6 +9145,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 .Select(schema.GetColumn)
                 .Where(c => c != null &&
                             !c.IsComputed &&
+                            !c.IsStoreGenerated &&
                             c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float)
                 .Cast<ColumnSchema>()
                 .ToList();
@@ -8891,10 +9155,12 @@ namespace SqlTestDataGenerator.DataGeneration
             {
                 var quantity = schema.Columns.FirstOrDefault(c =>
                     !c.IsComputed &&
+                    !c.IsStoreGenerated &&
                     c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
                     c.ColumnName.Contains("Quantity", StringComparison.OrdinalIgnoreCase));
                 var price = schema.Columns.FirstOrDefault(c =>
                     !c.IsComputed &&
+                    !c.IsStoreGenerated &&
                     c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
                     (c.ColumnName.Contains("Price", StringComparison.OrdinalIgnoreCase) ||
                      c.ColumnName.Contains("Amount", StringComparison.OrdinalIgnoreCase)));
@@ -8911,10 +9177,12 @@ namespace SqlTestDataGenerator.DataGeneration
             {
                 var quantity = schema.Columns.FirstOrDefault(c =>
                     !c.IsComputed &&
+                    !c.IsStoreGenerated &&
                     c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
                     c.ColumnName.Contains("Quantity", StringComparison.OrdinalIgnoreCase));
                 var measure = schema.Columns.FirstOrDefault(c =>
                     !c.IsComputed &&
+                    !c.IsStoreGenerated &&
                     c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
                     IsMeasureLikeNumericColumn(c));
 
@@ -8979,6 +9247,7 @@ namespace SqlTestDataGenerator.DataGeneration
         private static bool CanAdjustScalarAggregateColumn(TableSchema schema, ColumnSchema column)
         {
             if (column.IsComputed ||
+                column.IsStoreGenerated ||
                 column.IsIdentity ||
                 column.IsPrimaryKey ||
                 schema.PrimaryKey?.Columns.Any(c => c.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)) == true ||
@@ -9636,7 +9905,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 foreach (var col in schema.Columns)
                 {
-                    if (col.IsComputed) continue;
+                    if (col.IsComputed || col.IsStoreGenerated) continue;
 
                     var value = GenerateSubqueryColumnValue(
                         scenario,
@@ -10173,6 +10442,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 foreach (var column in schema.Columns)
                 {
                     if (column.IsComputed ||
+                        column.IsStoreGenerated ||
                         column.IsIdentity ||
                         column.IsPrimaryKey ||
                         schema.PrimaryKey?.Columns.Any(c => c.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)) == true ||
@@ -10417,7 +10687,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private static bool CanAdjustComparisonColumn(TableSchema schema, ColumnSchema column)
         {
-            if (column.IsComputed || column.IsIdentity || column.IsPrimaryKey)
+            if (column.IsComputed || column.IsStoreGenerated || column.IsIdentity || column.IsPrimaryKey)
                 return false;
 
             if (schema.PrimaryKey?.Columns.Any(c => c.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)) == true)
@@ -11690,6 +11960,7 @@ namespace SqlTestDataGenerator.DataGeneration
             {
                 if ((column.IsIdentity || column.IsPrimaryKey) &&
                     !column.IsComputed &&
+                    !column.IsStoreGenerated &&
                     seen.Add(column.ColumnName))
                 {
                     yield return column;
@@ -11699,7 +11970,7 @@ namespace SqlTestDataGenerator.DataGeneration
             if (schema.PrimaryKey?.Columns.Count == 1)
             {
                 var column = schema.GetColumn(schema.PrimaryKey.Columns[0]);
-                if (column != null && !column.IsComputed && seen.Add(column.ColumnName))
+                if (column != null && !column.IsComputed && !column.IsStoreGenerated && seen.Add(column.ColumnName))
                 {
                     yield return column;
                 }
@@ -11708,7 +11979,7 @@ namespace SqlTestDataGenerator.DataGeneration
             foreach (var unique in schema.UniqueConstraints.Where(u => u.Columns.Count == 1))
             {
                 var column = schema.GetColumn(unique.Columns[0]);
-                if (column != null && !column.IsComputed && seen.Add(column.ColumnName))
+                if (column != null && !column.IsComputed && !column.IsStoreGenerated && seen.Add(column.ColumnName))
                 {
                     yield return column;
                 }

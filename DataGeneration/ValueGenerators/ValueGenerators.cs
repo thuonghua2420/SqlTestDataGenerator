@@ -192,10 +192,10 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
             if (max <= 0m)
                 return NormalizeNumericValue(step, column);
 
-            var slotCountDecimal = decimal.Floor(max / step);
-            var slotCount = slotCountDecimal >= long.MaxValue
+            var longMaxThreshold = long.MaxValue * step;
+            var slotCount = max >= longMaxThreshold
                 ? long.MaxValue
-                : Math.Max(1L, decimal.ToInt64(slotCountDecimal));
+                : Math.Max(1L, decimal.ToInt64(decimal.Floor(max / step)));
 
             var ordinal = ((sequence - 1) % slotCount) + 1;
             var candidate = ordinal * step;
@@ -215,6 +215,11 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
             var scale = GetScale(column);
             var step = GetStep(scale);
             var max = GetMaxAbsValue(column, step);
+            if (value > max)
+                return max;
+            if (value < -max)
+                return -max;
+
             var rounded = decimal.Round(value, scale, MidpointRounding.AwayFromZero);
 
             if (rounded > max)
@@ -269,6 +274,7 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
 
         private static decimal Pow10(int exponent)
         {
+            exponent = Math.Min(28, Math.Max(0, exponent));
             decimal result = 1m;
             for (int i = 0; i < exponent; i++)
             {
@@ -280,11 +286,20 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
 
         private static decimal GetMaxAbsValue(ColumnSchema column, decimal step)
         {
+            var type = column.EffectiveDataType.ToLowerInvariant();
+            if (type == "money")
+                return 922337203685477.5807m;
+            if (type == "smallmoney")
+                return 214748.3647m;
+
             var precision = GetPrecision(column);
             var scale = GetScale(column);
             var integerDigits = Math.Max(0, precision - scale);
-            var wholePartLimit = Pow10(integerDigits);
-            var max = wholePartLimit - step;
+            var safeIntegerDigits = Math.Min(integerDigits, 28);
+            var wholePartLimit = Pow10(safeIntegerDigits);
+            var max = safeIntegerDigits + scale <= 28
+                ? wholePartLimit - step
+                : wholePartLimit - 1m;
             return max > 0m ? max : step;
         }
 

@@ -37,6 +37,9 @@ namespace SqlTestDataGenerator.Schema.Models
         public string ColumnKey => $"{SchemaName}.{TableName}.{ColumnName}";
         public string EffectiveDataType =>
             string.IsNullOrWhiteSpace(SystemDataType) ? DataType : SystemDataType;
+        public bool IsStoreGenerated =>
+            EffectiveDataType.Equals("rowversion", StringComparison.OrdinalIgnoreCase) ||
+            EffectiveDataType.Equals("timestamp", StringComparison.OrdinalIgnoreCase);
 
         /// <summary>Determines the C# type category for value generation</summary>
         public DataTypeCategory TypeCategory => EffectiveDataType.ToLowerInvariant() switch
@@ -50,7 +53,7 @@ namespace SqlTestDataGenerator.Schema.Models
             "datetimeoffset" => DataTypeCategory.DateTimeOffset,
             "char" or "varchar" or "nchar" or "nvarchar" or "text" or "ntext" => DataTypeCategory.String,
             "uniqueidentifier" => DataTypeCategory.Guid,
-            "binary" or "varbinary" or "image" => DataTypeCategory.Binary,
+            "binary" or "varbinary" or "image" or "rowversion" or "timestamp" => DataTypeCategory.Binary,
             "xml" => DataTypeCategory.Xml,
             "geography" or "geometry" => DataTypeCategory.Spatial,
             "hierarchyid" => DataTypeCategory.HierarchyId,

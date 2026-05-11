@@ -236,7 +236,7 @@ namespace SqlTestDataGenerator.Output
                 else
                 {
                     foreach (var column in schema.Columns
-                                 .Where(c => !c.IsComputed)
+                                 .Where(c => !c.IsComputed && !c.IsStoreGenerated)
                                  .OrderBy(c => c.OrdinalPosition))
                     {
                         if (row.ColumnValues.TryGetValue(column.ColumnName, out var value))

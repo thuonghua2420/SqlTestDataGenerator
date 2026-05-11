@@ -43,7 +43,7 @@ namespace SqlTestDataGenerator.Schema
                 "time" => NormalizeTime(value),
                 "char" or "varchar" or "nchar" or "nvarchar" or "text" or "ntext" => NormalizeString(column, value),
                 "uniqueidentifier" => NormalizeGuid(value),
-                "binary" or "varbinary" or "image" => NormalizeBinary(column, value),
+                "binary" or "varbinary" or "image" or "rowversion" or "timestamp" => NormalizeBinary(column, value),
                 "xml" => NormalizeXml(value),
                 "geography" => NormalizeSpatial("geography", value),
                 "geometry" => NormalizeSpatial("geometry", value),
@@ -73,6 +73,11 @@ namespace SqlTestDataGenerator.Schema
             var scale = GetScale(column);
             var step = GetStep(scale);
             var max = GetMaxAbsValue(column, step);
+            if (parsed > max)
+                return max;
+            if (parsed < -max)
+                return -max;
+
             var rounded = decimal.Round(parsed, scale, MidpointRounding.AwayFromZero);
 
             if (rounded > max)

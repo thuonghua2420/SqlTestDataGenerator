@@ -257,7 +257,7 @@ namespace SqlTestDataGenerator.Database
                 foreach (var fk in schema.ForeignKeys)
                 {
                     var fkColumn = schema.GetColumn(fk.ColumnName);
-                    if (fkColumn == null || fkColumn.IsComputed)
+                    if (fkColumn == null || fkColumn.IsComputed || fkColumn.IsStoreGenerated)
                         continue;
 
                     var fkValue = row.GetValue(fk.ColumnName);
@@ -330,7 +330,7 @@ namespace SqlTestDataGenerator.Database
             foreach (var fk in schema.ForeignKeys)
             {
                 var fkColumn = schema.GetColumn(fk.ColumnName);
-                if (fkColumn == null || fkColumn.IsComputed)
+                if (fkColumn == null || fkColumn.IsComputed || fkColumn.IsStoreGenerated)
                     continue;
 
                 var fkValue = row.GetValue(fk.ColumnName);
@@ -418,7 +418,7 @@ namespace SqlTestDataGenerator.Database
             foreach (var pkColumnName in schema.PrimaryKey?.Columns ?? Enumerable.Empty<string>())
             {
                 var pkColumn = schema.GetColumn(pkColumnName);
-                if (pkColumn == null || pkColumn.IsComputed)
+                if (pkColumn == null || pkColumn.IsComputed || pkColumn.IsStoreGenerated)
                     continue;
                 if (row.ColumnValues.ContainsKey(pkColumnName))
                     continue;
@@ -428,7 +428,7 @@ namespace SqlTestDataGenerator.Database
 
             foreach (var column in schema.Columns.OrderBy(c => c.OrdinalPosition))
             {
-                if (column.IsComputed || row.ColumnValues.ContainsKey(column.ColumnName))
+                if (column.IsComputed || column.IsStoreGenerated || row.ColumnValues.ContainsKey(column.ColumnName))
                     continue;
                 if (column.IsNullable || HasDefaultValue(column))
                     continue;
@@ -544,7 +544,7 @@ namespace SqlTestDataGenerator.Database
         {
             var pkColumns = schema.PrimaryKey?.Columns
                 .Select(schema.GetColumn)
-                .Where(c => c != null && !c.IsComputed)
+                .Where(c => c != null && !c.IsComputed && !c.IsStoreGenerated)
                 .Select(c => c!)
                 .ToList();
             if (pkColumns == null || pkColumns.Count == 0)
@@ -670,7 +670,7 @@ namespace SqlTestDataGenerator.Database
 
                 var pkColumns = schema.PrimaryKey.Columns
                     .Select(schema.GetColumn)
-                    .Where(c => c != null && !c.IsComputed)
+                    .Where(c => c != null && !c.IsComputed && !c.IsStoreGenerated)
                     .Select(c => c!)
                     .ToList();
                 if (!pkColumns.Any())
@@ -719,7 +719,7 @@ namespace SqlTestDataGenerator.Database
             {
                 foreach (var column in schema.Columns.OrderBy(c => c.OrdinalPosition))
                 {
-                    if (column.IsComputed)
+                    if (column.IsComputed || column.IsStoreGenerated)
                         continue;
                     if (row.ColumnValues.ContainsKey(column.ColumnName) && !IsNullValue(row.GetValue(column.ColumnName)))
                         continue;
@@ -1102,7 +1102,7 @@ namespace SqlTestDataGenerator.Database
 
         private static bool CanMutateConstraintColumn(TableSchema schema, ColumnSchema column)
         {
-            if (column.IsComputed)
+            if (column.IsComputed || column.IsStoreGenerated)
                 return false;
             if (schema.PrimaryKey?.Columns.Contains(column.ColumnName, StringComparer.OrdinalIgnoreCase) == true)
                 return false;
@@ -1243,7 +1243,7 @@ namespace SqlTestDataGenerator.Database
         private Dictionary<string, object?> FilterRowColumns(GeneratedRow row, TableSchema schema)
         {
             var allowedColumns = schema.Columns
-                .Where(c => !c.IsComputed)
+                .Where(c => !c.IsComputed && !c.IsStoreGenerated)
                 .ToDictionary(c => c.ColumnName, c => c, StringComparer.OrdinalIgnoreCase);
 
             var filtered = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
@@ -1265,7 +1265,7 @@ namespace SqlTestDataGenerator.Database
                 foreach (var kvp in row.ColumnValues.ToList())
                 {
                     var column = schema.GetColumn(kvp.Key);
-                    if (column == null || column.IsComputed)
+                    if (column == null || column.IsComputed || column.IsStoreGenerated)
                         continue;
 
                     try
@@ -1355,6 +1355,7 @@ namespace SqlTestDataGenerator.Database
             var quantityColumns = schema.Columns
                 .Where(c =>
                     !c.IsComputed &&
+                    !c.IsStoreGenerated &&
                     c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
                     IsQuantityLikeNumericColumn(c))
                 .ToList();
@@ -1364,6 +1365,7 @@ namespace SqlTestDataGenerator.Database
             var measureColumns = schema.Columns
                 .Where(c =>
                     !c.IsComputed &&
+                    !c.IsStoreGenerated &&
                     c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
                     IsProductFactorMeasureColumn(c))
                 .ToList();
@@ -1429,6 +1431,7 @@ namespace SqlTestDataGenerator.Database
                     .Select(schema.GetColumn)
                     .Where(c => c != null &&
                                 !c.IsComputed &&
+                                !c.IsStoreGenerated &&
                                 c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float)
                     .Cast<ColumnSchema>()
                     .ToList();
@@ -1438,10 +1441,12 @@ namespace SqlTestDataGenerator.Database
             {
                 var quantity = schema.Columns.FirstOrDefault(c =>
                     !c.IsComputed &&
+                    !c.IsStoreGenerated &&
                     c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
                     c.ColumnName.Contains("Quantity", StringComparison.OrdinalIgnoreCase));
                 var measure = schema.Columns.FirstOrDefault(c =>
                     !c.IsComputed &&
+                    !c.IsStoreGenerated &&
                     c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
                     IsMeasureLikeNumericColumn(c));
 
@@ -1874,7 +1879,7 @@ JOIN sys.schemas sp ON tp.schema_id = sp.schema_id;";
         {
             var columns = row.ColumnValues.Keys
                 .Select(schema.GetColumn)
-                .Where(c => c != null && !c.IsComputed)
+                .Where(c => c != null && !c.IsComputed && !c.IsStoreGenerated)
                 .OrderBy(c => c!.OrdinalPosition)
                 .Select(c => c!)
                 .ToList();
@@ -2058,6 +2063,8 @@ JOIN sys.schemas sp ON tp.schema_id = sp.schema_id;";
                 "uniqueidentifier" => SqlDbType.UniqueIdentifier,
                 "binary" => SqlDbType.Binary,
                 "varbinary" => SqlDbType.VarBinary,
+                "rowversion" => SqlDbType.Binary,
+                "timestamp" => SqlDbType.Binary,
                 "image" => SqlDbType.Image,
                 "xml" => SqlDbType.Xml,
                 _ => SqlDbType.Variant

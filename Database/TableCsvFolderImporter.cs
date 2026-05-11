@@ -179,7 +179,7 @@ namespace SqlTestDataGenerator.Database
                 for (int i = 0; i < headers.Length; i++)
                 {
                     var column = schema.GetColumn(headers[i]);
-                    if (column == null || column.IsComputed)
+                    if (column == null || column.IsComputed || column.IsStoreGenerated)
                         continue;
 
                     var value = ConvertFieldValue(record[i], column, filePath, rowIndex + 1);
@@ -227,7 +227,7 @@ namespace SqlTestDataGenerator.Database
                         $"Column [{column.ColumnKey}] is [{column.DataType}].");
                 }
 
-                object raw = column.DataType.ToLowerInvariant() switch
+                object raw = column.EffectiveDataType.ToLowerInvariant() switch
                 {
                     "bigint" => long.Parse(field.Value, NumberStyles.Integer, CultureInfo.InvariantCulture),
                     "int" => int.Parse(field.Value, NumberStyles.Integer, CultureInfo.InvariantCulture),
@@ -246,7 +246,7 @@ namespace SqlTestDataGenerator.Database
                         TimeSpan.Parse(field.Value, CultureInfo.InvariantCulture),
                     "uniqueidentifier" =>
                         Guid.Parse(field.Value),
-                    "binary" or "varbinary" or "image" =>
+                    "binary" or "varbinary" or "image" or "rowversion" or "timestamp" =>
                         ParseBinary(field.Value),
                     _ => field.Value
                 };
