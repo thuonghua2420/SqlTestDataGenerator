@@ -1,8 +1,10 @@
 using Microsoft.Data.SqlClient;
+using SqlTestDataGenerator.DataGeneration.Models;
 using SqlTestDataGenerator.Schema.Models;
 using System.Data;
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
 
 namespace SqlTestDataGenerator.Database
 {
@@ -59,6 +61,174 @@ namespace SqlTestDataGenerator.Database
                 result.ExportedTables++;
                 result.ExportedRows += rowCount;
                 result.Files.Add(filePath);
+            }
+
+            return result;
+        }
+
+        public async Task<CsvExportResult> ExportGeneratedDataSetAsync(
+            GeneratedDataSet dataSet,
+            string folderPath,
+            Dictionary<string, TableSchema>? schemas = null,
+            CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(folderPath))
+                throw new InvalidOperationException("Export folder path is required.");
+
+            var inputDataRoot = Path.Combine(folderPath, "Input data");
+            Directory.CreateDirectory(inputDataRoot);
+
+            var result = new CsvExportResult();
+            foreach (var scenario in dataSet.Scenarios)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var scenarioFolder = Path.Combine(
+                    inputDataRoot,
+                    BuildScenarioFolderName(scenario));
+                Directory.CreateDirectory(scenarioFolder);
+
+                var rowsByTable = CollectScenarioRows(scenario);
+                var manifestTables = new List<object>();
+
+                foreach (var tableName in rowsByTable.Keys.OrderBy(t => t, StringComparer.OrdinalIgnoreCase))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    var schema = FindTableSchema(schemas, "dbo", tableName);
+                    var rows = rowsByTable[tableName];
+                    if (rows.Count == 0)
+                        continue;
+
+                    var filePath = Path.Combine(scenarioFolder, BuildFileNameFromTableName(tableName));
+                    await ExportGeneratedRowsAsync(filePath, rows, schema, cancellationToken);
+
+                    result.ExportedTables++;
+                    result.ExportedRows += rows.Count;
+                    result.Files.Add(filePath);
+
+                    manifestTables.Add(new
+                    {
+                        tableName,
+                        rowCount = rows.Count,
+                        rows = rows.Select((row, index) => new
+                        {
+                            index,
+                            role = row.Role.ToString(),
+                            primaryKey = BuildPrimaryKeyManifest(schema, row)
+                        }).ToList()
+                    });
+                }
+
+                var manifestPath = Path.Combine(scenarioFolder, "_manifest.json");
+                var manifest = new
+                {
+                    scenarioId = scenario.Id,
+                    scenarioName = scenario.Name,
+                    scenarioType = scenario.Type.ToString(),
+                    expectedToReturnRows = scenario.ExpectedToReturnRows,
+                    generatedAt = dataSet.GeneratedAt,
+                    tables = manifestTables
+                };
+                var manifestJson = JsonSerializer.Serialize(
+                    manifest,
+                    new JsonSerializerOptions { WriteIndented = true });
+                await File.WriteAllTextAsync(manifestPath, manifestJson, new UTF8Encoding(false), cancellationToken);
+                result.Files.Add(manifestPath);
+            }
+
+            return result;
+        }
+
+        private static Dictionary<string, List<GeneratedRow>> CollectScenarioRows(BranchScenario scenario)
+        {
+            var result = new Dictionary<string, List<GeneratedRow>>(StringComparer.OrdinalIgnoreCase);
+
+            void Add(Dictionary<string, List<GeneratedRow>> source)
+            {
+                foreach (var (tableName, rows) in source)
+                {
+                    if (!result.TryGetValue(tableName, out var target))
+                    {
+                        target = new List<GeneratedRow>();
+                        result[tableName] = target;
+                    }
+
+                    target.AddRange(rows);
+                }
+            }
+
+            Add(scenario.TableRows);
+            Add(scenario.AntiMatchRows);
+            return result;
+        }
+
+        private static async Task ExportGeneratedRowsAsync(
+            string filePath,
+            IReadOnlyList<GeneratedRow> rows,
+            TableSchema? schema,
+            CancellationToken cancellationToken)
+        {
+            var columnNames = ResolveGeneratedColumnNames(rows, schema);
+            await using var writer = new StreamWriter(
+                filePath,
+                false,
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+                WriterBufferSize);
+
+            await writer.WriteLineAsync(BuildCsvLine(columnNames.Select(name => EscapeCsv(name, shouldQuoteAlways: true)).ToArray()));
+
+            foreach (var row in rows)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var fields = new List<string>();
+                foreach (var columnName in columnNames)
+                {
+                    var column = schema?.GetColumn(columnName);
+                    fields.Add(FormatCsvField(row.GetValue(columnName), column));
+                }
+
+                await writer.WriteLineAsync(BuildCsvLine(fields));
+            }
+
+            await writer.FlushAsync(cancellationToken);
+        }
+
+        private static List<string> ResolveGeneratedColumnNames(
+            IReadOnlyList<GeneratedRow> rows,
+            TableSchema? schema)
+        {
+            if (schema != null)
+            {
+                return schema.Columns
+                    .Where(c => !c.IsComputed && !c.IsStoreGenerated)
+                    .OrderBy(c => c.OrdinalPosition)
+                    .Select(c => c.ColumnName)
+                    .Where(name => rows.Any(r => r.ColumnValues.ContainsKey(name)))
+                    .ToList();
+            }
+
+            return rows
+                .SelectMany(r => r.ColumnValues.Keys)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(c => c, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private static Dictionary<string, string?> BuildPrimaryKeyManifest(TableSchema? schema, GeneratedRow row)
+        {
+            var result = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+            var pkColumns = schema?.PrimaryKey?.Columns ?? new List<string>();
+            foreach (var pkColumn in pkColumns)
+            {
+                result[pkColumn] = Convert.ToString(row.GetValue(pkColumn), CultureInfo.InvariantCulture);
+            }
+
+            if (result.Count == 0 && row.ColumnValues.Count > 0)
+            {
+                var first = row.ColumnValues.First();
+                result[first.Key] = Convert.ToString(first.Value, CultureInfo.InvariantCulture);
             }
 
             return result;
@@ -320,13 +490,30 @@ namespace SqlTestDataGenerator.Database
 
         private static string BuildFileName(DirectInsertTableInfo table)
         {
-            var rawName = $"{table.TableName}.csv";
+            return BuildFileNameFromTableName(table.TableName);
+        }
+
+        private static string BuildFileNameFromTableName(string tableName)
+        {
+            var rawName = $"{tableName}.csv";
             foreach (var invalid in Path.GetInvalidFileNameChars())
             {
                 rawName = rawName.Replace(invalid, '_');
             }
 
             return rawName;
+        }
+
+        private static string BuildScenarioFolderName(BranchScenario scenario)
+        {
+            var rawName = $"{scenario.Id:D2}_{scenario.Name}";
+            foreach (var invalid in Path.GetInvalidFileNameChars())
+            {
+                rawName = rawName.Replace(invalid, '_');
+            }
+
+            rawName = rawName.Replace(':', '_');
+            return rawName.Length <= 80 ? rawName : rawName[..80];
         }
 
         private static string GetQualifiedTableName(DirectInsertTableInfo table) =>

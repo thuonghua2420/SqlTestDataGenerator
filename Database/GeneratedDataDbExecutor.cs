@@ -1215,7 +1215,7 @@ namespace SqlTestDataGenerator.Database
 
             foreach (var scenario in dataSet.Scenarios)
             {
-                foreach (var kvp in scenario.TableRows)
+                foreach (var kvp in EnumerateScenarioRowsForInsert(scenario))
                 {
                     if (!schemas.TryGetValue(kvp.Key, out var schema))
                         continue;
@@ -1238,6 +1238,15 @@ namespace SqlTestDataGenerator.Database
             }
 
             return result;
+        }
+
+        private static IEnumerable<KeyValuePair<string, List<GeneratedRow>>> EnumerateScenarioRowsForInsert(BranchScenario scenario)
+        {
+            foreach (var tableRows in scenario.TableRows)
+                yield return tableRows;
+
+            foreach (var tableRows in scenario.AntiMatchRows)
+                yield return tableRows;
         }
 
         private Dictionary<string, object?> FilterRowColumns(GeneratedRow row, TableSchema schema)

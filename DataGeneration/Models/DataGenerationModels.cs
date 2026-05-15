@@ -6,11 +6,19 @@ namespace SqlTestDataGenerator.DataGeneration.Models
     public class GeneratedRow
     {
         public string TableName { get; set; } = string.Empty;
+        public RowRole Role { get; set; } = RowRole.Match;
+        public Dictionary<string, ValueBinding> ColumnBindings { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, object?> ColumnValues { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
         public void SetValue(string column, object? value)
         {
             ColumnValues[column] = value;
+        }
+
+        public void SetValue(string column, object? value, ValueBinding binding)
+        {
+            ColumnValues[column] = value;
+            ColumnBindings[column] = binding;
         }
 
         public object? GetValue(string column)
@@ -62,6 +70,9 @@ namespace SqlTestDataGenerator.DataGeneration.Models
         /// <summary>The rows to insert, keyed by table name, ordered by dependency</summary>
         public Dictionary<string, List<GeneratedRow>> TableRows { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>Non-mapping/support rows that are inserted and exported but kept out of legacy match-row views.</summary>
+        public Dictionary<string, List<GeneratedRow>> AntiMatchRows { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
         /// <summary>Tables in dependency order for INSERT</summary>
         public List<string> InsertOrder { get; set; } = new();
 
@@ -73,6 +84,14 @@ namespace SqlTestDataGenerator.DataGeneration.Models
             if (!TableRows.ContainsKey(tableName))
                 TableRows[tableName] = new List<GeneratedRow>();
             TableRows[tableName].Add(row);
+        }
+
+        public void AddAntiMatchRow(string tableName, GeneratedRow row)
+        {
+            row.Role = RowRole.AntiMatch;
+            if (!AntiMatchRows.ContainsKey(tableName))
+                AntiMatchRows[tableName] = new List<GeneratedRow>();
+            AntiMatchRows[tableName].Add(row);
         }
     }
 

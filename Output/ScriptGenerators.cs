@@ -83,9 +83,11 @@ namespace SqlTestDataGenerator.Output
             }
 
             // Generate INSERTs in dependency order
+            var rowsByTable = CollectScenarioRowsForInsert(scenario);
+
             foreach (var tableName in scenario.InsertOrder)
             {
-                if (!scenario.TableRows.TryGetValue(tableName, out var rows) || !rows.Any())
+                if (!rowsByTable.TryGetValue(tableName, out var rows) || !rows.Any())
                     continue;
 
                 var validRows = FilterInsertableRows(tableName, rows);
@@ -118,7 +120,7 @@ namespace SqlTestDataGenerator.Output
             }
 
             // Also handle tables not in insertOrder (subquery support data)
-            foreach (var kvp in scenario.TableRows)
+            foreach (var kvp in rowsByTable)
             {
                 if (scenario.InsertOrder.Contains(kvp.Key, StringComparer.OrdinalIgnoreCase))
                     continue;
@@ -206,6 +208,29 @@ namespace SqlTestDataGenerator.Output
             return statements;
         }
 
+        private static Dictionary<string, List<GeneratedRow>> CollectScenarioRowsForInsert(BranchScenario scenario)
+        {
+            var result = new Dictionary<string, List<GeneratedRow>>(StringComparer.OrdinalIgnoreCase);
+
+            void AddRows(Dictionary<string, List<GeneratedRow>> source)
+            {
+                foreach (var (tableName, rows) in source)
+                {
+                    if (!result.TryGetValue(tableName, out var targetRows))
+                    {
+                        targetRows = new List<GeneratedRow>();
+                        result[tableName] = targetRows;
+                    }
+
+                    targetRows.AddRange(rows);
+                }
+            }
+
+            AddRows(scenario.TableRows);
+            AddRows(scenario.AntiMatchRows);
+            return result;
+        }
+
         private static bool HasIdentityValues(TableSchema schema, List<GeneratedRow> rows)
         {
             var identityColumns = schema.Columns
@@ -224,7 +249,7 @@ namespace SqlTestDataGenerator.Output
 
             foreach (var row in rows)
             {
-                var filtered = new GeneratedRow { TableName = row.TableName };
+                var filtered = new GeneratedRow { TableName = row.TableName, Role = row.Role };
 
                 if (schema == null)
                 {
@@ -261,7 +286,7 @@ namespace SqlTestDataGenerator.Output
             if (!HandleIdentityInsert || Schemas == null)
                 return tables;
 
-            foreach (var kvp in scenario.TableRows)
+            foreach (var kvp in CollectScenarioRowsForInsert(scenario))
             {
                 var validRows = kvp.Value.Where(r => r.ColumnValues.Any()).ToList();
                 if (!validRows.Any())
@@ -365,10 +390,11 @@ namespace SqlTestDataGenerator.Output
             {
                 // Reverse order for DELETE
                 var deleteOrder = scenario.InsertOrder.AsEnumerable().Reverse().ToList();
+                var rowsByTable = CollectScenarioRowsForCleanup(scenario);
 
                 foreach (var tableName in deleteOrder)
                 {
-                    if (!scenario.TableRows.TryGetValue(tableName, out var rows))
+                    if (!rowsByTable.TryGetValue(tableName, out var rows))
                         continue;
 
                     if (!tableIds.ContainsKey(tableName))
@@ -399,7 +425,7 @@ namespace SqlTestDataGenerator.Output
                     continue;
 
                 var firstRow = dataSet.Scenarios
-                    .SelectMany(s => s.TableRows.GetValueOrDefault(tableName) ?? new List<GeneratedRow>())
+                    .SelectMany(s => CollectScenarioRowsForCleanup(s).GetValueOrDefault(tableName) ?? new List<GeneratedRow>())
                     .FirstOrDefault();
 
                 var pkColumn = firstRow?.ColumnValues.Keys.FirstOrDefault() ?? "id";
@@ -420,6 +446,27 @@ namespace SqlTestDataGenerator.Output
             return sb.ToString();
         }
 
+        private static Dictionary<string, List<GeneratedRow>> CollectScenarioRowsForCleanup(BranchScenario scenario)
+        {
+            var result = new Dictionary<string, List<GeneratedRow>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var source in new[] { scenario.TableRows, scenario.AntiMatchRows })
+            {
+                foreach (var (tableName, rows) in source)
+                {
+                    if (!result.TryGetValue(tableName, out var targetRows))
+                    {
+                        targetRows = new List<GeneratedRow>();
+                        result[tableName] = targetRows;
+                    }
+
+                    targetRows.AddRange(rows);
+                }
+            }
+
+            return result;
+        }
+
         private string FormatDeleteValue(object value)
         {
             return value switch
@@ -438,7 +485,8 @@ namespace SqlTestDataGenerator.Output
             foreach (var scenario in dataSet.Scenarios)
             {
                 var orderedTables = scenario.InsertOrder
-                    .Concat(scenario.TableRows.Keys.Where(t => !scenario.InsertOrder.Contains(t, StringComparer.OrdinalIgnoreCase)));
+                    .Concat(scenario.TableRows.Keys.Where(t => !scenario.InsertOrder.Contains(t, StringComparer.OrdinalIgnoreCase)))
+                    .Concat(scenario.AntiMatchRows.Keys.Where(t => !scenario.InsertOrder.Contains(t, StringComparer.OrdinalIgnoreCase)));
 
                 foreach (var tableName in orderedTables)
                 {

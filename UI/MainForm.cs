@@ -198,7 +198,7 @@ namespace SqlTestDataGenerator.UI
 
             var rowsPerTableLabel = new Label
             {
-                Text = "Rows/Table:",
+                Text = "Expected result rows:",
                 AutoSize = true,
                 Location = new Point(622, 13),
                 ForeColor = SystemColors.ControlText,
@@ -207,7 +207,7 @@ namespace SqlTestDataGenerator.UI
 
             _rowsPerTableInput = new NumericUpDown
             {
-                Minimum = 1,
+                Minimum = 0,
                 Maximum = 2500,
                 Value = 1,
                 Increment = 1,
@@ -520,9 +520,9 @@ namespace SqlTestDataGenerator.UI
             _insertDbBtn.Enabled = false;
             _insertDbBtn.Click += InsertDbBtn_Click;
 
-            var rowsPerTableLabel = new Label
+            var expectedRowsLabel = new Label
             {
-                Text = "Rows/Table:",
+                Text = "Expected result rows:",
                 AutoSize = true,
                 Location = new Point(462, 13),
                 ForeColor = _textPrimary,
@@ -531,11 +531,11 @@ namespace SqlTestDataGenerator.UI
 
             _rowsPerTableInput = new NumericUpDown
             {
-                Minimum = 1,
+                Minimum = 0,
                 Maximum = 2500,
                 Value = 1,
                 Increment = 1,
-                Location = new Point(537, 9),
+                Location = new Point(590, 9),
                 Width = 72,
                 Font = new Font("Segoe UI", 9F),
                 BackColor = Color.White,
@@ -547,7 +547,7 @@ namespace SqlTestDataGenerator.UI
             {
                 Text = "Maxlength/MaxValue",
                 AutoSize = true,
-                Location = new Point(628, 12),
+                Location = new Point(680, 12),
                 Font = new Font("Segoe UI", 9F),
                 ForeColor = _textPrimary,
                 BackColor = SystemColors.Control
@@ -556,7 +556,7 @@ namespace SqlTestDataGenerator.UI
 
             _toolbarPanel.Controls.AddRange(new Control[]
             {
-                _analyzeBtn, _generateBtn, _insertDbBtn, rowsPerTableLabel, _rowsPerTableInput, _maxLengthMaxValueCheck
+                _analyzeBtn, _generateBtn, _insertDbBtn, expectedRowsLabel, _rowsPerTableInput, _maxLengthMaxValueCheck
             });
 
             void CenterToolbarControls()
@@ -566,7 +566,7 @@ namespace SqlTestDataGenerator.UI
                     _analyzeBtn,
                     _generateBtn,
                     _insertDbBtn,
-                    rowsPerTableLabel,
+                    expectedRowsLabel,
                     _rowsPerTableInput,
                     _maxLengthMaxValueCheck
                 })
@@ -943,7 +943,7 @@ namespace SqlTestDataGenerator.UI
 
             _rowsPerTableInput = new NumericUpDown
             {
-                Minimum = 1,
+                Minimum = 0,
                 Maximum = 2500,
                 Value = 1,
                 Increment = 1,
@@ -968,7 +968,7 @@ namespace SqlTestDataGenerator.UI
             controlsFlow.Controls.Add(_analyzeBtn);
             controlsFlow.Controls.Add(_generateBtn);
             controlsFlow.Controls.Add(_insertDbBtn);
-            controlsFlow.Controls.Add(CreateLabeledInputPanel("Rows/Table:", _rowsPerTableInput));
+            controlsFlow.Controls.Add(CreateLabeledInputPanel("Expected result rows:", _rowsPerTableInput));
 
             headerLayout.Controls.Add(heroLayout, 0, 0);
             headerLayout.Controls.Add(controlsFlow, 0, 1);
@@ -1541,12 +1541,13 @@ namespace SqlTestDataGenerator.UI
             {
                 ClearLastInsertedTables();
                 SetStatus("Generating test data...");
-                _dataEngine.RowsPerTable = (int)_rowsPerTableInput.Value;
+                _dataEngine.ExpectedResultRows = (int)_rowsPerTableInput.Value;
                 _dataEngine.TableSeedStarts = null;
                 _dataEngine.SampleRowsByTable = null;
                 _dataEngine.UseMaxLengthMaxValueMode = _maxLengthMaxValueCheck.Checked;
                 _dataEngine.ShuffleGeneratedStringCharacters = true;
-                LogInfo($"Starting data generation with {_dataEngine.RowsPerTable} row(s)/table, mode = {(_maxLengthMaxValueCheck.Checked ? "Maxlength/MaxValue" : "Sample-based")}, value shuffle = enabled.");
+                _dataEngine.Options.EnsureAntiMatchRows = true;
+                LogInfo($"Starting data generation with expected result rows = {_dataEngine.ExpectedResultRows}, mode = {(_maxLengthMaxValueCheck.Checked ? "Maxlength/MaxValue" : "Sample-based")}, value shuffle = enabled.");
 
                 // Get schemas from database if connected
                 _schemas = null;
@@ -1649,8 +1650,8 @@ namespace SqlTestDataGenerator.UI
 
                 RefreshInsertScriptPreview("generated data");
                 UpdateDbInsertButtonState();
-                SetStatus($"Generated {selectedScenarios.Count} scenario(s), {_rowsPerTableInput.Value} row(s)/table.");
-                LogInfo($"Generated {selectedScenarios.Count} scenario(s) with {_rowsPerTableInput.Value} row(s)/table.");
+                SetStatus($"Generated {selectedScenarios.Count} scenario(s), expected result rows = {_rowsPerTableInput.Value}.");
+                LogInfo($"Generated {selectedScenarios.Count} scenario(s) with expected result rows = {_rowsPerTableInput.Value}.");
             }
             catch (Exception ex)
             {
@@ -1750,9 +1751,11 @@ namespace SqlTestDataGenerator.UI
                     .OrderBy(t => t.DisplayName, StringComparer.OrdinalIgnoreCase)
                     .ToList();
                 bool? hasQueryRows = null;
+                long? queryRowCount = null;
                 try
                 {
                     hasQueryRows = await QueryReturnsRowsAsync(conn, _currentQuery.OriginalSql);
+                    queryRowCount = await QueryResultCountAsync(conn, _currentQuery.OriginalSql);
                 }
                 catch
                 {
@@ -1761,7 +1764,7 @@ namespace SqlTestDataGenerator.UI
 
                 SetStatus($"Inserted {result.RowsInserted} row(s) into {result.TablesInserted} table(s).");
                 LogInfo(
-                    $"Direct insert completed: {result.RowsInserted} row(s) into {result.TablesInserted} table(s), {result.RowsDeleted} row(s) deleted, query returns rows = {FormatQueryRowsResult(hasQueryRows)}.");
+                    $"Direct insert completed: {result.RowsInserted} row(s) into {result.TablesInserted} table(s), {result.RowsDeleted} row(s) deleted, query returns rows = {FormatQueryRowsResult(hasQueryRows)}, query row count = {FormatQueryRowCountResult(queryRowCount, _dataEngine.ExpectedResultRows)}.");
                 MessageBox.Show(
                     $"Direct insert completed.\r\n\r\n" +
                     $"- Generated tables: {result.GeneratedTables}\r\n" +
@@ -1774,7 +1777,8 @@ namespace SqlTestDataGenerator.UI
                     $"- Rows inserted: {result.RowsInserted}\r\n" +
                     $"- FK clear fallback used: {(result.UsedConstraintDisableFallback ? "YES" : "NO")}\r\n" +
                     $"- FK insert bypass used: {(result.UsedInsertConstraintBypass ? "YES" : "NO")}\r\n" +
-                    $"- Query returns rows: {FormatQueryRowsResult(hasQueryRows)}",
+                    $"- Query returns rows: {FormatQueryRowsResult(hasQueryRows)}\r\n" +
+                    $"- Query row count: {FormatQueryRowCountResult(queryRowCount, _dataEngine.ExpectedResultRows)}",
                     "Insert Completed",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
@@ -1849,8 +1853,16 @@ namespace SqlTestDataGenerator.UI
 
                 var folderPath = Path.GetFullPath(_exportFolderInput.Text.Trim());
                 LogInfo($"Starting CSV export to folder {folderPath}.");
-                using var conn = _connectionManager.CreateNewConnection();
-                var result = await _csvExporter.ExportAsync(conn, _lastInsertedTables, folderPath, _schemas);
+                CsvExportResult result;
+                if (_currentDataSet != null)
+                {
+                    result = await _csvExporter.ExportGeneratedDataSetAsync(_currentDataSet, folderPath, _schemas);
+                }
+                else
+                {
+                    using var conn = _connectionManager.CreateNewConnection();
+                    result = await _csvExporter.ExportAsync(conn, _lastInsertedTables, folderPath, _schemas);
+                }
 
                 SetStatus($"Exported {result.ExportedTables} CSV file(s).");
                 LogInfo($"CSV export completed: {result.ExportedTables} file(s), {result.ExportedRows} row(s), folder {folderPath}.");
@@ -2307,6 +2319,27 @@ namespace SqlTestDataGenerator.UI
             return await reader.ReadAsync();
         }
 
+        private static async Task<long> QueryResultCountAsync(SqlConnection connection, string sql)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = $"SELECT COUNT_BIG(1) FROM ({TrimSqlForSubquery(sql)}) AS generated_result_count;";
+            cmd.CommandTimeout = 30;
+
+            var value = await cmd.ExecuteScalarAsync();
+            return Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        private static string TrimSqlForSubquery(string sql)
+        {
+            var trimmed = sql.Trim();
+            while (trimmed.EndsWith(";", StringComparison.Ordinal))
+            {
+                trimmed = trimmed[..^1].TrimEnd();
+            }
+
+            return trimmed;
+        }
+
         private static string FormatQueryRowsResult(bool? hasRows)
         {
             return hasRows switch
@@ -2315,6 +2348,16 @@ namespace SqlTestDataGenerator.UI
                 false => "NO",
                 _ => "UNKNOWN (cannot execute verification query)"
             };
+        }
+
+        private static string FormatQueryRowCountResult(long? actualCount, int expectedCount)
+        {
+            if (!actualCount.HasValue)
+                return $"UNKNOWN (expected {expectedCount})";
+
+            return actualCount.Value == expectedCount
+                ? $"{actualCount.Value} (matches expected {expectedCount})"
+                : $"{actualCount.Value} (expected {expectedCount})";
         }
 
         private static string BuildErrorChain(Exception ex)

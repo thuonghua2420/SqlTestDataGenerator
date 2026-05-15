@@ -14,7 +14,7 @@ namespace SqlTestDataGenerator.DataGeneration
         {
             foreach (var scenario in dataSet.Scenarios)
             {
-                foreach (var tableRows in scenario.TableRows)
+                foreach (var tableRows in EnumerateAllTableRows(scenario))
                 {
                     if (!schemas.TryGetValue(tableRows.Key, out var schema))
                         continue;
@@ -32,6 +32,15 @@ namespace SqlTestDataGenerator.DataGeneration
                     }
                 }
             }
+        }
+
+        private static IEnumerable<KeyValuePair<string, List<GeneratedRow>>> EnumerateAllTableRows(BranchScenario scenario)
+        {
+            foreach (var tableRows in scenario.TableRows)
+                yield return tableRows;
+
+            foreach (var tableRows in scenario.AntiMatchRows)
+                yield return tableRows;
         }
     }
 }
