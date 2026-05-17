@@ -453,8 +453,8 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
         {
             var sequence = NextSequence(column) + ValueGeneratorKeyHelper.GetColumnVariantOffset(column, 365);
             var next = column.EffectiveDataType.Equals("date", StringComparison.OrdinalIgnoreCase)
-                ? BaseDateTime.AddDays(sequence)
-                : BaseDateTime.AddMinutes(sequence);
+                ? SafeAddDays(BaseDateTime, sequence)
+                : SafeAddMinutes(BaseDateTime, sequence);
             return NormalizeDateValue(next, column);
         }
 
@@ -466,10 +466,10 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
             var candidate = op switch
             {
                 "=" => dateValue,
-                "<>" or "!=" => dateValue.AddDays(30),
-                ">" => dateValue.AddDays(1),
+                "<>" or "!=" => SafeAddDays(dateValue, 30),
+                ">" => SafeAddDays(dateValue, 1),
                 ">=" => dateValue,
-                "<" => dateValue.AddDays(-1),
+                "<" => SafeAddDays(dateValue, -1),
                 "<=" => dateValue,
                 _ => dateValue
             };
@@ -483,12 +483,12 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
 
             var candidate = op switch
             {
-                "=" => dateValue.AddDays(1),
+                "=" => SafeAddDays(dateValue, 1),
                 "<>" or "!=" => dateValue,
-                ">" => dateValue.AddDays(-1),
-                ">=" => dateValue.AddDays(-1),
-                "<" => dateValue.AddDays(1),
-                "<=" => dateValue.AddDays(1),
+                ">" => SafeAddDays(dateValue, -1),
+                ">=" => SafeAddDays(dateValue, -1),
+                "<" => SafeAddDays(dateValue, 1),
+                "<=" => SafeAddDays(dateValue, 1),
                 _ => DateTime.MinValue
             };
             return NormalizeDateValue(candidate, column);
@@ -503,13 +503,39 @@ namespace SqlTestDataGenerator.DataGeneration.ValueGenerators
         {
             return column.EffectiveDataType.ToLowerInvariant() switch
             {
-                "date" => value.Date,
-                "smalldatetime" => new DateTime(
+                "date" => (object)value.Date,
+                "smalldatetime" => (object)new DateTime(
                     value.Year, value.Month, value.Day,
                     value.Hour, value.Minute, 0, value.Kind),
-                "datetimeoffset" => new DateTimeOffset(value, TimeSpan.Zero),
+                "datetimeoffset" => (object)new DateTimeOffset(DateTime.SpecifyKind(value, DateTimeKind.Unspecified), TimeSpan.Zero),
                 _ => value
             };
+        }
+
+        private static DateTime SafeAddDays(DateTime value, double days) =>
+            SafeAddTicks(value, TimeSpan.FromDays(days).Ticks);
+
+        private static DateTime SafeAddMinutes(DateTime value, double minutes) =>
+            SafeAddTicks(value, TimeSpan.FromMinutes(minutes).Ticks);
+
+        private static DateTime SafeAddTicks(DateTime value, long ticks)
+        {
+            try
+            {
+                checked
+                {
+                    var targetTicks = value.Ticks + ticks;
+                    if (targetTicks < DateTime.MinValue.Ticks)
+                        return DateTime.MinValue;
+                    if (targetTicks > DateTime.MaxValue.Ticks)
+                        return DateTime.MaxValue;
+                    return new DateTime(targetTicks, value.Kind);
+                }
+            }
+            catch (OverflowException)
+            {
+                return ticks < 0 ? DateTime.MinValue : DateTime.MaxValue;
+            }
         }
 
         private int NextSequence(ColumnSchema column)

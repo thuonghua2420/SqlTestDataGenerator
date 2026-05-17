@@ -617,7 +617,7 @@ namespace SqlTestDataGenerator.DataGeneration
                 foreach (var computedColumn in schema.Columns.Where(c => c.IsComputed))
                 {
                     if (!TryBuildComputedProductColumnPlan(schema, computedColumn, out var plan) ||
-                        !TryGetPositiveColumnMax(plan.ResultColumn, out var resultMax))
+                        !TryGetComputedProductResultMax(plan, out var resultMax))
                     {
                         continue;
                     }
@@ -1114,7 +1114,7 @@ namespace SqlTestDataGenerator.DataGeneration
             foreach (var computedColumn in schema.Columns.Where(c => c.IsComputed))
             {
                 if (!TryBuildComputedProductColumnPlan(schema, computedColumn, out var plan) ||
-                    !TryGetPositiveColumnMax(plan.ResultColumn, out var resultMax))
+                    !TryGetComputedProductResultMax(plan, out var resultMax))
                 {
                     continue;
                 }
@@ -1177,9 +1177,9 @@ namespace SqlTestDataGenerator.DataGeneration
             {
                 DataTypeCategory.DateTime => SqlServerValueNormalizer.NormalizeValue(
                     column,
-                    new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Unspecified).AddMinutes(seed)),
+                    SafeAddMinutes(new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Unspecified), seed)),
                 DataTypeCategory.DateTimeOffset => new DateTimeOffset(
-                    new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Unspecified).AddMinutes(seed),
+                    SafeAddMinutes(new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Unspecified), seed),
                     TimeSpan.Zero),
                 DataTypeCategory.Time => TimeSpan.FromSeconds(seed % (24 * 60 * 60)),
                 DataTypeCategory.Guid => BuildDeterministicGuid(schema.TableName, column.ColumnName, seed, attempt.ToString(System.Globalization.CultureInfo.InvariantCulture)),
@@ -1213,7 +1213,13 @@ namespace SqlTestDataGenerator.DataGeneration
             if (!string.IsNullOrWhiteSpace(currentText))
             {
                 var token = BuildDiversityTextToken(column, seed, attempt);
-                return BuildPredicatePreservingStringVariant(column, currentText, token, targetLength, attempt);
+                return BuildPredicatePreservingStringVariant(
+                    column,
+                    currentText,
+                    token,
+                    targetLength,
+                    attempt,
+                    exactLength: UseMaxLengthMaxValueMode);
             }
 
             if (!UseMaxLengthMaxValueMode)
@@ -1237,7 +1243,8 @@ namespace SqlTestDataGenerator.DataGeneration
             string currentText,
             string token,
             int targetLength,
-            int attempt)
+            int attempt,
+            bool exactLength = false)
         {
             if (targetLength <= 0)
                 return string.Empty;
@@ -1258,7 +1265,14 @@ namespace SqlTestDataGenerator.DataGeneration
             };
 
             if (candidate.Length <= targetLength)
+            {
+                if (exactLength && candidate.Length < targetLength)
+                {
+                    candidate = RepeatPhraseToExactLength(candidate, token, targetLength);
+                }
+
                 return SqlServerValueNormalizer.NormalizeValue(column, candidate) ?? candidate;
+            }
 
             candidate = (attempt % 4) switch
             {
@@ -4019,6 +4033,11 @@ namespace SqlTestDataGenerator.DataGeneration
                 return (rowIndex % 2 == 0);
             }
 
+            if (column.TypeCategory == DataTypeCategory.Binary)
+            {
+                return BuildMaxBinaryValue(column, rowIndex);
+            }
+
             return null;
         }
 
@@ -4033,7 +4052,7 @@ namespace SqlTestDataGenerator.DataGeneration
             {
                 if (!computedCol.IsComputed) continue;
                 if (!TryBuildComputedProductColumnPlan(schema, computedCol, out var plan)) continue;
-                if (!TryGetPositiveColumnMax(plan.ResultColumn, out var resultMax)) continue;
+                if (!TryGetComputedProductResultMax(plan, out var resultMax)) continue;
 
                 ColumnSchema? otherFactor = null;
                 if (plan.AnchorColumn.ColumnName.Equals(sourceColumn.ColumnName, StringComparison.OrdinalIgnoreCase))
@@ -4328,7 +4347,7 @@ namespace SqlTestDataGenerator.DataGeneration
             object value;
             
             if (IsNumericTextColumn(column))
-                value = BuildExactDigitString(rowIndex, targetLength);
+                value = BuildExactDigitString(column, rowIndex, targetLength);
             else if (IsPhoneColumn(column))
                 value = BuildPhoneLikeString(column, rowIndex, targetLength);
             else if (IsEmailColumn(column))
@@ -4370,13 +4389,32 @@ namespace SqlTestDataGenerator.DataGeneration
 
             DateTime maxDt;
             if (type == "smalldatetime")
-                maxDt = new DateTime(2079, 6, 6, 23, 59, 0).AddMinutes(-offset);
+                maxDt = SafeAddMinutes(new DateTime(2079, 6, 6, 23, 59, 0), -offset);
             else if (type == "date")
-                maxDt = new DateTime(9999, 12, 31).AddDays(-offset);
+                maxDt = SafeAddDays(new DateTime(9999, 12, 31), -offset);
             else
-                maxDt = new DateTime(9999, 12, 31, 23, 59, 59).AddSeconds(-offset);
+                maxDt = SafeAddTicks(new DateTime(9999, 12, 31, 23, 59, 59), -TimeSpan.FromSeconds(offset).Ticks);
 
             return SqlServerValueNormalizer.NormalizeValue(column, maxDt) ?? maxDt;
+        }
+
+        private static byte[] BuildMaxBinaryValue(ColumnSchema column, int rowIndex)
+        {
+            var length = column.MaxLength.HasValue && column.MaxLength.Value > 0
+                ? column.MaxLength.Value
+                : 64;
+            length = Math.Clamp(length, 1, 8000);
+
+            var bytes = Enumerable.Repeat((byte)0xFF, length).ToArray();
+            var offset = Math.Max(0, rowIndex) + GetColumnStableOffset(column, 251);
+            for (var i = bytes.Length - 1; i >= 0 && offset > 0; i--)
+            {
+                var subtract = Math.Min(255, offset);
+                bytes[i] = (byte)Math.Max(0, bytes[i] - subtract);
+                offset -= subtract;
+            }
+
+            return bytes;
         }
 
         private object BuildMaxNumericValue(ColumnSchema column, int rowIndex)
@@ -4503,6 +4541,34 @@ namespace SqlTestDataGenerator.DataGeneration
             var curved = spread * index * index / denominator;
             var offset = baseOffset + index + curved;
             return Math.Min(offset, maxSteps);
+        }
+
+        private static DateTime SafeAddDays(DateTime value, double days) =>
+            SafeAddTicks(value, TimeSpan.FromDays(days).Ticks);
+
+        private static DateTime SafeAddMinutes(DateTime value, double minutes) =>
+            SafeAddTicks(value, TimeSpan.FromMinutes(minutes).Ticks);
+
+        private static DateTime SafeAddTicks(DateTime value, long ticks)
+        {
+            try
+            {
+                checked
+                {
+                    var targetTicks = value.Ticks + ticks;
+                    if (targetTicks < DateTime.MinValue.Ticks)
+                        return DateTime.SpecifyKind(DateTime.MinValue, DateTimeKind.Unspecified);
+                    if (targetTicks > DateTime.MaxValue.Ticks)
+                        return DateTime.SpecifyKind(DateTime.MaxValue, DateTimeKind.Unspecified);
+                    return new DateTime(targetTicks, DateTimeKind.Unspecified);
+                }
+            }
+            catch (OverflowException)
+            {
+                return ticks < 0
+                    ? DateTime.SpecifyKind(DateTime.MinValue, DateTimeKind.Unspecified)
+                    : DateTime.SpecifyKind(DateTime.MaxValue, DateTimeKind.Unspecified);
+            }
         }
 
         private object MutateSampleString(ColumnSchema column, object sampleValue, int rowIndex)
@@ -4775,13 +4841,13 @@ namespace SqlTestDataGenerator.DataGeneration
             return digits.PadLeft(targetLength, '0')[^targetLength..];
         }
 
-        private static string BuildExactDigitString(int rowIndex, int targetLength)
+        private static string BuildExactDigitString(ColumnSchema column, int rowIndex, int targetLength)
         {
             if (targetLength <= 0)
                 return string.Empty;
 
-            var digit = (char)('9' - (Math.Abs(rowIndex) % 9));
-            return new string(digit, targetLength);
+            var offset = Math.Max(0, rowIndex) + GetNumericTextColumnOffset(column);
+            return SubtractFromAllNinesString(targetLength, offset);
         }
 
         private static Guid BuildDeterministicGuid(string tableName, string columnName, int rowIndex, string value)
@@ -4826,7 +4892,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private static byte[] BuildDeterministicBinaryValue(string tableName, ColumnSchema column, int rowIndex, string value)
         {
-            var length = Math.Clamp(column.MaxLength ?? 8, 1, 64);
+            var length = Math.Clamp(column.MaxLength ?? 8, 1, 8000);
             var bytes = new byte[length];
             new Random(BuildStableShuffleSeed(tableName, column.ColumnName, rowIndex, value, 31)).NextBytes(bytes);
             return bytes;
@@ -4842,7 +4908,7 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private static string PreserveRequiredStringSeed(string candidate, ColumnSchema column)
         {
-            if (IsEmailColumn(column) || IsUrlColumn(column) || IsPhoneColumn(column))
+            if (IsEmailColumn(column) || IsUrlColumn(column) || IsPhoneColumn(column) || IsNumericTextColumn(column))
                 return candidate;
 
             var targetLength = candidate.Length;
@@ -4856,11 +4922,14 @@ namespace SqlTestDataGenerator.DataGeneration
             if (candidate.Contains(seed, StringComparison.Ordinal))
                 return candidate;
 
-            var withoutSeedChars = new string(candidate
-                .Where(c => seed.IndexOf(c) < 0)
-                .ToArray());
-            var merged = seed + withoutSeedChars;
-            return merged.Length <= targetLength ? merged : merged[..targetLength];
+            if (seed.Length >= targetLength)
+                return seed[..targetLength];
+
+            var remainderLength = targetLength - seed.Length;
+            var remainder = candidate.Length <= remainderLength
+                ? candidate.PadRight(remainderLength, seed[^1])
+                : candidate[^remainderLength..];
+            return seed + remainder;
         }
 
         private static string BuildSeededJapaneseValue(ColumnSchema column, int rowIndex, int targetLength)
@@ -5127,7 +5196,32 @@ namespace SqlTestDataGenerator.DataGeneration
                    name.EndsWith("Cd", StringComparison.OrdinalIgnoreCase) ||
                    name.EndsWith("Phone", StringComparison.OrdinalIgnoreCase) ||
                    name.EndsWith("Nm", StringComparison.OrdinalIgnoreCase) ||
-                   name.EndsWith("Digits", StringComparison.OrdinalIgnoreCase);
+                   name.EndsWith("Digits", StringComparison.OrdinalIgnoreCase) ||
+                   name.EndsWith("Ditgits", StringComparison.OrdinalIgnoreCase) ||
+                   name.EndsWith("No", StringComparison.OrdinalIgnoreCase) ||
+                   name.EndsWith("Number", StringComparison.OrdinalIgnoreCase) ||
+                   name.EndsWith("Mobile", StringComparison.OrdinalIgnoreCase) ||
+                   name.EndsWith("Fax", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static int GetNumericTextColumnOffset(ColumnSchema column)
+        {
+            var name = column.ColumnName;
+            var suffixOffset =
+                name.EndsWith("Num", StringComparison.OrdinalIgnoreCase) ? 0 :
+                name.EndsWith("Cd", StringComparison.OrdinalIgnoreCase) ? 1 :
+                name.EndsWith("Phone", StringComparison.OrdinalIgnoreCase) ? 2 :
+                name.EndsWith("Nm", StringComparison.OrdinalIgnoreCase) ? 3 :
+                name.EndsWith("Digits", StringComparison.OrdinalIgnoreCase) ? 4 :
+                name.EndsWith("Ditgits", StringComparison.OrdinalIgnoreCase) ? 5 :
+                name.EndsWith("No", StringComparison.OrdinalIgnoreCase) ? 6 :
+                name.EndsWith("Number", StringComparison.OrdinalIgnoreCase) ? 7 :
+                name.EndsWith("Mobile", StringComparison.OrdinalIgnoreCase) ? 8 :
+                name.EndsWith("Fax", StringComparison.OrdinalIgnoreCase) ? 9 :
+                10;
+
+            var columnHash = Math.Abs(StringComparer.OrdinalIgnoreCase.GetHashCode(column.ColumnKey));
+            return suffixOffset + ((columnHash % 97) * 10);
         }
 
         private static bool IsNameLikeColumn(ColumnSchema column)
@@ -5187,8 +5281,8 @@ namespace SqlTestDataGenerator.DataGeneration
             var source = normalized is DateTime dt ? dt : DateTime.Now;
             var offset = rowIndex + GetColumnVariantOffset(column);
             var mutated = column.EffectiveDataType.Equals("date", StringComparison.OrdinalIgnoreCase)
-                ? source.AddDays(offset)
-                : source.AddMinutes(offset * 7);
+                ? SafeAddDays(source, offset)
+                : SafeAddMinutes(source, offset * 7);
             return SqlServerValueNormalizer.NormalizeValue(column, mutated) ?? mutated;
         }
 
@@ -5197,8 +5291,20 @@ namespace SqlTestDataGenerator.DataGeneration
             var normalized = SqlServerValueNormalizer.NormalizeValue(column, sampleValue);
             var source = normalized is DateTimeOffset dto ? dto : DateTimeOffset.Now;
             var offset = rowIndex + GetColumnVariantOffset(column);
-            var mutated = source.AddMinutes(offset * 7);
+            var mutated = SafeAddDateTimeOffsetMinutes(source, offset * 7);
             return SqlServerValueNormalizer.NormalizeValue(column, mutated) ?? mutated;
+        }
+
+        private static DateTimeOffset SafeAddDateTimeOffsetMinutes(DateTimeOffset value, double minutes)
+        {
+            try
+            {
+                return value.AddMinutes(minutes);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                return minutes < 0 ? DateTimeOffset.MinValue : DateTimeOffset.MaxValue;
+            }
         }
 
         private object MutateSampleTime(ColumnSchema column, object sampleValue, int rowIndex)
@@ -5268,6 +5374,15 @@ namespace SqlTestDataGenerator.DataGeneration
             return (hash % 17) + 1;
         }
 
+        private static int GetColumnStableOffset(ColumnSchema column, int modulus)
+        {
+            if (modulus <= 0)
+                return 0;
+
+            var hash = Math.Abs(StringComparer.OrdinalIgnoreCase.GetHashCode(column.ColumnKey));
+            return hash % modulus;
+        }
+
         private static string Abbreviate(string value, int maxLength)
         {
             var filtered = new string(value.Where(char.IsLetterOrDigit).ToArray()).ToUpperInvariant();
@@ -5298,13 +5413,24 @@ namespace SqlTestDataGenerator.DataGeneration
 
         private static long GetMaxIntegerValue(ColumnSchema column)
         {
-            return column.EffectiveDataType.ToLowerInvariant() switch
+            var typeMax = column.EffectiveDataType.ToLowerInvariant() switch
             {
                 "tinyint" => byte.MaxValue,
                 "smallint" => short.MaxValue,
                 "int" => int.MaxValue,
                 _ => long.MaxValue / 1024
             };
+
+            long allNines = 9;
+            while (allNines <= typeMax / 10)
+            {
+                var next = (allNines * 10) + 9;
+                if (next > typeMax)
+                    break;
+                allNines = next;
+            }
+
+            return allNines;
         }
 
         private long GetPracticalMaxIntegerValue(ColumnSchema column, ParsedQuery? query, string tableAlias)
@@ -6440,12 +6566,12 @@ namespace SqlTestDataGenerator.DataGeneration
             void AddDateTimeWithNeighbors(DateTime dateTime)
             {
                 AddTemporal(dateTime);
-                AddTemporal(dateTime.AddDays(-1));
-                AddTemporal(dateTime.AddDays(1));
-                AddTemporal(dateTime.AddHours(-1));
-                AddTemporal(dateTime.AddHours(1));
-                AddTemporal(dateTime.AddMinutes(-1));
-                AddTemporal(dateTime.AddMinutes(1));
+                AddTemporal(SafeAddDays(dateTime, -1));
+                AddTemporal(SafeAddDays(dateTime, 1));
+                AddTemporal(SafeAddMinutes(dateTime, -60));
+                AddTemporal(SafeAddMinutes(dateTime, 60));
+                AddTemporal(SafeAddMinutes(dateTime, -1));
+                AddTemporal(SafeAddMinutes(dateTime, 1));
             }
 
             if (TryBuildCompositeDatePartCandidate(targets, scenario, query, currentRow, column, tableAlias, out var compositeDate))
@@ -7760,7 +7886,14 @@ namespace SqlTestDataGenerator.DataGeneration
             var monthToAdd = TryConvertInt(args.ElementAtOrDefault(1), out var parsedMonthToAdd)
                 ? parsedMonthToAdd
                 : 0;
-            return EndOfMonth(startDate.AddMonths(monthToAdd));
+            try
+            {
+                return EndOfMonth(startDate.AddMonths(monthToAdd));
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                return EndOfMonth(monthToAdd < 0 ? DateTime.MinValue : DateTime.MaxValue);
+            }
         }
 
         private static object? EvaluateNullIf(IReadOnlyList<object?> args)
@@ -9034,7 +9167,7 @@ namespace SqlTestDataGenerator.DataGeneration
                         continue;
                     }
 
-                    if (TryGetPositiveColumnMax(plan.ResultColumn, out var resultMax) &&
+                    if (TryGetComputedProductResultMax(plan, out var resultMax) &&
                         !IsComputedProductWithinRange(anchorDecimal, adjustableDecimal, resultMax))
                     {
                         continue;
@@ -9549,7 +9682,7 @@ namespace SqlTestDataGenerator.DataGeneration
             if (existingDates.Count == 0)
                 return;
 
-            var supportDate = existingDates.Min().AddDays(-1);
+            var supportDate = SafeAddDays(existingDates.Min(), -1);
             supportRow.SetValue(
                 orderDateColumn.ColumnName,
                 SqlServerValueNormalizer.NormalizeValue(orderDateColumn, supportDate) ?? supportDate);
@@ -10895,25 +11028,25 @@ namespace SqlTestDataGenerator.DataGeneration
                 case ComparisonOp.GreaterThan:
                     if (!TryConvertToDateTimeValue(condition.Value, out var greaterThan))
                         return false;
-                    candidate = greaterThan.AddTicks(step.Ticks * (offset + 1));
+                    candidate = SafeAddTicks(greaterThan, step.Ticks * (offset + 1));
                     break;
 
                 case ComparisonOp.GreaterThanOrEqual:
                     if (!TryConvertToDateTimeValue(condition.Value, out var greaterThanOrEqual))
                         return false;
-                    candidate = greaterThanOrEqual.AddTicks(step.Ticks * offset);
+                    candidate = SafeAddTicks(greaterThanOrEqual, step.Ticks * offset);
                     break;
 
                 case ComparisonOp.LessThan:
                     if (!TryConvertToDateTimeValue(condition.Value, out var lessThan))
                         return false;
-                    candidate = lessThan.AddTicks(-step.Ticks * (offset + 1));
+                    candidate = SafeAddTicks(lessThan, -step.Ticks * (offset + 1));
                     break;
 
                 case ComparisonOp.LessThanOrEqual:
                     if (!TryConvertToDateTimeValue(condition.Value, out var lessThanOrEqual))
                         return false;
-                    candidate = lessThanOrEqual.AddTicks(-step.Ticks * offset);
+                    candidate = SafeAddTicks(lessThanOrEqual, -step.Ticks * offset);
                     break;
 
                 case ComparisonOp.Between:
@@ -10926,13 +11059,13 @@ namespace SqlTestDataGenerator.DataGeneration
 
                     if (condition.IsNegated)
                     {
-                        candidate = lower.AddTicks(-step.Ticks * (offset + 1));
+                        candidate = SafeAddTicks(lower, -step.Ticks * (offset + 1));
                     }
                     else
                     {
                         var spanSteps = Math.Max(0, (long)((upper - lower).Ticks / step.Ticks));
                         var boundedOffset = spanSteps == 0 ? 0 : offset % (spanSteps + 1);
-                        candidate = lower.AddTicks(step.Ticks * boundedOffset);
+                        candidate = SafeAddTicks(lower, step.Ticks * boundedOffset);
                     }
                     break;
 
@@ -11649,12 +11782,20 @@ namespace SqlTestDataGenerator.DataGeneration
             if (column.TypeCategory == DataTypeCategory.String)
             {
                 var text = Convert.ToString(currentValue, System.Globalization.CultureInfo.InvariantCulture);
-                var targetLength = Math.Max(1, Math.Min(ResolveTargetStringLength(column), string.IsNullOrEmpty(text) ? 96 : text.Length));
+                var targetLength = UseMaxLengthMaxValueMode
+                    ? ResolveTargetStringLength(column)
+                    : Math.Max(1, Math.Min(ResolveTargetStringLength(column), string.IsNullOrEmpty(text) ? 96 : text.Length));
                 if (string.IsNullOrEmpty(text))
                 {
-                    text = IsPhoneColumn(column)
-                        ? BuildPhoneLikeString(column, rowIndex, targetLength)
-                        : Convert.ToString(BuildSemanticString(column, rowIndex, null), System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+                    text = IsNumericTextColumn(column)
+                        ? BuildExactDigitString(column, rowIndex, targetLength)
+                        : IsPhoneColumn(column)
+                            ? BuildPhoneLikeString(column, rowIndex, targetLength)
+                            : Convert.ToString(
+                                UseMaxLengthMaxValueMode
+                                    ? BuildMaxLengthString(column, rowIndex)
+                                    : BuildSemanticString(column, rowIndex, null),
+                                System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
                 }
 
                 if (ExpressionUsesRightMostCharacter(expressionText, column.ColumnName))
@@ -11665,6 +11806,12 @@ namespace SqlTestDataGenerator.DataGeneration
                 else
                 {
                     text = domainValue.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    if (UseMaxLengthMaxValueMode)
+                    {
+                        text = IsNumericTextColumn(column)
+                            ? BuildExactDigitString(column, rowIndex, targetLength)
+                            : RepeatPhraseToExactLength(text, (rowIndex + 1).ToString("D3"), targetLength);
+                    }
                 }
 
                 return SqlServerValueNormalizer.NormalizeValue(column, text);
@@ -11988,7 +12135,7 @@ namespace SqlTestDataGenerator.DataGeneration
             if (targetColumn.TypeCategory is DataTypeCategory.DateTime or DataTypeCategory.DateTimeOffset &&
                 TryConvertToDateTimeValue(referenceValue, out var dateTime))
             {
-                return dateTime.AddDays(preferGreater ? 1 : -1);
+                return SafeAddDays(dateTime, preferGreater ? 1 : -1);
             }
 
             return $"{referenceValue}_alt";
@@ -12011,7 +12158,7 @@ namespace SqlTestDataGenerator.DataGeneration
             if (targetColumn.TypeCategory is DataTypeCategory.DateTime or DataTypeCategory.DateTimeOffset &&
                 TryConvertToDateTimeValue(referenceValue, out var dateTime))
             {
-                return dateTime.AddDays(direction);
+                return SafeAddDays(dateTime, direction);
             }
 
             return direction >= 0
@@ -12166,17 +12313,25 @@ namespace SqlTestDataGenerator.DataGeneration
             int rowIndex,
             char digit)
         {
-            var targetLength = !string.IsNullOrEmpty(existing)
+            var targetLength = UseMaxLengthMaxValueMode
+                ? ResolveTargetStringLength(column)
+                : !string.IsNullOrEmpty(existing)
                 ? existing.Length
                 : Math.Min(ResolveTargetStringLength(column), 64);
             if (targetLength <= 0)
                 return string.Empty;
 
-            var candidate = !string.IsNullOrEmpty(existing)
-                ? existing
-                : IsPhoneColumn(column)
-                    ? BuildPhoneLikeString(column, rowIndex, targetLength)
-                    : Convert.ToString(BuildSemanticString(column, rowIndex, null), System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+            var candidate = IsNumericTextColumn(column)
+                ? BuildExactDigitString(column, rowIndex, targetLength)
+                : !string.IsNullOrEmpty(existing) && existing.Length == targetLength
+                    ? existing
+                    : IsPhoneColumn(column)
+                        ? BuildPhoneLikeString(column, rowIndex, targetLength)
+                        : Convert.ToString(
+                            UseMaxLengthMaxValueMode
+                                ? BuildMaxLengthString(column, rowIndex)
+                                : BuildSemanticString(column, rowIndex, null),
+                            System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
 
             if (candidate.Length < targetLength)
                 candidate = candidate.PadLeft(targetLength, '0');
@@ -12242,7 +12397,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     TryBuildComputedProductColumnPlan(schema, lineTotalColumn, out var plan))
                 {
                     // Get LineTotal's max from schema.
-                    if (!TryGetPositiveColumnMax(plan.ResultColumn, out var resultMax))
+                    if (!TryGetComputedProductResultMax(plan, out var resultMax))
                         resultMax = 99_999_999.99m; // Conservative fallback
 
                     // Also constrain resultMax by source column max products to avoid inflation.
@@ -12407,7 +12562,7 @@ namespace SqlTestDataGenerator.DataGeneration
             foreach (var computedColumn in schema.Columns.Where(c => c.IsComputed))
             {
                 if (!TryBuildComputedProductColumnPlan(schema, computedColumn, out var plan) ||
-                    !TryGetPositiveColumnMax(plan.ResultColumn, out var resultMax) ||
+                    !TryGetComputedProductResultMax(plan, out var resultMax) ||
                     !TryConvertDecimal(row.GetValue(plan.AnchorColumn.ColumnName), out var anchorDecimal) ||
                     !TryConvertDecimal(row.GetValue(plan.AdjustableColumn.ColumnName), out var adjustableDecimal))
                 {
@@ -12718,6 +12873,53 @@ namespace SqlTestDataGenerator.DataGeneration
                     }
                     return false;
             }
+        }
+
+        private static bool TryGetComputedProductResultMax(
+            ComputedProductColumnPlan plan,
+            out decimal max)
+        {
+            if (!TryGetPositiveColumnMax(plan.ResultColumn, out max))
+                return false;
+
+            if (plan.ResultColumn.IsComputedTypeInferred &&
+                TryGetInferredComputedProductResultMax(plan, out var inferredMax))
+            {
+                max = Math.Min(max, inferredMax);
+            }
+
+            return max > 0m;
+        }
+
+        private static bool TryGetInferredComputedProductResultMax(
+            ComputedProductColumnPlan plan,
+            out decimal max)
+        {
+            max = 0m;
+            var sourceBounds = new List<decimal>();
+
+            foreach (var factor in new[] { plan.AnchorColumn, plan.AdjustableColumn })
+            {
+                if (factor.TypeCategory is not (DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float))
+                    continue;
+
+                if (TryGetPositiveColumnMax(factor, out var factorMax) && factorMax > 0m)
+                    sourceBounds.Add(factorMax);
+            }
+
+            if (sourceBounds.Count == 0)
+                return false;
+
+            var measureBounds = new[] { plan.AnchorColumn, plan.AdjustableColumn }
+                .Where(IsMeasureLikeNumericColumn)
+                .Select(factor => TryGetPositiveColumnMax(factor, out var factorMax) ? factorMax : 0m)
+                .Where(factorMax => factorMax > 0m)
+                .ToList();
+
+            max = measureBounds.Count > 0
+                ? measureBounds.Min()
+                : sourceBounds.Min();
+            return max > 0m;
         }
 
         private static void SetComputedProductPreviewValue(
@@ -14340,7 +14542,7 @@ namespace SqlTestDataGenerator.DataGeneration
             foreach (var computedColumn in schema.Columns.Where(c => c.IsComputed))
             {
                 if (!TryBuildComputedProductColumnPlan(schema, computedColumn, out var plan) ||
-                    !TryGetPositiveColumnMax(plan.ResultColumn, out var resultMax) ||
+                    !TryGetComputedProductResultMax(plan, out var resultMax) ||
                     !TryConvertDecimal(row.GetValue(plan.AnchorColumn.ColumnName), out var anchorDecimal) ||
                     !TryConvertDecimal(row.GetValue(plan.AdjustableColumn.ColumnName), out var adjustableDecimal))
                 {

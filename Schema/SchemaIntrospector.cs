@@ -301,8 +301,21 @@ namespace SqlTestDataGenerator.Schema
                 {
                     col.IsComputed = true;
                     col.ComputedExpression = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
+                    col.IsComputedTypeInferred = IsRawProductComputedExpression(col.ComputedExpression);
                 }
             }
+        }
+
+        private static bool IsRawProductComputedExpression(string expression)
+        {
+            if (string.IsNullOrWhiteSpace(expression) ||
+                !expression.Contains('*', StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            return !expression.Contains("CAST", StringComparison.OrdinalIgnoreCase) &&
+                   !expression.Contains("CONVERT", StringComparison.OrdinalIgnoreCase);
         }
     }
 }

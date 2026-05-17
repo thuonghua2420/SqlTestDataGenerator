@@ -520,6 +520,8 @@ namespace SqlTestDataGenerator.Schema
                 var computedExpression = definition.ComputedColumnExpression == null
                     ? string.Empty
                     : GetFragmentText(definition.ComputedColumnExpression);
+                var computedTypeInferred = definition.ComputedColumnExpression != null &&
+                    definition.DataType == null;
                 var defaultConstraint = definition.DefaultConstraint ??
                     definition.Constraints.OfType<DefaultConstraintDefinition>().FirstOrDefault();
 
@@ -540,6 +542,7 @@ namespace SqlTestDataGenerator.Schema
                         : GetFragmentText(defaultConstraint.Expression),
                     IsIdentity = definition.IdentityOptions != null,
                     IsComputed = definition.ComputedColumnExpression != null,
+                    IsComputedTypeInferred = computedTypeInferred,
                     ComputedExpression = computedExpression,
                     OrdinalPosition = table.Columns.Count + 1
                 };
@@ -557,6 +560,7 @@ namespace SqlTestDataGenerator.Schema
                 target.DefaultValue = source.DefaultValue;
                 target.IsIdentity = source.IsIdentity;
                 target.IsComputed = source.IsComputed;
+                target.IsComputedTypeInferred = source.IsComputedTypeInferred;
                 target.ComputedExpression = source.ComputedExpression;
             }
 

@@ -643,3 +643,38 @@ Không làm ngược lại. Ví dụ:
   - bỏ implicit product plan trùng khi đã có computed product plan explicit từ DDL/schema;
   - khi vẫn cần chống overflow, giữ count factor (`Quantity`/`Stock`/`Count`) và giảm measure factor (`Price`/`Amount`) thay vì ngược lại;
   - thêm regression `direct insert computed product plan` để khóa invariant: explicit computed plan không bị implicit fallback mutate, và direct insert safety giữ `Quantity` khi buộc phải giảm `Price`.
+
+## E73. Hậu xử lý từng phá exact length của DDL max-mode
+- Chi tiết lỗi: khi bật `Maxlength/MaxValue`, dữ liệu ban đầu đã fill đúng DDL length nhưng các bước hậu xử lý như generated-value diversity, string shuffle, function hint adjustment hoặc RIGHT-digit adjustment có thể ghi đè bằng chuỗi ngắn hơn. Case cụ thể là DDL `Customers/Products` có `FullName nvarchar(150)`, `Address nvarchar(255)`, `ProductName nvarchar(150)` nhưng sau shuffle chỉ còn 34 hoặc 170 ký tự.
+- Nguyên nhân gốc: max-mode chưa có một boundary policy được áp ở mọi nhánh. Một số helper chỉ đảm bảo candidate không vượt `MaxLength`, hoặc preserve seed bằng cách xóa ký tự trùng seed nên vô tình rút ngắn giá trị sau khi đã fill đúng.
+- Cách fix:
+  - mọi candidate string hậu xử lý trong max-mode phải giữ đúng target length từ schema/DDL trước khi được accept;
+  - sửa seed-preservation để giữ nguyên chiều dài, không xóa hàng loạt ký tự trùng seed;
+  - chuẩn hóa cột text dạng số theo suffix `Num`, `Cd`, `Phone`, `Nm`, `Digits`, `Ditgits`, `No`, `Number`, `Mobile`, `Fax` bằng digit-only exact length có offset theo table/column/row để tránh trùng;
+  - thêm regression cho DDL computed product diversity, suffix text digit-only, và post-processing exact string để khóa invariant này.
+
+## E74. DDL computed column không khai báo type từng dùng fallback quá rộng
+- Chi tiết lỗi: DDL có `LineTotal AS ([Quantity]*[Price])` nhưng parser gán fallback `decimal(18,2)` cho computed column không khai báo type. Max-mode vì vậy có thể để `Quantity = 1000000000` đi cùng `Price = 9999999.xx`, direct insert vào SQL Server bị `Arithmetic overflow error converting numeric to data type numeric`.
+- Nguyên nhân gốc:
+  - computed column từ DDL không có type declared riêng, nhưng metadata fallback `decimal(18,2)` bị dùng như bound thật;
+  - cả generator và `GeneratedDataDbExecutor.ApplyComputedProductInsertSafety(...)` đều tin bound rộng này nên không giảm source factors trước khi insert;
+  - regression cũ có dòng set tay `LineTotal.NumericPrecision = 10`, vô tình che case DDL thực tế.
+- Cách fix:
+  - đánh dấu computed column lấy từ DDL không khai báo type bằng `IsComputedTypeInferred`;
+  - đánh dấu raw computed product lấy từ DB introspection (`sys.computed_columns.definition` có phép `*` nhưng không có `CAST/CONVERT`) bằng cùng flag, vì direct insert có thể dùng schema introspection thay vì schema DDL cache;
+  - với computed product inferred type, derive product max bảo thủ từ source measure column như `Price/Amount decimal(10,2)` thay vì dùng fallback `decimal(18,2)`;
+  - áp cùng helper bound cho generator, diversity, validation và direct insert executor;
+  - cập nhật regression DDL computed product không set tay precision và thêm direct-insert regression cho row giống lỗi `Quantity=1000000000`, `Price=9999999.42` và `Quantity=100000000`, `Price=9999999.50`.
+
+## E75. Last-mile insert từng vẫn lọt cặp `Quantity * Price` overflow
+- Chi tiết lỗi: dù DDL/schema đã có guard computed product, khi nhấn `Insert Data` vẫn có thể gửi row `OrderDetails.Quantity=100000000` và `Price=9999999.xx` vào SQL Server, làm computed column `LineTotal` overflow trước khi insert xong.
+- Nguyên nhân gốc:
+  - direct insert chỉ chạy product safety ở bước chuẩn bị kế hoạch, trước một số bước heal/normalize/retry;
+  - nếu metadata computed bị thiếu, bị merge lệch, hoặc schema đang dùng chỉ còn các source column (`Quantity`, `Price`) thì explicit computed plan không đủ để chặn row ngay trước `INSERT`;
+  - DateTime boundary cũng có nhánh sinh dữ liệu dùng `.AddDays/.AddTicks` trực tiếp, có thể ném `The added or subtracted value results in an un-representable DateTime`.
+- Cách fix:
+  - thêm `PrepareRowForInsert(...)` ngay trước từng `InsertRowAsync`, normalize rồi apply computed safety và heuristic product-pair safety lần cuối;
+  - thêm retry riêng cho SQL arithmetic overflow, kể cả khi `InsertRowAsync` đã bọc `SqlException` thành `InvalidOperationException`: mutate numeric row lần cuối rồi retry, nếu vẫn lỗi thì diagnostic sẽ hiển thị giá trị sau safety;
+  - heuristic last-mile tự phát hiện cặp count/quantity/stock với price/amount/cost/fee ngay cả khi thiếu computed metadata;
+  - clamp DateTime arithmetic bằng safe add helpers và sửa switch `NormalizeDateValue` để không ép `DateTime` sang `DateTimeOffset` ngoài ý muốn;
+  - thêm regression cho row giống lỗi `Quantity=100000000`, `Price=9999999.46` khi schema thiếu computed metadata, và regression DateTime boundary arithmetic.

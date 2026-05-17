@@ -123,6 +123,7 @@ namespace SqlTestDataGenerator.Database
                             {
                                 await HealForeignKeysAsync(
                                     connection, tx, schema, row, plannedRows, plannedTableKeys, schemas, cancellationToken);
+                                PrepareRowForInsert(schema, row);
 
                                 bool inserted = false;
                                 while (!inserted)
@@ -145,6 +146,16 @@ namespace SqlTestDataGenerator.Database
 
                                         insertConstraintBypassEnabled = true;
                                         result.UsedInsertConstraintBypass = true;
+                                    }
+                                    catch (SqlException ex) when (IsArithmeticOverflow(ex) && TryApplyLastChanceNumericInsertSafety(schema, row))
+                                    {
+                                        // Retry once with the mutated row. If SQL Server still rejects it,
+                                        // the next loop will throw with the post-safety values in diagnostics.
+                                    }
+                                    catch (InvalidOperationException ex) when (IsArithmeticOverflow(ex) && TryApplyLastChanceNumericInsertSafety(schema, row))
+                                    {
+                                        // InsertRowAsync wraps SQL arithmetic overflow with a richer diagnostic.
+                                        // Retry with the healed row before surfacing that diagnostic.
                                     }
                                 }
                             }
@@ -1292,6 +1303,31 @@ namespace SqlTestDataGenerator.Database
             }
         }
 
+        private static void PrepareRowForInsert(TableSchema schema, GeneratedRow row)
+        {
+            NormalizeRowValues(schema, new[] { row });
+            ApplyComputedProductInsertSafety(schema, new[] { row });
+            ApplyHeuristicProductPairInsertSafety(schema, row);
+            NormalizeRowValues(schema, new[] { row });
+        }
+
+        private static bool TryApplyLastChanceNumericInsertSafety(TableSchema schema, GeneratedRow row)
+        {
+            var before = BuildRowNumericValueSnapshot(schema, row);
+            PrepareRowForInsert(schema, row);
+            var after = BuildRowNumericValueSnapshot(schema, row);
+            return !before.Equals(after, StringComparison.Ordinal);
+        }
+
+        private static string BuildRowNumericValueSnapshot(TableSchema schema, GeneratedRow row)
+        {
+            return string.Join("|",
+                schema.Columns
+                    .Where(c => c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float)
+                    .OrderBy(c => c.ColumnName, StringComparer.OrdinalIgnoreCase)
+                    .Select(c => $"{c.ColumnName}={FormatDiagnosticValue(row.GetValue(c.ColumnName))}"));
+        }
+
         private static void ApplyComputedProductInsertSafety(TableSchema schema, IEnumerable<GeneratedRow> rows)
         {
             var plans = schema.Columns
@@ -1309,7 +1345,7 @@ namespace SqlTestDataGenerator.Database
             {
                 foreach (var plan in plans)
                 {
-                    if (!TryGetColumnPositiveMax(plan.ResultColumn, out var resultMax) ||
+                    if (!TryGetComputedProductResultMax(plan, out var resultMax) ||
                         !TryConvertDecimal(row.GetValue(plan.LeftColumn.ColumnName), out var left) ||
                         !TryConvertDecimal(row.GetValue(plan.RightColumn.ColumnName), out var right) ||
                         IsProductWithinMax(left, right, resultMax))
@@ -1341,6 +1377,91 @@ namespace SqlTestDataGenerator.Database
                         row.SetValue(plan.LeftColumn.ColumnName, SqlServerValueNormalizer.NormalizeValue(plan.LeftColumn, 1m));
                         row.SetValue(plan.RightColumn.ColumnName, BuildSafeFactorForComputedProduct(plan.RightColumn, resultMax, 1m));
                     }
+                }
+            }
+        }
+
+        private static void ApplyHeuristicProductPairInsertSafety(TableSchema schema, GeneratedRow row)
+        {
+            foreach (var plan in BuildHeuristicProductInsertPlans(schema))
+            {
+                if (!TryGetHeuristicProductResultMax(plan, out var resultMax) ||
+                    !TryConvertDecimal(row.GetValue(plan.LeftColumn.ColumnName), out var left) ||
+                    !TryConvertDecimal(row.GetValue(plan.RightColumn.ColumnName), out var right) ||
+                    IsProductWithinMax(left, right, resultMax))
+                {
+                    continue;
+                }
+
+                // Last-mile heuristic has no predicate model, so preserve money/rate-like
+                // values first and lower count/quantity/stock where possible.
+                var leftIsCount = IsComputedProductCountFactorColumn(plan.LeftColumn);
+                var rightIsCount = IsComputedProductCountFactorColumn(plan.RightColumn);
+                if (leftIsCount && TryReduceComputedProductFactor(row, plan.LeftColumn, plan.RightColumn, right, resultMax))
+                    continue;
+                if (rightIsCount && TryReduceComputedProductFactor(row, plan.RightColumn, plan.LeftColumn, left, resultMax))
+                    continue;
+
+                var keepLeft = ShouldKeepComputedProductFactor(plan.LeftColumn, plan.RightColumn);
+                var reduceColumn = keepLeft ? plan.RightColumn : plan.LeftColumn;
+                var otherColumn = keepLeft ? plan.LeftColumn : plan.RightColumn;
+                var otherValue = keepLeft ? left : right;
+                if (TryReduceComputedProductFactor(row, reduceColumn, otherColumn, otherValue, resultMax))
+                    continue;
+
+                row.SetValue(plan.LeftColumn.ColumnName, SqlServerValueNormalizer.NormalizeValue(plan.LeftColumn, 1m));
+                row.SetValue(plan.RightColumn.ColumnName, BuildSafeFactorForComputedProduct(plan.RightColumn, resultMax, 1m));
+            }
+        }
+
+        private static bool TryReduceComputedProductFactor(
+            GeneratedRow row,
+            ColumnSchema reduceColumn,
+            ColumnSchema otherColumn,
+            decimal otherValue,
+            decimal resultMax)
+        {
+            var reduced = BuildSafeFactorForComputedProduct(reduceColumn, resultMax, otherValue);
+            if (!TryConvertDecimal(reduced, out var reducedDecimal) ||
+                !IsProductWithinMax(reducedDecimal, otherValue, resultMax))
+            {
+                return false;
+            }
+
+            row.SetValue(reduceColumn.ColumnName, reduced);
+            return true;
+        }
+
+        private static IEnumerable<ComputedProductInsertPlan> BuildHeuristicProductInsertPlans(TableSchema schema)
+        {
+            var countColumns = schema.Columns
+                .Where(c =>
+                    !c.IsComputed &&
+                    !c.IsStoreGenerated &&
+                    c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
+                    IsComputedProductCountFactorColumn(c))
+                .ToList();
+            if (countColumns.Count == 0)
+                yield break;
+
+            var measureColumns = schema.Columns
+                .Where(c =>
+                    !c.IsComputed &&
+                    !c.IsStoreGenerated &&
+                    c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
+                    IsProductFactorMeasureColumn(c))
+                .ToList();
+            if (measureColumns.Count == 0)
+                yield break;
+
+            foreach (var count in countColumns)
+            {
+                foreach (var measure in measureColumns)
+                {
+                    if (count.ColumnName.Equals(measure.ColumnName, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    yield return new ComputedProductInsertPlan(measure, count, measure);
                 }
             }
         }
@@ -1570,6 +1691,85 @@ namespace SqlTestDataGenerator.Database
             }
 
             return TryConvertDecimal(normalized, out max) && max > 0m;
+        }
+
+        private static bool TryGetComputedProductResultMax(
+            ComputedProductInsertPlan plan,
+            out decimal max)
+        {
+            if (!TryGetColumnPositiveMax(plan.ResultColumn, out max))
+                return false;
+
+            if (plan.ResultColumn.IsComputedTypeInferred &&
+                TryGetInferredComputedProductResultMax(plan, out var inferredMax))
+            {
+                max = Math.Min(max, inferredMax);
+            }
+
+            return max > 0m;
+        }
+
+        private static bool TryGetHeuristicProductResultMax(
+            ComputedProductInsertPlan plan,
+            out decimal max)
+        {
+            if (plan.ResultColumn.IsComputed)
+                return TryGetComputedProductResultMax(plan, out max);
+
+            max = 0m;
+            var measureBounds = new[] { plan.LeftColumn, plan.RightColumn }
+                .Where(IsProductFactorMeasureColumn)
+                .Select(factor => TryGetColumnPositiveMax(factor, out var factorMax) ? factorMax : 0m)
+                .Where(factorMax => factorMax > 0m)
+                .ToList();
+
+            if (measureBounds.Count > 0)
+            {
+                max = measureBounds.Min();
+                return max > 0m;
+            }
+
+            var sourceBounds = new[] { plan.LeftColumn, plan.RightColumn }
+                .Select(factor => TryGetColumnPositiveMax(factor, out var factorMax) ? factorMax : 0m)
+                .Where(factorMax => factorMax > 0m)
+                .ToList();
+
+            if (sourceBounds.Count == 0)
+                return false;
+
+            max = sourceBounds.Min();
+            return max > 0m;
+        }
+
+        private static bool TryGetInferredComputedProductResultMax(
+            ComputedProductInsertPlan plan,
+            out decimal max)
+        {
+            max = 0m;
+            var sourceBounds = new List<decimal>();
+
+            foreach (var factor in new[] { plan.LeftColumn, plan.RightColumn })
+            {
+                if (factor.TypeCategory is not (DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float))
+                    continue;
+
+                if (TryGetColumnPositiveMax(factor, out var factorMax) && factorMax > 0m)
+                    sourceBounds.Add(factorMax);
+            }
+
+            if (sourceBounds.Count == 0)
+                return false;
+
+            var measureBounds = new[] { plan.LeftColumn, plan.RightColumn }
+                .Where(IsMeasureLikeNumericColumn)
+                .Select(factor => TryGetColumnPositiveMax(factor, out var factorMax) ? factorMax : 0m)
+                .Where(factorMax => factorMax > 0m)
+                .ToList();
+
+            max = measureBounds.Count > 0
+                ? measureBounds.Min()
+                : sourceBounds.Min();
+            return max > 0m;
         }
 
         private static bool IsProductWithinMax(decimal left, decimal right, decimal max)
@@ -1994,6 +2194,20 @@ JOIN sys.schemas sp ON tp.schema_id = sp.schema_id;";
         private static bool IsArithmeticOverflow(SqlException ex) =>
             ex.Number == 8115 ||
             ex.Message.Contains("Arithmetic overflow", StringComparison.OrdinalIgnoreCase);
+
+        private static bool IsArithmeticOverflow(Exception ex)
+        {
+            for (var current = ex; current != null; current = current.InnerException)
+            {
+                if (current is SqlException sqlException && IsArithmeticOverflow(sqlException))
+                    return true;
+
+                if (current.Message.Contains("Arithmetic overflow", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            return false;
+        }
 
         private static string BuildArithmeticOverflowDiagnostic(
             TableSchema schema,

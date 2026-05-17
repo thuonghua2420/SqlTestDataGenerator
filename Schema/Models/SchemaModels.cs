@@ -32,6 +32,7 @@ namespace SqlTestDataGenerator.Schema.Models
         public bool IsIdentity { get; set; }
         public bool IsPrimaryKey { get; set; }
         public bool IsComputed { get; set; }
+        public bool IsComputedTypeInferred { get; set; }
         public string ComputedExpression { get; set; } = string.Empty;
         public int OrdinalPosition { get; set; }
         public string ColumnKey => $"{SchemaName}.{TableName}.{ColumnName}";
