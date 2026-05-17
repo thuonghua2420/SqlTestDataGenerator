@@ -1300,7 +1300,7 @@ namespace SqlTestDataGenerator.Database
                 .Where(p => p != null)
                 .Select(p => p!)
                 .ToList();
-            plans.AddRange(BuildImplicitProductInsertPlans(schema));
+            plans.AddRange(BuildImplicitProductInsertPlans(schema, plans));
 
             if (plans.Count == 0)
                 return;
@@ -1317,7 +1317,7 @@ namespace SqlTestDataGenerator.Database
                         continue;
                     }
 
-                    var keepLeft = IsMeasureLikeNumericColumn(plan.LeftColumn) && !IsMeasureLikeNumericColumn(plan.RightColumn);
+                    var keepLeft = ShouldKeepComputedProductFactor(plan.LeftColumn, plan.RightColumn);
                     var keepColumn = keepLeft ? plan.LeftColumn : plan.RightColumn;
                     var reduceColumn = keepLeft ? plan.RightColumn : plan.LeftColumn;
                     var keepValue = keepLeft ? left : right;
@@ -1359,14 +1359,35 @@ namespace SqlTestDataGenerator.Database
             return SqlServerValueNormalizer.NormalizeValue(column, candidate);
         }
 
-        private static IEnumerable<ComputedProductInsertPlan> BuildImplicitProductInsertPlans(TableSchema schema)
+        private static bool ShouldKeepComputedProductFactor(ColumnSchema leftColumn, ColumnSchema rightColumn)
+        {
+            var leftIsCountFactor = IsComputedProductCountFactorColumn(leftColumn);
+            var rightIsCountFactor = IsComputedProductCountFactorColumn(rightColumn);
+            var leftIsMeasure = IsMeasureLikeNumericColumn(leftColumn);
+            var rightIsMeasure = IsMeasureLikeNumericColumn(rightColumn);
+
+            if (leftIsCountFactor && rightIsMeasure)
+                return true;
+            if (rightIsCountFactor && leftIsMeasure)
+                return false;
+            if (leftIsMeasure && !rightIsMeasure)
+                return false;
+            if (rightIsMeasure && !leftIsMeasure)
+                return true;
+
+            return true;
+        }
+
+        private static IEnumerable<ComputedProductInsertPlan> BuildImplicitProductInsertPlans(
+            TableSchema schema,
+            IReadOnlyCollection<ComputedProductInsertPlan> explicitPlans)
         {
             var quantityColumns = schema.Columns
                 .Where(c =>
                     !c.IsComputed &&
                     !c.IsStoreGenerated &&
                     c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
-                    IsQuantityLikeNumericColumn(c))
+                    IsComputedProductCountFactorColumn(c))
                 .ToList();
             if (quantityColumns.Count == 0)
                 yield break;
@@ -1388,10 +1409,22 @@ namespace SqlTestDataGenerator.Database
                     if (quantity.ColumnName.Equals(measure.ColumnName, StringComparison.OrdinalIgnoreCase))
                         continue;
 
+                    if (explicitPlans.Any(plan => SameProductFactorPair(plan, quantity, measure)))
+                        continue;
+
                     yield return new ComputedProductInsertPlan(measure, quantity, measure);
                 }
             }
         }
+
+        private static bool SameProductFactorPair(
+            ComputedProductInsertPlan plan,
+            ColumnSchema first,
+            ColumnSchema second) =>
+            (plan.LeftColumn.ColumnName.Equals(first.ColumnName, StringComparison.OrdinalIgnoreCase) &&
+             plan.RightColumn.ColumnName.Equals(second.ColumnName, StringComparison.OrdinalIgnoreCase)) ||
+            (plan.LeftColumn.ColumnName.Equals(second.ColumnName, StringComparison.OrdinalIgnoreCase) &&
+             plan.RightColumn.ColumnName.Equals(first.ColumnName, StringComparison.OrdinalIgnoreCase));
 
         private static decimal RoundTowardZeroForColumn(ColumnSchema column, decimal value)
         {
@@ -1596,6 +1629,28 @@ namespace SqlTestDataGenerator.Database
             return name.Contains("Quantity", StringComparison.OrdinalIgnoreCase) ||
                    name.Equals("Qty", StringComparison.OrdinalIgnoreCase) ||
                    name.EndsWith("Qty", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsComputedProductCountFactorColumn(ColumnSchema column) =>
+            IsQuantityLikeNumericColumn(column) ||
+            IsInventoryLikeNumericColumn(column) ||
+            IsCountLikeNumericColumn(column);
+
+        private static bool IsInventoryLikeNumericColumn(ColumnSchema column)
+        {
+            var name = column.ColumnName;
+            return name.Contains("Stock", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("OnHand", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Reorder", StringComparison.OrdinalIgnoreCase) ||
+                   name.Contains("Backorder", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsCountLikeNumericColumn(ColumnSchema column)
+        {
+            var name = column.ColumnName;
+            return name.Contains("Count", StringComparison.OrdinalIgnoreCase) ||
+                   name.EndsWith("Cnt", StringComparison.OrdinalIgnoreCase) ||
+                   name.Equals("Cnt", StringComparison.OrdinalIgnoreCase);
         }
 
         private sealed class ComputedProductInsertPlan

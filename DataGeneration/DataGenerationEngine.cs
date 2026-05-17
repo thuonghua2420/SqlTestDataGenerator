@@ -147,11 +147,14 @@ namespace SqlTestDataGenerator.DataGeneration
                     insertOrder,
                     nextTableIds);
                 ApplyScenarioInsertSafetyAdjustments(query, workingScenario, schemas);
+                EnforceScenarioComputedProductFactorDiversity(query, workingScenario, schemas);
                 EnforceScenarioGeneratedValueDiversity(query, workingScenario, schemas);
                 ApplyScenarioInsertSafetyAdjustments(query, workingScenario, schemas);
+                EnforceScenarioComputedProductFactorDiversity(query, workingScenario, schemas);
                 ApplyScenarioStringShuffleAdjustments(query, workingScenario, schemas);
                 EnforceScenarioGeneratedValueDiversity(query, workingScenario, schemas);
                 ApplyScenarioInsertSafetyAdjustments(query, workingScenario, schemas);
+                EnforceScenarioComputedProductFactorDiversity(query, workingScenario, schemas);
                 ValidateScenarioLocalForeignKeys(workingScenario, schemas);
                 ValidateScenarioData(workingScenario, schemas);
                 ApplyScenarioRecordOrderShuffle(workingScenario);
@@ -597,6 +600,224 @@ namespace SqlTestDataGenerator.DataGeneration
             }
         }
 
+        private void EnforceScenarioComputedProductFactorDiversity(
+            ParsedQuery query,
+            BranchScenario scenario,
+            Dictionary<string, TableSchema> schemas)
+        {
+            if (!scenario.ExpectedToReturnRows)
+                return;
+
+            foreach (var (tableName, rows) in EnumerateScenarioRowsByTable(scenario))
+            {
+                if (!schemas.TryGetValue(tableName, out var schema) || rows.Count < 2)
+                    continue;
+
+                var tableAlias = ResolveAliasesForTable(query, schema.TableName).FirstOrDefault() ?? schema.TableName;
+                foreach (var computedColumn in schema.Columns.Where(c => c.IsComputed))
+                {
+                    if (!TryBuildComputedProductColumnPlan(schema, computedColumn, out var plan) ||
+                        !TryGetPositiveColumnMax(plan.ResultColumn, out var resultMax))
+                    {
+                        continue;
+                    }
+
+                    var usedAnchorKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    var usedAdjustableKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+                    {
+                        var row = rows[rowIndex];
+                        if (row.Role == RowRole.AntiMatch ||
+                            !CanEnforceGeneratedDiversityColumn(query, scenario, schema, row, plan.AnchorColumn) ||
+                            !CanEnforceGeneratedDiversityColumn(query, scenario, schema, row, plan.AdjustableColumn))
+                        {
+                            continue;
+                        }
+
+                        if (!TryBuildDiverseComputedProductPair(
+                                query,
+                                scenario,
+                                schema,
+                                tableAlias,
+                                row,
+                                rowIndex,
+                                plan,
+                                resultMax,
+                                usedAnchorKeys,
+                                usedAdjustableKeys,
+                                out var anchorValue,
+                                out var anchorDecimal,
+                                out var adjustableValue,
+                                out var adjustableDecimal))
+                        {
+                            var anchorKey = BuildDiversityValueKey(plan.AnchorColumn, row.GetValue(plan.AnchorColumn.ColumnName));
+                            if (!string.IsNullOrEmpty(anchorKey))
+                                usedAnchorKeys.Add(anchorKey);
+
+                            var adjustableKey = BuildDiversityValueKey(plan.AdjustableColumn, row.GetValue(plan.AdjustableColumn.ColumnName));
+                            if (!string.IsNullOrEmpty(adjustableKey))
+                                usedAdjustableKeys.Add(adjustableKey);
+                            continue;
+                        }
+
+                        row.SetValue(plan.AnchorColumn.ColumnName, anchorValue, ValueBinding.RandomDistinct);
+                        row.SetValue(plan.AdjustableColumn.ColumnName, adjustableValue, ValueBinding.RandomDistinct);
+                        SetComputedProductPreviewValue(row, plan, anchorDecimal, adjustableDecimal);
+                        usedAnchorKeys.Add(BuildDiversityValueKey(plan.AnchorColumn, anchorValue));
+                        usedAdjustableKeys.Add(BuildDiversityValueKey(plan.AdjustableColumn, adjustableValue));
+                    }
+                }
+            }
+        }
+
+        private bool TryBuildDiverseComputedProductPair(
+            ParsedQuery query,
+            BranchScenario scenario,
+            TableSchema schema,
+            string tableAlias,
+            GeneratedRow row,
+            int rowIndex,
+            ComputedProductColumnPlan plan,
+            decimal resultMax,
+            HashSet<string> usedAnchorKeys,
+            HashSet<string> usedAdjustableKeys,
+            out object? anchorValue,
+            out decimal anchorDecimal,
+            out object? adjustableValue,
+            out decimal adjustableDecimal)
+        {
+            anchorValue = null;
+            anchorDecimal = 0m;
+            adjustableValue = null;
+            adjustableDecimal = 0m;
+
+            var anchorCandidates = BuildComputedProductDiversityAnchorCandidates(plan.AnchorColumn, row, rowIndex);
+            foreach (var rawAnchor in anchorCandidates)
+            {
+                if (!TryNormalizeNumericCandidate(plan.AnchorColumn, rawAnchor, out var normalizedAnchor, out var candidateAnchor) ||
+                    candidateAnchor == 0m ||
+                    usedAnchorKeys.Contains(BuildDiversityValueKey(plan.AnchorColumn, normalizedAnchor)) ||
+                    !SatisfiesPositiveColumnConstraints(query, scenario, schema.TableName, tableAlias, plan.AnchorColumn, normalizedAnchor))
+                {
+                    continue;
+                }
+
+                var limit = resultMax / Math.Abs(candidateAnchor);
+                foreach (var rawAdjustable in BuildComputedProductDiversityAdjustableCandidates(
+                             query,
+                             scenario,
+                             schema.TableName,
+                             tableAlias,
+                             plan.AdjustableColumn,
+                             row,
+                             rowIndex,
+                             limit))
+                {
+                    if (!TryNormalizeNumericCandidate(plan.AdjustableColumn, rawAdjustable, out var normalizedAdjustable, out var candidateAdjustable) ||
+                        candidateAdjustable == 0m ||
+                        Math.Abs(candidateAdjustable) > limit ||
+                        usedAdjustableKeys.Contains(BuildDiversityValueKey(plan.AdjustableColumn, normalizedAdjustable)) ||
+                        !SatisfiesPositiveColumnConstraints(query, scenario, schema.TableName, tableAlias, plan.AdjustableColumn, normalizedAdjustable) ||
+                        !IsComputedProductWithinRange(candidateAnchor, candidateAdjustable, resultMax))
+                    {
+                        continue;
+                    }
+
+                    var rawResult = candidateAnchor * candidateAdjustable;
+                    if (!TryNormalizeNumericCandidate(plan.ResultColumn, rawResult, out var normalizedResult, out _) ||
+                        !SatisfiesPositiveColumnConstraints(query, scenario, schema.TableName, tableAlias, plan.ResultColumn, normalizedResult))
+                    {
+                        continue;
+                    }
+
+                    anchorValue = normalizedAnchor;
+                    anchorDecimal = candidateAnchor;
+                    adjustableValue = normalizedAdjustable;
+                    adjustableDecimal = candidateAdjustable;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static IEnumerable<decimal> BuildComputedProductDiversityAnchorCandidates(
+            ColumnSchema column,
+            GeneratedRow row,
+            int rowIndex)
+        {
+            var step = GetNumericRangeStep(column);
+            var baseIndex = rowIndex + 1;
+            var candidates = new List<decimal>
+            {
+                baseIndex,
+                baseIndex + 1,
+                baseIndex + 2,
+                1m,
+                2m,
+                3m,
+                4m,
+                5m,
+                6m,
+                7m,
+                8m,
+                9m,
+                10m
+            };
+
+            if (TryConvertDecimal(row.GetValue(column.ColumnName), out var current))
+            {
+                candidates.Add(current);
+                candidates.Add(current + step);
+            }
+
+            return DeduplicateDecimalCandidates(candidates);
+        }
+
+        private IEnumerable<decimal> BuildComputedProductDiversityAdjustableCandidates(
+            ParsedQuery query,
+            BranchScenario scenario,
+            string tableName,
+            string tableAlias,
+            ColumnSchema column,
+            GeneratedRow row,
+            int rowIndex,
+            decimal limit)
+        {
+            if (limit <= 0m)
+                return Enumerable.Empty<decimal>();
+
+            var bounds = GetPositiveNumericBounds(query, scenario, tableName, tableAlias, column, excludedConditionKey: string.Empty);
+            var step = GetNumericRangeStep(column);
+            var upper = bounds.Upper.HasValue ? Math.Min(bounds.Upper.Value, limit) : limit;
+            var offset = Math.Max(0, rowIndex) * step;
+            var candidates = new List<decimal>
+            {
+                upper - offset,
+                upper,
+                upper - step,
+                limit,
+                limit - step
+            };
+
+            if (TryConvertDecimal(row.GetValue(column.ColumnName), out var current))
+            {
+                candidates.Add(current);
+                candidates.Add(current - ((rowIndex + 1) * step));
+            }
+
+            candidates.AddRange(bounds.DiscreteValues.Where(v => Math.Abs(v) <= limit));
+            if (bounds.Lower.HasValue)
+            {
+                candidates.Add(bounds.Lower.Value);
+                candidates.Add(bounds.Lower.Value + step);
+            }
+
+            return DeduplicateDecimalCandidates(candidates)
+                .Where(c => c != 0m && Math.Abs(c) <= limit && IsWithinNumericBounds(c, bounds))
+                .OrderByDescending(Math.Abs);
+        }
+
         private bool EnforceRowValueDiversity(
             ParsedQuery query,
             BranchScenario scenario,
@@ -784,15 +1005,44 @@ namespace SqlTestDataGenerator.DataGeneration
             TableSchema schema,
             ColumnSchema column)
         {
-            return ResolveAliasesForTable(query, schema.TableName)
-                .DefaultIfEmpty(schema.TableName)
-                .Any(alias =>
-                    FindApplicableSubqueryConditionTargets(
-                        scenario,
-                        query,
-                        schema.TableName,
-                        alias,
-                        column.ColumnName).Count > 0);
+            return IsColumnReferencedBySubqueryCondition(
+                query.Subqueries,
+                query.AliasToTableMap,
+                schema.TableName,
+                column.ColumnName);
+        }
+
+        private static bool IsColumnReferencedBySubqueryCondition(
+            IEnumerable<SubqueryInfo> subqueries,
+            IReadOnlyDictionary<string, string> aliasMap,
+            string tableName,
+            string columnName)
+        {
+            foreach (var subquery in subqueries)
+            {
+                var localAliasMap = ExtendAliasMap(
+                    new Dictionary<string, string>(aliasMap, StringComparer.OrdinalIgnoreCase),
+                    subquery.Tables);
+
+                if (subquery.Conditions.Any(condition =>
+                        ConditionTargetsColumn(localAliasMap, condition, tableName, tableName, columnName) ||
+                        condition.ReferencedColumns.Any(reference =>
+                            MatchesColumnReference(localAliasMap, reference, tableName, tableName, columnName))))
+                {
+                    return true;
+                }
+
+                if (IsColumnReferencedBySubqueryCondition(
+                        subquery.NestedSubqueries,
+                        localAliasMap,
+                        tableName,
+                        columnName))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private bool TryBuildDistinctGeneratedValue(
@@ -3778,8 +4028,6 @@ namespace SqlTestDataGenerator.DataGeneration
             out decimal upperBound)
         {
             upperBound = 0m;
-            if (IsMeasureLikeNumericColumn(sourceColumn))
-                return false;
 
             foreach (var computedCol in schema.Columns)
             {
@@ -3795,60 +4043,42 @@ namespace SqlTestDataGenerator.DataGeneration
 
                 if (otherFactor == null) continue;
 
+                if (IsComputedProductCountFactorColumn(sourceColumn) &&
+                    IsMeasureLikeNumericColumn(otherFactor))
+                {
+                    continue;
+                }
+
+                if (IsMeasureLikeNumericColumn(sourceColumn) &&
+                    !IsComputedProductCountFactorColumn(otherFactor))
+                {
+                    continue;
+                }
+
                 if (!TryGetPositiveColumnMax(otherFactor, out var otherMax) || otherMax <= 0m)
                     continue;
 
                 var limit = resultMax / otherMax;
                 if (limit <= 0m) continue;
 
-                upperBound = limit;
-                return true;
-            }
-
-            if (IsQuantityLikeNumericColumn(sourceColumn) &&
-                schema.Columns.Any(c => c.IsComputed && IsComputedNumericProductResultColumn(c)) &&
-                TryGetImplicitProductUpperBound(schema, sourceColumn, out upperBound))
-            {
+                upperBound = FloorPositiveLimitToColumnStep(sourceColumn, limit);
                 return true;
             }
 
             return false;
         }
 
-        private static bool TryGetImplicitProductUpperBound(
-            TableSchema schema,
-            ColumnSchema quantityColumn,
-            out decimal upperBound)
+        private static decimal FloorPositiveLimitToColumnStep(ColumnSchema column, decimal limit)
         {
-            upperBound = 0m;
-            var measureColumn = schema.Columns.FirstOrDefault(c =>
-                !c.IsComputed &&
-                !c.IsStoreGenerated &&
-                c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float &&
-                IsProductFactorMeasureColumn(c));
-            if (measureColumn == null ||
-                !TryGetPositiveColumnMax(measureColumn, out var measureMax) ||
-                measureMax <= 0m)
-            {
-                return false;
-            }
-
-            var resultColumn = schema.Columns.FirstOrDefault(c =>
-                c.IsComputed &&
-                (c.ColumnName.Contains("Total", StringComparison.OrdinalIgnoreCase) ||
-                 c.ColumnName.Contains("Amount", StringComparison.OrdinalIgnoreCase) ||
-                 c.ColumnName.Contains("Computed", StringComparison.OrdinalIgnoreCase)));
-
-            var resultMax = resultColumn != null && TryGetPositiveColumnMax(resultColumn, out var explicitResultMax)
-                ? explicitResultMax
-                : measureMax;
-
-            var limit = resultMax / measureMax;
             if (limit <= 0m)
-                return false;
+                return 0m;
 
-            upperBound = Math.Max(GetNumericRangeStep(quantityColumn), limit);
-            return true;
+            var step = GetNumericRangeStep(column);
+            if (step <= 0m)
+                return limit;
+
+            var floored = decimal.Floor(limit / step) * step;
+            return floored > 0m ? floored : 0m;
         }
 
         private object? GenerateSampleBasedValue(ColumnSchema column, object? sampleValue, int rowIndex)
@@ -5299,16 +5529,6 @@ namespace SqlTestDataGenerator.DataGeneration
                    name.Contains("Fee", StringComparison.OrdinalIgnoreCase);
         }
 
-        private static bool IsProductFactorMeasureColumn(ColumnSchema column)
-        {
-            var name = column.ColumnName;
-            return name.Contains("Price", StringComparison.OrdinalIgnoreCase) ||
-                   name.Contains("Cost", StringComparison.OrdinalIgnoreCase) ||
-                   (name.Contains("Amount", StringComparison.OrdinalIgnoreCase) &&
-                    !name.Contains("Total", StringComparison.OrdinalIgnoreCase)) ||
-                   name.Contains("Fee", StringComparison.OrdinalIgnoreCase);
-        }
-
         private static bool IsQuantityLikeNumericColumn(ColumnSchema column)
         {
             var name = column.ColumnName;
@@ -5316,6 +5536,11 @@ namespace SqlTestDataGenerator.DataGeneration
                    name.Equals("Qty", StringComparison.OrdinalIgnoreCase) ||
                    name.EndsWith("Qty", StringComparison.OrdinalIgnoreCase);
         }
+
+        private static bool IsComputedProductCountFactorColumn(ColumnSchema column) =>
+            IsQuantityLikeNumericColumn(column) ||
+            IsInventoryLikeNumericColumn(column) ||
+            IsCountLikeNumericColumn(column);
 
         private static bool IsRateLikeNumericColumn(ColumnSchema column)
         {

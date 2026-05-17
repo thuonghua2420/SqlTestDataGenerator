@@ -664,6 +664,8 @@ Nhóm regression quan trọng hiện có:
 - sample mode
 - max mode
 - smallint safety
+- computed product overflow/diversity
+- DDL schema import and max-mode range coverage
 - pair self-join
 - string expression support
 
@@ -777,6 +779,14 @@ Ví dụ đúng:
 - sau đó mới solve mọi query dùng họ function đó.
 
 ## 16. Tóm tắt một câu
+
+Ghi chú kiến trúc mới:
+
+- Schema metadata có thể đến từ DB introspection hoặc file DDL đã import.
+- DDL import được parse bằng ScriptDom và lưu cache trong hệ thống để dùng cho các lần generate sau.
+- DDL import là best-effort schema extraction: chỉ các block bảng/constraint liên quan metadata được parse, còn `CREATE SCHEMA`, `DROP`, non-unique index và syntax export ngoài bảng không được làm fail toàn bộ file.
+- Khi có DDL import, generator phải dùng metadata cột trong DDL trước khi fallback sang schema suy luận, nhằm giữ đúng `MaxLength`, `precision/scale`, `identity`, `computed`, `rowversion/timestamp`, PK/FK/unique và range của `tinyint`/`smallint`/các numeric type.
+- Nếu DDL thiếu bảng xuất hiện trong SQL, phải cảnh báo/fail sớm hoặc bổ sung từ DB khi đang connected; không được generate bằng schema thiếu bảng mà im lặng bỏ qua table.
 
 Toàn bộ dự án này nên được hiểu là:
 

@@ -27,6 +27,8 @@ namespace SqlTestDataGenerator.UI
         private readonly TableCsvExporter _csvExporter = new();
         private readonly TableCsvFolderImporter _csvImporter = new();
         private readonly ConnectionProfileCache _connectionProfileCache = new();
+        private readonly DdlSchemaParser _ddlSchemaParser = new();
+        private readonly DdlSchemaCache _ddlSchemaCache = new();
         private TableKeySeedResolver? _tableKeySeedResolver;
         private TableSampleExtractor? _tableSampleExtractor;
         private DatabaseConnectionManager? _connectionManager;
@@ -35,6 +37,9 @@ namespace SqlTestDataGenerator.UI
         // ── State ──
         private ParsedQuery? _currentQuery;
         private Dictionary<string, TableSchema>? _schemas;
+        private Dictionary<string, TableSchema>? _importedDdlSchemas;
+        private string _importedDdlSourceFile = string.Empty;
+        private DateTime _importedDdlAtUtc;
         private DataGeneration.Models.GeneratedDataSet? _currentDataSet;
         private Dictionary<string, Dictionary<string, object?>> _baselineSampleRows = new(StringComparer.OrdinalIgnoreCase);
         private List<DataGeneration.Models.BranchScenario> _availableScenarios = new();
@@ -60,6 +65,7 @@ namespace SqlTestDataGenerator.UI
         private Button _analyzeBtn = null!;
         private Button _generateBtn = null!;
         private Button _insertDbBtn = null!;
+        private Button _importDdlBtn = null!;
         private Button _exportCsvBtn = null!;
         private Button _importCsvBtn = null!;
         private Button _browseExportFolderBtn = null!;
@@ -98,6 +104,7 @@ namespace SqlTestDataGenerator.UI
         {
             InitializeComponent();
             ApplyTheme();
+            TryLoadCachedDdlSchema();
             Shown += MainForm_Shown;
             LogInfo("Application started.");
         }
@@ -397,6 +404,10 @@ namespace SqlTestDataGenerator.UI
             _saveBtn.Location = new Point(150, 8);
             _saveBtn.Click += SaveBtn_Click;
 
+            _importDdlBtn = CreateLegacyButton("Import DDL", 110);
+            _importDdlBtn.Location = new Point(274, 8);
+            _importDdlBtn.Click += ImportDdlBtn_Click;
+
             _exportFolderLabel = new Label
             {
                 Text = "CSV Folder:",
@@ -444,7 +455,7 @@ namespace SqlTestDataGenerator.UI
 
             _bottomToolbar.Controls.AddRange(new Control[]
             {
-                _copyBtn, _saveBtn,
+                _copyBtn, _saveBtn, _importDdlBtn,
                 _exportFolderLabel, _exportFolderInput, _browseExportFolderBtn, _exportCsvBtn, _importCsvBtn,
                 _statusLabel
             });
@@ -707,6 +718,10 @@ namespace SqlTestDataGenerator.UI
             _saveBtn.Location = new Point(150, 8);
             _saveBtn.Click += SaveBtn_Click;
 
+            _importDdlBtn = CreateLegacyButton("Import DDL", 110);
+            _importDdlBtn.Location = new Point(274, 8);
+            _importDdlBtn.Click += ImportDdlBtn_Click;
+
             _exportFolderLabel = new Label
             {
                 Text = "CSV Folder:",
@@ -754,7 +769,7 @@ namespace SqlTestDataGenerator.UI
 
             _bottomToolbar.Controls.AddRange(new Control[]
             {
-                _copyBtn, _saveBtn, _exportFolderLabel, _exportFolderInput, _browseExportFolderBtn, _exportCsvBtn, _importCsvBtn, _statusLabel
+                _copyBtn, _saveBtn, _importDdlBtn, _exportFolderLabel, _exportFolderInput, _browseExportFolderBtn, _exportCsvBtn, _importCsvBtn, _statusLabel
             });
             _bottomToolbar.Resize += BottomToolbar_Resize;
 
@@ -1100,6 +1115,9 @@ namespace SqlTestDataGenerator.UI
             _saveBtn = CreateButton("Save .sql", _accentGreen, 106);
             _saveBtn.Click += SaveBtn_Click;
 
+            _importDdlBtn = CreateButton("Import DDL", _accentOrange, 110);
+            _importDdlBtn.Click += ImportDdlBtn_Click;
+
             _exportFolderLabel = new Label
             {
                 Text = "CSV Folder:",
@@ -1176,6 +1194,7 @@ namespace SqlTestDataGenerator.UI
             };
             actionsLeftFlow.Controls.Add(_copyBtn);
             actionsLeftFlow.Controls.Add(_saveBtn);
+            actionsLeftFlow.Controls.Add(_importDdlBtn);
 
             actionsRow.Controls.Add(actionsLeftFlow, 0, 0);
             actionsRow.Controls.Add(_statusLabel, 1, 0);
@@ -1549,19 +1568,19 @@ namespace SqlTestDataGenerator.UI
                 _dataEngine.Options.EnsureAntiMatchRows = true;
                 LogInfo($"Starting data generation with expected result rows = {_dataEngine.ExpectedResultRows}, mode = {(_maxLengthMaxValueCheck.Checked ? "Maxlength/MaxValue" : "Sample-based")}, value shuffle = enabled.");
 
-                // Get schemas from database if connected
+                // Get schemas from imported DDL or database if available.
                 _schemas = null;
-                if (_schemaIntrospector != null)
+                if (HasImportedDdlSchema || _schemaIntrospector != null)
                 {
                     try
                     {
                         var tableNames = GetAllReferencedTableNames(_currentQuery);
-                        _schemas = LoadSchemaClosure(tableNames);
+                        _schemas = LoadActiveSchemaClosure(tableNames);
                     }
                     catch (Exception ex)
                     {
-                        SetStatus($"Schema introspection warning: {ex.Message}. Using inferred schemas.");
-                        LogWarn($"Schema introspection warning: {BuildErrorChain(ex)}");
+                        SetStatus($"Schema metadata warning: {ex.Message}. Using inferred schemas.");
+                        LogWarn($"Schema metadata warning: {BuildErrorChain(ex)}");
                     }
                 }
 
@@ -1689,10 +1708,10 @@ namespace SqlTestDataGenerator.UI
 
             try
             {
-                if (_schemaIntrospector != null)
+                if (HasImportedDdlSchema || _schemaIntrospector != null)
                 {
                     var tableNames = GetAllReferencedTableNames(_currentQuery);
-                    _schemas = LoadSchemaClosure(tableNames);
+                    _schemas = LoadActiveSchemaClosure(tableNames);
                 }
             }
             catch (Exception ex)
@@ -1823,6 +1842,67 @@ namespace SqlTestDataGenerator.UI
             }
         }
 
+        private void ImportDdlBtn_Click(object? sender, EventArgs e)
+        {
+            using var dialog = new OpenFileDialog
+            {
+                Title = "Import database DDL",
+                Filter = "SQL DDL files|*.sql;*.ddl|SQL files|*.sql|All files|*.*",
+                Multiselect = false,
+                CheckFileExists = true
+            };
+
+            if (dialog.ShowDialog(this) != DialogResult.OK)
+                return;
+
+            try
+            {
+                var ddlText = File.ReadAllText(dialog.FileName, Encoding.UTF8);
+                var result = _ddlSchemaParser.Parse(ddlText);
+                var schemas = BuildLookupSchemaDictionary(result.Schemas.Values);
+                var importedAtUtc = DateTime.UtcNow;
+
+                _importedDdlSchemas = schemas;
+                _importedDdlSourceFile = dialog.FileName;
+                _importedDdlAtUtc = importedAtUtc;
+                _ddlSchemaCache.Save(_importedDdlSourceFile, schemas, importedAtUtc);
+
+                _schemas = null;
+                _currentDataSet = null;
+                _currentDataSetIsGenerated = false;
+                _scriptCleanOutput.Clear();
+                ClearLastInsertedTables();
+                UpdateDbInsertButtonState();
+
+                var distinctTables = CountDistinctTables(schemas);
+                SetStatus($"Imported DDL schema: {distinctTables} table(s). Generate data again to use it.");
+                LogInfo($"Imported DDL schema from {dialog.FileName}: {distinctTables} table(s), {schemas.Count} lookup key(s).");
+                foreach (var warning in result.Warnings)
+                {
+                    LogWarn($"DDL import warning: {warning}");
+                }
+
+                MessageBox.Show(
+                    $"DDL import completed.\r\n\r\n" +
+                    $"- Tables: {distinctTables}\r\n" +
+                    $"- Source: {dialog.FileName}\r\n" +
+                    $"- Warnings: {result.Warnings.Count}",
+                    "DDL Imported",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                SetStatus("DDL import failed.");
+                LogError($"DDL import failed: {BuildErrorChain(ex)}");
+                MessageBox.Show(
+                    $"DDL import failed:\r\n{BuildErrorChain(ex)}",
+                    "DDL Import Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
+
         private async void ExportCsvBtn_Click(object? sender, EventArgs e)
         {
             if (_connectionManager == null || !_connectionManager.IsConnected)
@@ -1900,10 +1980,10 @@ namespace SqlTestDataGenerator.UI
                 return;
             }
 
-            if (_schemaIntrospector == null)
+            if (_schemaIntrospector == null && !HasImportedDdlSchema)
             {
                 LogWarn("CSV import requested without schema introspector.");
-                MessageBox.Show("Schema introspector is not available. Please reconnect to the database.", "Schema Required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Schema metadata is not available. Please reconnect to the database or import a DDL file.", "Schema Required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
@@ -1924,7 +2004,7 @@ namespace SqlTestDataGenerator.UI
                 LogInfo($"Starting CSV import from folder {folderPath}.");
                 var csvFiles = _csvImporter.DiscoverTableFiles(folderPath);
                 LogInfo($"Discovered {csvFiles.Count} CSV file(s) for import.");
-                _schemas = LoadSchemaClosure(csvFiles.Select(f => f.TableName));
+                _schemas = LoadActiveSchemaClosure(csvFiles.Select(f => f.TableName));
 
                 var importData = await _csvImporter.LoadFolderAsync(folderPath, _schemas);
                 _currentDataSet = importData.DataSet;
@@ -2251,6 +2331,32 @@ namespace SqlTestDataGenerator.UI
                                     !string.IsNullOrWhiteSpace(_exportFolderInput.Text);
         }
 
+        private bool HasImportedDdlSchema =>
+            _importedDdlSchemas != null && _importedDdlSchemas.Count > 0;
+
+        private void TryLoadCachedDdlSchema()
+        {
+            if (!_ddlSchemaCache.TryLoad(
+                    out var schemas,
+                    out var sourceFile,
+                    out var importedAtUtc,
+                    out var message))
+            {
+                if (!string.IsNullOrWhiteSpace(message))
+                {
+                    LogWarn(message);
+                }
+
+                return;
+            }
+
+            _importedDdlSchemas = BuildLookupSchemaDictionary(schemas.Values);
+            _importedDdlSourceFile = sourceFile;
+            _importedDdlAtUtc = importedAtUtc;
+            LogInfo(
+                $"Loaded cached DDL schema: {CountDistinctTables(_importedDdlSchemas)} table(s), source = {sourceFile}.");
+        }
+
         private static HashSet<string> GetAllReferencedTableNames(ParsedQuery query)
         {
             var tableNames = query.Tables
@@ -2308,6 +2414,126 @@ namespace SqlTestDataGenerator.UI
 
             return result;
         }
+
+        private Dictionary<string, TableSchema> LoadActiveSchemaClosure(IEnumerable<string> seedTables)
+        {
+            var seeds = seedTables
+                .Where(t => !string.IsNullOrWhiteSpace(t))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (HasImportedDdlSchema)
+            {
+                var schemas = LoadImportedDdlSchemaClosure(seeds, allowDatabaseSupplement: _schemaIntrospector != null);
+                var missingSeeds = seeds
+                    .Where(t => !schemas.ContainsKey(t))
+                    .ToList();
+                if (missingSeeds.Count > 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Imported DDL schema does not contain table(s): {string.Join(", ", missingSeeds)}.");
+                }
+
+                LogInfo(
+                    $"Using imported DDL schema metadata: {CountDistinctTables(schemas)} table(s), source = {_importedDdlSourceFile}.");
+                return schemas;
+            }
+
+            var dbSchemas = LoadSchemaClosure(seeds);
+            LogInfo($"Using database schema introspection for {CountDistinctTables(dbSchemas)} table(s).");
+            return dbSchemas;
+        }
+
+        private Dictionary<string, TableSchema> LoadImportedDdlSchemaClosure(
+            IEnumerable<string> seedTables,
+            bool allowDatabaseSupplement)
+        {
+            if (!HasImportedDdlSchema)
+                throw new InvalidOperationException("Imported DDL schema is not available.");
+
+            var result = new Dictionary<string, TableSchema>(StringComparer.OrdinalIgnoreCase);
+            var queue = new Queue<string>(seedTables
+                .Where(t => !string.IsNullOrWhiteSpace(t))
+                .Distinct(StringComparer.OrdinalIgnoreCase));
+
+            while (queue.Count > 0)
+            {
+                var tableName = queue.Dequeue();
+                if (result.ContainsKey(tableName))
+                    continue;
+
+                var schema = TryGetImportedDdlSchema(tableName);
+                if (schema == null && allowDatabaseSupplement && _schemaIntrospector != null)
+                {
+                    try
+                    {
+                        schema = _schemaIntrospector.GetTableSchema(tableName);
+                        LogInfo($"Supplemented imported DDL schema with database table {schema.SchemaName}.{schema.TableName}.");
+                    }
+                    catch (Exception ex)
+                    {
+                        LogWarn($"Could not supplement missing DDL table {tableName} from database: {BuildErrorChain(ex)}");
+                    }
+                }
+
+                if (schema == null)
+                    continue;
+
+                AddSchemaLookupKeys(result, schema);
+
+                foreach (var fk in schema.ForeignKeys)
+                {
+                    if (!string.IsNullOrWhiteSpace(fk.ReferencedTable) &&
+                        !result.ContainsKey(fk.ReferencedTable))
+                    {
+                        queue.Enqueue(fk.ReferencedTable);
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        private TableSchema? TryGetImportedDdlSchema(string tableName)
+        {
+            if (_importedDdlSchemas == null)
+                return null;
+
+            if (_importedDdlSchemas.TryGetValue(tableName, out var schema))
+                return schema;
+
+            var dotIndex = tableName.IndexOf('.');
+            if (dotIndex >= 0 &&
+                dotIndex < tableName.Length - 1 &&
+                _importedDdlSchemas.TryGetValue(tableName[(dotIndex + 1)..], out schema))
+            {
+                return schema;
+            }
+
+            return null;
+        }
+
+        private static Dictionary<string, TableSchema> BuildLookupSchemaDictionary(IEnumerable<TableSchema> schemas)
+        {
+            var result = new Dictionary<string, TableSchema>(StringComparer.OrdinalIgnoreCase);
+            foreach (var schema in schemas.DistinctBy(s => $"{s.SchemaName}.{s.TableName}"))
+            {
+                AddSchemaLookupKeys(result, schema);
+            }
+
+            return result;
+        }
+
+        private static void AddSchemaLookupKeys(Dictionary<string, TableSchema> target, TableSchema schema)
+        {
+            target[schema.TableName] = schema;
+            target[$"{schema.SchemaName}.{schema.TableName}"] = schema;
+        }
+
+        private static int CountDistinctTables(Dictionary<string, TableSchema> schemas) =>
+            schemas.Values
+                .DistinctBy(s => $"{s.SchemaName}.{s.TableName}")
+                .Count();
 
         private static async Task<bool> QueryReturnsRowsAsync(SqlConnection connection, string sql)
         {

@@ -604,3 +604,42 @@ Không làm ngược lại. Ví dụ:
   - parse record tuần tự, không giữ toàn bộ file trong memory;
   - với binary hex, thêm kiểm tra chặt `odd length` trước khi `Convert.FromHexString(...)`;
   - thêm regression `binary csv integrity` để khóa invariant: payload dài vẫn round-trip đủ byte, không thiếu byte như lỗi cũ.
+
+## E69. Offline generation thiếu schema thật từ DDL
+- Chi tiết lỗi: khi không connected DB, generator chỉ suy luận schema tối thiểu từ SQL nên không biết chính xác `MaxLength`, `precision/scale`, `identity`, `computed`, `rowversion/timestamp`, PK/FK/unique và range của các kiểu như `tinyint`/`smallint`. Max-mode vì vậy có thể sinh giá trị hợp lý theo SQL text nhưng vượt định nghĩa cột thật.
+- Nguyên nhân gốc: kiến trúc chỉ có schema source mạnh từ `SchemaIntrospector`; offline mode rơi về inferred schema quá nghèo metadata.
+- Cách fix:
+  - thêm `DdlSchemaParser` dùng ScriptDom để parse `CREATE TABLE`, `ALTER TABLE ... ADD`, FK/PK/unique/default/identity/computed và unique index không filter;
+  - thêm `DdlSchemaCache` lưu metadata DDL đã import vào cache ứng dụng;
+  - thêm button `Import DDL` trên UI và ưu tiên schema DDL khi generate/script/CSV import, có thể supplement từ DB khi đang connected;
+  - fail/cảnh báo sớm nếu DDL import thiếu bảng được SQL tham chiếu, tránh im lặng generate bằng schema thiếu;
+  - thêm harness regression cho metadata DDL và max-mode generation theo range/length từ DDL.
+
+## E70. DDL import fail vì parse nguyên file export có syntax ngoài bảng
+- Chi tiết lỗi: file DDL export từ tool như DBeaver có `CREATE SCHEMA`, comment `DROP TABLE`, `CREATE INDEX ... WITH ... ON [PRIMARY ]`, và tên object 3 phần `Database.Schema.Table`. Importer parse nguyên file bằng ScriptDom nên fail ngay tại `CREATE TABLE DemoDB20.dbo.Customers`, dù phần cần dùng chỉ là bảng và thuộc tính cột.
+- Nguyên nhân gốc: DDL import dùng parser SQL theo batch đầy đủ thay vì chế độ best-effort schema extraction. Nó coi mọi statement trong file là bắt buộc hợp lệ, trái với mục tiêu chỉ lấy metadata bảng/cột.
+- Cách fix:
+  - đổi `DdlSchemaParser` sang bóc riêng các block `CREATE TABLE (...)`, `ALTER TABLE ... ADD`, và `CREATE UNIQUE INDEX`;
+  - chuẩn hóa object name 3 phần `database.schema.table` thành `schema.table` trước khi parse từng block;
+  - bỏ qua/cảnh báo các statement không hỗ trợ thay vì fail toàn bộ file;
+  - thêm harness regression mô phỏng DBeaver export và lệnh `parse-ddl` để kiểm tra trực tiếp file DDL thực tế.
+
+## E71. Computed product max-mode từng pin `Quantity = 1`
+- Chi tiết lỗi: với DDL có `LineTotal AS ([Quantity]*[Price])`, max-mode có thể sinh `Price` sát max `decimal(10,2)` rồi giới hạn `Quantity` về `1` để tránh overflow. Query vẫn insert được, nhưng các record match bị thiếu diversity ở cột `Quantity`.
+- Nguyên nhân gốc: upper-bound policy cho computed product đang cắt factor không phải measure theo `ComputedMax / MeasureMax`. Với cặp `Quantity * Price`, cách này bảo vệ overflow bằng cách hy sinh `Quantity`, trái với rule phải giảm measure (`Price`/`Amount`) khi có thể.
+- Cách fix:
+  - không dùng computed-product upper bound để pin cột quantity/count/inventory-like khi factor còn lại là measure-like;
+  - áp upper bound vào cột measure-like và floor theo step thực tế của kiểu dữ liệu để không làm tròn vượt range;
+  - cập nhật regression max-mode overflow guard để kỳ vọng `Quantity` vẫn lớn hơn `1`, còn `Price` được giảm nhưng tích vẫn nằm trong range;
+  - thêm regression DDL cho query join `Customers/Orders/OrderDetails/Products` với `ABS(od.Quantity)` và `ISNULL(od.LineTotal)` để khóa diversity của `Quantity`, `OrderDetails.Price`, và `Products.Price`.
+
+## E72. Direct insert từng mutate dữ liệu khác với `Executable SQL Script`
+- Chi tiết lỗi: script preview hiển thị một bộ giá trị, nhưng khi nhấn `Insert to DB` dữ liệu trong DB có thể khác. Case cụ thể là `OrderDetails.Quantity/Price`: script có `Quantity = 2..10` và `Price` gần `99,999,999.xx`, nhưng direct insert có thể giảm một factor trước khi insert.
+- Nguyên nhân gốc:
+  - `Insert to DB` không execute text đang hiển thị trong `Executable SQL Script`; nó gọi `GeneratedDataDbExecutor` trên dataset hiện tại;
+  - executor có bước `ApplyComputedProductInsertSafety(...)` riêng và còn tự thêm implicit plan `Quantity * Price <= PriceMax` ngay cả khi DDL đã có computed column thật `LineTotal AS ([Quantity]*[Price])`;
+  - implicit plan giả này dùng max của `Price` làm max của product, nên direct insert mutate row khác với script preview.
+- Cách fix:
+  - bỏ implicit product plan trùng khi đã có computed product plan explicit từ DDL/schema;
+  - khi vẫn cần chống overflow, giữ count factor (`Quantity`/`Stock`/`Count`) và giảm measure factor (`Price`/`Amount`) thay vì ngược lại;
+  - thêm regression `direct insert computed product plan` để khóa invariant: explicit computed plan không bị implicit fallback mutate, và direct insert safety giữ `Quantity` khi buộc phải giảm `Price`.
