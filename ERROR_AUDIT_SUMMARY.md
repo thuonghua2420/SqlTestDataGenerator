@@ -678,3 +678,15 @@ Không làm ngược lại. Ví dụ:
   - heuristic last-mile tự phát hiện cặp count/quantity/stock với price/amount/cost/fee ngay cả khi thiếu computed metadata;
   - clamp DateTime arithmetic bằng safe add helpers và sửa switch `NormalizeDateValue` để không ép `DateTime` sang `DateTimeOffset` ngoài ý muốn;
   - thêm regression cho row giống lỗi `Quantity=100000000`, `Price=9999999.46` khi schema thiếu computed metadata, và regression DateTime boundary arithmetic.
+
+## E76. Computed `CAST/CONVERT` numeric từng không giới hạn source column
+- Chi tiết lỗi: DDL có computed persisted như `N_CollAreaInfoTyp AS (CONVERT([tinyint],[N_CollAreaOfficeCd]))`, nhưng generator vẫn sinh source `N_CollAreaOfficeCd=756` vì cột source là `int`. SQL Server không insert computed column, nhưng vẫn evaluate expression khi insert và nổ `Arithmetic overflow error for data type tinyint`.
+- Nguyên nhân gốc:
+  - safety cũ chỉ bỏ computed/store-generated khỏi insert và đã có guard riêng cho computed product `Quantity * Price`;
+  - chưa có plan đọc target type trong computed expression `CAST/CONVERT`, nên source numeric vẫn dùng range của chính nó thay vì range của target computed conversion;
+  - direct insert last-mile cũng không clamp source theo computed conversion, khiến lỗi vẫn xảy ra khi nhấn `Insert Data` dù DDL đã được import.
+- Cách fix:
+  - thêm helper schema chung để parse computed `CAST/CONVERT` sang numeric type và tạo plan source-column -> target-range;
+  - max-mode, diversity, validation và scenario insert-safety đều dùng plan này để giới hạn source trước khi hậu xử lý khác ghi đè;
+  - direct insert executor chạy computed conversion safety ngay trước từng `INSERT` và cả ở bước prepare plan;
+  - thêm regression với `Office` có source `int` giá trị `748/756` và computed `CONVERT(tinyint, source)` để khóa cả generator và direct insert.

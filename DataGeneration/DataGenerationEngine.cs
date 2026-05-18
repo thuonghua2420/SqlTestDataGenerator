@@ -504,9 +504,12 @@ namespace SqlTestDataGenerator.DataGeneration
                 if (!schemas.TryGetValue(tableRows.Key, out var schema))
                     continue;
 
-                foreach (var row in tableRows.Value)
+                for (var rowIndex = 0; rowIndex < tableRows.Value.Count; rowIndex++)
                 {
+                    var row = tableRows.Value[rowIndex];
+                    ApplyComputedNumericConversionSafetyAdjustments(query, scenario, schema, row, rowIndex);
                     ApplyComputedProductSafetyAdjustments(query, scenario, schema, row);
+                    ApplyComputedNumericConversionSafetyAdjustments(query, scenario, schema, row, rowIndex);
                 }
             }
         }
@@ -1085,6 +1088,9 @@ namespace SqlTestDataGenerator.DataGeneration
                 if (!KeepsComputedProductsWithinRange(schema, row, column, normalized))
                     continue;
 
+                if (!KeepsComputedNumericConversionsWithinRange(schema, row, column, normalized))
+                    continue;
+
                 if (!aliases.All(alias =>
                         SatisfiesPositiveColumnConstraints(
                             query,
@@ -1139,6 +1145,30 @@ namespace SqlTestDataGenerator.DataGeneration
             return true;
         }
 
+        private static bool KeepsComputedNumericConversionsWithinRange(
+            TableSchema schema,
+            GeneratedRow row,
+            ColumnSchema changedColumn,
+            object? changedValue)
+        {
+            foreach (var plan in ComputedExpressionSafety.BuildNumericConversionPlans(schema))
+            {
+                if (!plan.SourceColumn.ColumnName.Equals(changedColumn.ColumnName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var rawValue = plan.SourceColumn.ColumnName.Equals(changedColumn.ColumnName, StringComparison.OrdinalIgnoreCase)
+                    ? changedValue
+                    : row.GetValue(plan.SourceColumn.ColumnName);
+                if (!TryConvertDecimal(rawValue, out var sourceValue))
+                    continue;
+
+                if (sourceValue < plan.MinValue || sourceValue > plan.MaxValue)
+                    return false;
+            }
+
+            return true;
+        }
+
         private object? BuildDiversityCandidate(
             ParsedQuery query,
             TableSchema schema,
@@ -1164,7 +1194,12 @@ namespace SqlTestDataGenerator.DataGeneration
                     decimal? computedUpperBound = null;
                     if (TryGetComputedProductUpperBound(schema, column, out var bound))
                     {
-                        computedUpperBound = bound;
+                        computedUpperBound = MinNullable(computedUpperBound, bound);
+                    }
+
+                    if (TryGetComputedNumericConversionUpperBound(schema, column, out var conversionBound))
+                    {
+                        computedUpperBound = MinNullable(computedUpperBound, conversionBound);
                     }
 
                     return BuildMaxNumericValue(column, seed, query, tableAlias, computedUpperBound);
@@ -4013,7 +4048,13 @@ namespace SqlTestDataGenerator.DataGeneration
                 if (tableSchema != null &&
                     TryGetComputedProductUpperBound(tableSchema, column, out var bound))
                 {
-                    computedUpperBound = bound;
+                    computedUpperBound = MinNullable(computedUpperBound, bound);
+                }
+
+                if (tableSchema != null &&
+                    TryGetComputedNumericConversionUpperBound(tableSchema, column, out var conversionBound))
+                {
+                    computedUpperBound = MinNullable(computedUpperBound, conversionBound);
                 }
                 return BuildMaxNumericValue(column, rowIndex, query, tableAlias, computedUpperBound);
             }
@@ -4085,6 +4126,25 @@ namespace SqlTestDataGenerator.DataGeneration
             }
 
             return false;
+        }
+
+        private static bool TryGetComputedNumericConversionUpperBound(
+            TableSchema schema,
+            ColumnSchema sourceColumn,
+            out decimal upperBound)
+        {
+            upperBound = 0m;
+            var bounds = ComputedExpressionSafety.BuildNumericConversionPlans(schema)
+                .Where(plan => plan.SourceColumn.ColumnName.Equals(sourceColumn.ColumnName, StringComparison.OrdinalIgnoreCase))
+                .Select(plan => plan.MaxValue)
+                .Where(max => max >= 0m)
+                .ToList();
+
+            if (bounds.Count == 0)
+                return false;
+
+            upperBound = bounds.Min();
+            return true;
         }
 
         private static decimal FloorPositiveLimitToColumnStep(ColumnSchema column, decimal limit)
@@ -12552,6 +12612,42 @@ namespace SqlTestDataGenerator.DataGeneration
             SetNormalizedRowValueIfSafe(query, scenario, schema, row, "CostPrice", costPrice);
         }
 
+        private void ApplyComputedNumericConversionSafetyAdjustments(
+            ParsedQuery query,
+            BranchScenario scenario,
+            TableSchema schema,
+            GeneratedRow row,
+            int rowIndex)
+        {
+            var aliases = ResolveAliasesForTable(query, schema.TableName).DefaultIfEmpty(schema.TableName).ToList();
+            foreach (var plan in ComputedExpressionSafety.BuildNumericConversionPlans(schema))
+            {
+                if (!TryConvertDecimal(row.GetValue(plan.SourceColumn.ColumnName), out var currentValue) ||
+                    IsWithinComputedConversionRange(currentValue, plan))
+                {
+                    continue;
+                }
+
+                var safeDecimal = BuildSafeComputedConversionSourceDecimal(plan, currentValue, rowIndex);
+                var safeValue = SqlServerValueNormalizer.NormalizeValue(plan.SourceColumn, safeDecimal);
+                row.SetValue(plan.SourceColumn.ColumnName, safeValue);
+
+                if (!aliases.All(alias =>
+                        SatisfiesPositiveColumnConstraints(
+                            query,
+                            scenario,
+                            schema.TableName,
+                            alias,
+                            plan.SourceColumn,
+                            safeValue)))
+                {
+                    AddScenarioValidationMessageOnce(
+                        scenario,
+                        $"Insert safety warning: computed column [{schema.TableName}.{plan.ComputedColumn.ColumnName}] converts [{plan.SourceColumn.ColumnName}] to [{plan.TargetColumn.EffectiveDataType}], so [{plan.SourceColumn.ColumnName}] was clamped to [{plan.MinValue}..{plan.MaxValue}] and may not satisfy a wider predicate.");
+                }
+            }
+        }
+
         private void ApplyComputedProductSafetyAdjustments(
             ParsedQuery query,
             BranchScenario scenario,
@@ -12598,6 +12694,36 @@ namespace SqlTestDataGenerator.DataGeneration
                     Console.WriteLine($"[debug:max-guard-fail] Table={schema.TableName} Anchor={plan.AnchorColumn.ColumnName}({anchorDecimal}) Adjustable={plan.AdjustableColumn.ColumnName}({adjustableDecimal}) Max={resultMax}");
                 }
             }
+        }
+
+        private static bool IsWithinComputedConversionRange(
+            decimal value,
+            ComputedNumericConversionPlan plan) =>
+            value >= plan.MinValue && value <= plan.MaxValue;
+
+        private static decimal BuildSafeComputedConversionSourceDecimal(
+            ComputedNumericConversionPlan plan,
+            decimal currentValue,
+            int rowIndex)
+        {
+            var step = ComputedExpressionSafety.GetNumericStep(plan.TargetColumn);
+            if (step <= 0m)
+                step = 1m;
+
+            var offset = Math.Max(0, rowIndex) * step;
+            if (currentValue > plan.MaxValue)
+            {
+                var candidate = plan.MaxValue - offset;
+                return candidate >= plan.MinValue ? candidate : plan.MaxValue;
+            }
+
+            if (currentValue < plan.MinValue)
+            {
+                var candidate = plan.MinValue + offset;
+                return candidate <= plan.MaxValue ? candidate : plan.MinValue;
+            }
+
+            return currentValue;
         }
 
         private bool TryBuildSafeComputedProductPair(
@@ -14488,6 +14614,7 @@ namespace SqlTestDataGenerator.DataGeneration
                     }
 
                     ValidateComputedProductInsertSafety(scenario, schema, row);
+                    ValidateComputedNumericConversionInsertSafety(scenario, schema, row);
                 }
             }
         }
@@ -14555,6 +14682,25 @@ namespace SqlTestDataGenerator.DataGeneration
                 AddScenarioValidationMessageOnce(
                     scenario,
                     $"Insert safety error: computed column [{schema.TableName}.{plan.ResultColumn.ColumnName}] may overflow because [{plan.AnchorColumn.ColumnName}] * [{plan.AdjustableColumn.ColumnName}] exceeds [{resultMax}].");
+            }
+        }
+
+        private static void ValidateComputedNumericConversionInsertSafety(
+            BranchScenario scenario,
+            TableSchema schema,
+            GeneratedRow row)
+        {
+            foreach (var plan in ComputedExpressionSafety.BuildNumericConversionPlans(schema))
+            {
+                if (!TryConvertDecimal(row.GetValue(plan.SourceColumn.ColumnName), out var sourceValue) ||
+                    IsWithinComputedConversionRange(sourceValue, plan))
+                {
+                    continue;
+                }
+
+                AddScenarioValidationMessageOnce(
+                    scenario,
+                    $"Insert safety error: computed column [{schema.TableName}.{plan.ComputedColumn.ColumnName}] may overflow converting [{plan.SourceColumn.ColumnName}] value [{sourceValue}] to [{plan.TargetColumn.EffectiveDataType}] range [{plan.MinValue}..{plan.MaxValue}].");
             }
         }
 

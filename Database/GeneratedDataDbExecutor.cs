@@ -624,7 +624,9 @@ namespace SqlTestDataGenerator.Database
 
                 EnsureRequiredColumns(schema, kvp.Value);
                 NormalizeRowValues(schema, kvp.Value);
+                ApplyComputedNumericConversionInsertSafety(schema, kvp.Value);
                 ApplyComputedProductInsertSafety(schema, kvp.Value);
+                ApplyComputedNumericConversionInsertSafety(schema, kvp.Value);
                 NormalizeRowValues(schema, kvp.Value);
             }
 
@@ -1306,8 +1308,10 @@ namespace SqlTestDataGenerator.Database
         private static void PrepareRowForInsert(TableSchema schema, GeneratedRow row)
         {
             NormalizeRowValues(schema, new[] { row });
+            ApplyComputedNumericConversionInsertSafety(schema, new[] { row });
             ApplyComputedProductInsertSafety(schema, new[] { row });
             ApplyHeuristicProductPairInsertSafety(schema, row);
+            ApplyComputedNumericConversionInsertSafety(schema, new[] { row });
             NormalizeRowValues(schema, new[] { row });
         }
 
@@ -1326,6 +1330,56 @@ namespace SqlTestDataGenerator.Database
                     .Where(c => c.TypeCategory is DataTypeCategory.Integer or DataTypeCategory.Decimal or DataTypeCategory.Float)
                     .OrderBy(c => c.ColumnName, StringComparer.OrdinalIgnoreCase)
                     .Select(c => $"{c.ColumnName}={FormatDiagnosticValue(row.GetValue(c.ColumnName))}"));
+        }
+
+        private static void ApplyComputedNumericConversionInsertSafety(TableSchema schema, IEnumerable<GeneratedRow> rows)
+        {
+            var plans = ComputedExpressionSafety.BuildNumericConversionPlans(schema);
+            if (plans.Count == 0)
+                return;
+
+            var indexedRows = rows.Select((row, index) => new { Row = row, Index = index });
+            foreach (var item in indexedRows)
+            {
+                foreach (var plan in plans)
+                {
+                    if (!TryConvertDecimal(item.Row.GetValue(plan.SourceColumn.ColumnName), out var currentValue) ||
+                        currentValue >= plan.MinValue && currentValue <= plan.MaxValue)
+                    {
+                        continue;
+                    }
+
+                    var safeDecimal = BuildSafeComputedConversionSourceDecimal(plan, currentValue, item.Index);
+                    item.Row.SetValue(
+                        plan.SourceColumn.ColumnName,
+                        SqlServerValueNormalizer.NormalizeValue(plan.SourceColumn, safeDecimal));
+                }
+            }
+        }
+
+        private static decimal BuildSafeComputedConversionSourceDecimal(
+            ComputedNumericConversionPlan plan,
+            decimal currentValue,
+            int rowIndex)
+        {
+            var step = ComputedExpressionSafety.GetNumericStep(plan.TargetColumn);
+            if (step <= 0m)
+                step = 1m;
+
+            var offset = Math.Max(0, rowIndex) * step;
+            if (currentValue > plan.MaxValue)
+            {
+                var candidate = plan.MaxValue - offset;
+                return candidate >= plan.MinValue ? candidate : plan.MaxValue;
+            }
+
+            if (currentValue < plan.MinValue)
+            {
+                var candidate = plan.MinValue + offset;
+                return candidate <= plan.MaxValue ? candidate : plan.MinValue;
+            }
+
+            return currentValue;
         }
 
         private static void ApplyComputedProductInsertSafety(TableSchema schema, IEnumerable<GeneratedRow> rows)
